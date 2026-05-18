@@ -352,6 +352,8 @@ class AuctionResult:
     amplitude: float
     turnover: float
     buy_ratio: float
+    buy_vol: int
+    sell_vol: int
     bull_score: int
     bear_score: int
     verdict: str
@@ -482,6 +484,7 @@ def analyze(code: str, quote: dict, hist: list[dict]) -> Optional[AuctionResult]
         volume=vol, amount=amt, change_pct=chg,
         volume_ratio=round(vr, 2), open_gap=round(gap, 2),
         amplitude=amp, turnover=to, buy_ratio=round(br, 1),
+        buy_vol=bv, sell_vol=sv,
         bull_score=bs, bear_score=rs, verdict=v, signals=sigs,
     )
 
@@ -514,45 +517,68 @@ def print_result(r: AuctionResult):
 
 def save_html(results: list[AuctionResult], path: str) -> str:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    cards = ""
-    for r in results:
-        ud = "up" if r.change_pct > 0 else ("down" if r.change_pct < 0 else "flat")
-        vc = "bull" if "抢筹" in r.verdict else "bear"
-        sigs = "".join(f'<div class="s">{s}</div>' for s in r.signals)
-        cards += f"""
-<div class="c"><div class="h"><div><span class="n">{r.name}</span> <span class="d">{r.code}</span></div>
-<span class="b {vc}">{r.verdict}</span></div>
-<div class="g">
-<div class="m"><div class="ml">今开</div><div class="mv {ud}">{r.open_price:.2f}</div></div>
-<div class="m"><div class="ml">涨跌</div><div class="mv {ud}">{r.change_pct:+.2f}%</div></div>
-<div class="m"><div class="ml">跳空</div><div class="mv {ud}">{r.open_gap:+.2f}%</div></div>
-<div class="m"><div class="ml">成交量</div><div class="mv">{r.volume:,}手</div></div>
-<div class="m"><div class="ml">量比</div><div class="mv {"up" if r.volume_ratio>1.5 else ""}">{r.volume_ratio}x</div></div>
-<div class="m"><div class="ml">外盘比</div><div class="mv">{r.buy_ratio:.1f}%</div></div></div>
-<div class="brs">
-<div class="br"><span class="bl">🟢 抢筹</span><div class="bt"><div class="bf bu" style="width:{r.bull_score}%"></div></div><span class="bsc" style="color:#3fb950">{r.bull_score}</span></div>
-<div class="br"><span class="bl">🔴 出货</span><div class="bt"><div class="bf be" style="width:{r.bear_score}%"></div></div><span class="bsc" style="color:#f85149">{r.bear_score}</span></div></div>
-<div class="sg"><div class="sh">📌 信号明细</div>{sigs}</div></div>"""
+
+    # 按涨跌%降序排列
+    sorted_results = sorted(results, key=lambda x: x.change_pct, reverse=True)
+
+    rows = ""
+    for i, r in enumerate(sorted_results, 1):
+        # 涨跌颜色
+        chg_color = "#f85149" if r.change_pct > 0 else ("#3fb950" if r.change_pct < 0 else "#c9d1d9")
+        # 状态判定
+        net = r.bull_score - r.bear_score
+        if net > 15:
+            status = "🔴"
+        elif net > 0:
+            status = "🟡"
+        else:
+            status = "🟢"
+
+        rows += f"""<tr>
+<td>{i}</td>
+<td>{r.code}</td>
+<td style="text-align:left;font-weight:600">{r.name}</td>
+<td>{r.price:.2f}</td>
+<td style="color:{chg_color}">{r.change_pct:+.2f}</td>
+<td style="color:{chg_color}">{r.change_pct:+.2f}%</td>
+<td>{r.volume:,}</td>
+<td>{r.amount:,.0f}</td>
+<td>{r.turnover:.2f}%</td>
+<td>{r.amplitude:.2f}%</td>
+<td>{r.volume_ratio}</td>
+<td>{r.buy_vol:,}</td>
+<td>{r.sell_vol:,}</td>
+<td>{r.buy_ratio:.1f}%</td>
+<td>{status}</td>
+</tr>"""
 
     html = f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>集合竞价分析</title>
-<style>*{{margin:0;padding:0;box-sizing:border-box}}body{{font-family:-apple-system,"PingFang SC",sans-serif;background:#0d1117;color:#c9d1d9;padding:16px}}
-.hd{{text-align:center;padding:20px 0}}.hd h1{{font-size:22px;color:#58a6ff}}.hd .t{{color:#8b949e;font-size:12px;margin-top:4px}}
-.c{{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:18px;margin:12px auto;max-width:660px}}
-.h{{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:6px}}
-.n{{font-size:17px;font-weight:700;color:#f0f6fc}}.d{{color:#8b949e;font-size:12px}}
-.b{{padding:3px 10px;border-radius:14px;font-size:12px;font-weight:600}}
-.b.bull{{background:rgba(46,160,67,.15);color:#3fb950}}.b.bear{{background:rgba(248,81,73,.15);color:#f85149}}.b.neutral{{background:rgba(139,148,158,.15);color:#8b949e}}
-.g{{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:10px 0}}
-.m{{background:#0d1117;border-radius:6px;padding:8px;text-align:center}}.ml{{font-size:10px;color:#8b949e}}.mv{{font-size:15px;font-weight:700;margin-top:2px;color:#c9d1d9}}
-.mv.up{{color:#f85149}}.mv.down{{color:#3fb950}}
-.brs{{margin:10px 0}}.br{{display:flex;align-items:center;margin:5px 0}}.bl{{width:65px;font-size:11px}}
-.bt{{flex:1;height:16px;background:#0d1117;border-radius:8px;overflow:hidden}}.bf{{height:100%;border-radius:8px}}
-.bf.bu{{background:linear-gradient(90deg,#238636,#3fb950)}}.bf.be{{background:linear-gradient(90deg,#da3633,#f85149)}}
-.bsc{{width:35px;text-align:right;font-weight:700;font-size:12px}}
-.sg{{margin-top:12px}}.sh{{font-size:12px;color:#8b949e;margin-bottom:4px}}.s{{padding:2px 0;font-size:12px;line-height:1.6}}
-.ft{{text-align:center;color:#484f58;font-size:10px;padding:20px 0}}</style></head><body>
-<div class="hd"><h1>📊 集合竞价分析</h1><div class="t">{now}</div></div>{cards}
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>集合竞价 - 股票筛选</title>
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{font-family:"Microsoft YaHei","PingFang SC",sans-serif;background:#0d1117;color:#c9d1d9;padding:16px}}
+.hd{{text-align:center;padding:16px 0}}
+.hd h1{{font-size:20px;color:#58a6ff}}
+.hd .t{{color:#8b949e;font-size:12px;margin-top:4px}}
+.tbl-wrap{{overflow-x:auto;margin:0 auto;max-width:960px}}
+table{{width:100%;border-collapse:collapse;font-size:13px;white-space:nowrap}}
+th{{background:#161b22;color:#8b949e;font-weight:600;padding:8px 10px;text-align:center;border-bottom:2px solid #30363d;position:sticky;top:0}}
+td{{padding:6px 10px;text-align:center;border-bottom:1px solid #21262d}}
+tr:hover{{background:#161b22}}
+.ft{{text-align:center;color:#484f58;font-size:10px;padding:20px 0}}
+@media(max-width:768px){{table{{font-size:11px}}th,td{{padding:4px 6px}}}}
+</style></head><body>
+<div class="hd"><h1>📊 集合竞价 - 股票筛选</h1><div class="t">更新时间: {now}</div></div>
+<div class="tbl-wrap">
+<table>
+<thead><tr>
+<th>序号</th><th>代码</th><th>名称</th><th>最新</th><th>涨跌</th><th>涨跌%</th>
+<th>成交量</th><th>成交额</th><th>换手</th><th>振幅</th><th>量比</th>
+<th>外盘</th><th>内盘</th><th>外%</th><th>状态</th>
+</tr></thead>
+<tbody>{rows}</tbody>
+</table></div>
 <div class="ft">⚠️ 仅供学习参考，不构成投资建议</div></body></html>"""
 
     with open(path, "w", encoding="utf-8") as f:
