@@ -13,6 +13,7 @@ A股集合竞价 · 抢筹/出货分析工具 v3
 import requests
 import re
 import json
+import subprocess
 import numpy as np
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
@@ -137,77 +138,117 @@ def _get_mimo_api_key() -> str:
     return ""
 
 
-def _image_to_data_uri(image_path: str) -> str:
-    """将本地图片转为 data URI"""
-    import base64
-    ext = os.path.splitext(image_path)[1].lower()
-    mime_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
-                ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp"}
-    mime = mime_map.get(ext, "image/jpeg")
-    with open(image_path, "rb") as f:
-        b64 = base64.b64encode(f.read()).decode()
-    return f"data:{mime};base64,{b64}"
-
-
 def extract_stocks_from_image(image_path: str) -> list[str]:
     """
-    用 MiMo 多模态 API 识别图片中的股票名称或代码
-    纯 Python 实现，跨平台兼容（Windows/Linux/macOS）
+    识别图片中的股票名称或代码
+    优先用 MiMo API（需 key），无 key 时用本地 OCR（无需 key）
     """
+    # 方案1: MiMo API（更智能，能理解上下文）
     api_key = _get_mimo_api_key()
-    if not api_key:
-        print("  ✗ 未找到 MiMo API Key")
-        print("    请设置环境变量 MIMO_API_KEY，或在 ~/.openclaw/openclaw.json 中配置")
-        return []
+    if api_key:
+        keywords = _ocr_via_mimo(image_path, api_key)
+        if keywords:
+            return keywords
 
+    # 方案2: 本地 OCR（无需 API Key）
+    keywords = _ocr_via_local(image_path)
+    if keywords:
+        return keywords
+
+    print("  ✗ 无法进行图片识别，请手动输入股票名称")
+    return []
+
+
+def _ocr_via_mimo(image_path: str, api_key: str) -> list[str]:
+    """用 MiMo 多模态 API 识别"""
     prompt = (
         "请识别这张图片中的所有A股股票名称或代码。"
         "只输出股票名称或代码，每行一个，不要其他内容。"
         "例如：贵州茅台 或 600519"
     )
-
     api_url = os.environ.get("MIMO_API_ENDPOINT", "https://api.xiaomimimo.com/v1/chat/completions")
     model = os.environ.get("MIMO_OMNI_MODEL", "clawm-alpha")
-
     try:
-        image_url = _image_to_data_uri(image_path)
+        import base64
+        ext = os.path.splitext(image_path)[1].lower()
+        mime_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+                    ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp"}
+        mime = mime_map.get(ext, "image/jpeg")
+        with open(image_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode()
+        image_url = f"data:{mime};base64,{b64}"
+
         body = {
             "model": model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image_url", "image_url": {"url": image_url}},
-                        {"type": "text", "text": prompt},
-                    ],
-                }
-            ],
+            "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": image_url}},
+                {"type": "text", "text": prompt},
+            ]}],
             "max_tokens": 4096,
         }
-        resp = requests.post(
-            api_url,
-            headers={"api-key": api_key, "Content-Type": "application/json"},
-            json=body,
-            timeout=120,
-        )
+        resp = requests.post(api_url, headers={"api-key": api_key, "Content-Type": "application/json"},
+                             json=body, timeout=120)
         if resp.status_code == 200:
-            data = resp.json()
-            text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            text = resp.json().get("choices", [{}])[0].get("message", {}).get("content", "")
             if text.strip():
                 lines = text.strip().split("\n")
                 keywords = [l.strip().lstrip("0123456789.、- ").strip() for l in lines if l.strip()]
                 keywords = [k for k in keywords if k]
-                return keywords
-            else:
-                print("  ⚠ OCR返回为空")
+                if keywords:
+                    print(f"  ✓ MiMo API 识别到 {len(keywords)} 个关键词")
+                    return keywords
         else:
-            print(f"  ⚠ API请求失败: HTTP {resp.status_code}")
-            print(f"    {resp.text[:200]}")
-    except requests.Timeout:
-        print("  ⚠ OCR请求超时")
+            print(f"  ⚠ MiMo API 失败: HTTP {resp.status_code}")
     except Exception as e:
-        print(f"  ⚠ OCR异常: {e}")
+        print(f"  ⚠ MiMo API 异常: {e}")
+    return []
 
+
+def _ocr_via_local(image_path: str) -> list[str]:
+    """用本地 OCR 识别（rapidocr-onnxruntime，无需 API Key）"""
+    try:
+        from rapidocr_onnxruntime import RapidOCR
+    except ImportError:
+        print("  ⚠ 未安装本地 OCR 库，正在自动安装...")
+        try:
+            subprocess.run([sys.executable, "-m", "pip", "install", "rapidocr-onnxruntime", "-q"],
+                           capture_output=True, timeout=120)
+            from rapidocr_onnxruntime import RapidOCR
+        except Exception:
+            print("  ✗ 安装失败，请手动运行: pip install rapidocr-onnxruntime")
+            return []
+
+    try:
+        print("  📷 使用本地 OCR 识别中...")
+        ocr = RapidOCR()
+        result, _ = ocr(image_path)
+        if not result:
+            print("  ⚠ OCR 未识别到文字")
+            return []
+
+        # 拼接所有识别到的文本
+        all_text = " ".join([item[1] for item in result])
+        print(f"  OCR 原文: {all_text[:120]}...")
+
+        # 从文本中提取股票名称或6位代码
+        keywords = []
+        # 提取6位数字代码
+        codes = re.findall(r'\b(\d{6})\b', all_text)
+        keywords.extend(codes)
+        # 提取中文股票名称（2-4个汉字，排除常见非股票词）
+        exclude = {"集合竞价", "抢筹", "出货", "股票", "代码", "名称", "涨跌", "成交量",
+                    "换手率", "振幅", "量比", "今开", "昨收", "最新", "买入", "卖出",
+                    "时间", "序号", "类型", "市场", "行业", "板块", "概念", "自选"}
+        names = re.findall(r'[\u4e00-\u9fa5]{2,4}', all_text)
+        for name in names:
+            if name not in exclude and name not in keywords:
+                keywords.append(name)
+
+        if keywords:
+            print(f"  ✓ 本地 OCR 识别到 {len(keywords)} 个关键词")
+        return keywords
+    except Exception as e:
+        print(f"  ⚠ 本地 OCR 异常: {e}")
     return []
 
 
