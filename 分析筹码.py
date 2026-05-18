@@ -473,10 +473,12 @@ def analyze(code: str, quote: dict, hist: list[dict]) -> Optional[AuctionResult]
     bs = min(bull, 100)
     rs = min(bear, 100)
     net = bs - rs
-    if net > 0:
-        v = "🟢 真实抢筹"
+    if net > 15:
+        v = "真实抢筹"
+    elif net < -10:
+        v = "疑似出货"
     else:
-        v = "🔴 疑似出货"
+        v = "正常"
 
     return AuctionResult(
         code=code, name=quote["name"],
@@ -515,69 +517,86 @@ def print_result(r: AuctionResult):
     print(f"{'─'*56}")
 
 
+def _format_volume(vol: int) -> str:
+    """格式化搓合量：万手/手"""
+    if vol >= 10000:
+        return f"{vol / 10000:.1f}万"
+    return f"{vol:,}手"
+
+
+def _compute_strategy(r: AuctionResult) -> str:
+    """根据信号推断策略"""
+    net = r.bull_score - r.bear_score
+    sig_text = " ".join(r.signals)
+    if "连跌" in sig_text and "高开" in sig_text:
+        return "1进2，止跌反弹"
+    if "连涨" in sig_text and "高开" in sig_text:
+        return "强势延续"
+    if r.change_pct >= 9.5:
+        return "一字板/涨停"
+    if net > 20 and r.volume_ratio > 2:
+        return "5w首板、新首板"
+    if net > 15:
+        return "新首板"
+    if net > 5:
+        return "四万首板"
+    if net < -10:
+        return "三万首板"
+    if r.change_pct > 3:
+        return "新首板"
+    return "观望"
+
+
+def _compute_frequency(r: AuctionResult) -> int:
+    """频次：信号命中数"""
+    return len([s for s in r.signals if any(k in s for k in ["高开", "低开", "放量", "缩量", "买盘", "卖盘", "连涨", "连跌", "平开"])])
+
+
 def save_html(results: list[AuctionResult], path: str) -> str:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # 按涨跌%降序排列
+    # 按涨幅降序
     sorted_results = sorted(results, key=lambda x: x.change_pct, reverse=True)
 
-    # 表格行
     rows = ""
     for i, r in enumerate(sorted_results, 1):
         chg_color = "#f85149" if r.change_pct > 0 else ("#3fb950" if r.change_pct < 0 else "#c9d1d9")
-        net = r.bull_score - r.bear_score
-        if net > 15:
-            status = "🔴"
-        elif net > 0:
-            status = "🟡"
+        chg_str = f"{r.change_pct:+.2f}%" if r.change_pct != 999 else "涨停"
+
+        # 筹码判断颜色
+        if r.verdict == "真实抢筹":
+            v_color = "#f85149"
+            v_bg = "rgba(248,81,73,.12)"
+        elif r.verdict == "疑似出货":
+            v_color = "#3fb950"
+            v_bg = "rgba(63,185,80,.12)"
         else:
-            status = "🟢"
+            v_color = "#d29922"
+            v_bg = "rgba(210,153,34,.12)"
+
+        freq = _compute_frequency(r)
+        strategy = _compute_strategy(r)
+        vol_fmt = _format_volume(r.volume)
+
+        # 竞昨比（今开 vs 昨收）
+        if r.prev_close > 0:
+            comp_ratio = f"{(r.open_price - r.prev_close) / r.prev_close * 100:.1f}%"
+        else:
+            comp_ratio = "-"
 
         rows += f"""<tr>
-<td>{i}</td>
 <td>{r.code}</td>
 <td style="text-align:left;font-weight:600">{r.name}</td>
+<td>{r.open_price:.2f}</td>
 <td>{r.price:.2f}</td>
-<td style="color:{chg_color}">{r.change_pct:+.2f}</td>
-<td style="color:{chg_color}">{r.change_pct:+.2f}%</td>
-<td>{r.volume:,}</td>
-<td>{r.amount:,.0f}</td>
-<td>{r.turnover:.2f}%</td>
-<td>{r.amplitude:.2f}%</td>
-<td>{r.volume_ratio}</td>
-<td>{r.buy_vol:,}</td>
-<td>{r.sell_vol:,}</td>
+<td>{vol_fmt}</td>
+<td>{comp_ratio}</td>
 <td>{r.buy_ratio:.1f}%</td>
-<td>{status}</td>
+<td style="color:{chg_color}">{chg_str}</td>
+<td style="color:{v_color};background:{v_bg};border-radius:4px;font-weight:600">{r.verdict}</td>
+<td>{freq}</td>
+<td style="text-align:left;font-size:12px">{strategy}</td>
 </tr>"""
-
-    # 筹码判定卡片
-    cards = ""
-    for r in sorted_results:
-        vc = "bull" if "抢筹" in r.verdict else "bear"
-        sigs = "".join(f'<div class="sig">{s}</div>' for s in r.signals)
-        cards += f"""
-<div class="card">
-  <div class="card-hd">
-    <span class="card-name">{r.name}</span>
-    <span class="card-code">{r.code}</span>
-    <span class="badge {vc}">{r.verdict}</span>
-  </div>
-  <div class="bars">
-    <div class="bar-row">
-      <span class="bar-label">🟢 抢筹</span>
-      <div class="bar-track"><div class="bar-fill bull" style="width:{r.bull_score}%"></div></div>
-      <span class="bar-score" style="color:#3fb950">{r.bull_score}</span>
-    </div>
-    <div class="bar-row">
-      <span class="bar-label">🔴 出货</span>
-      <div class="bar-track"><div class="bar-fill bear" style="width:{r.bear_score}%"></div></div>
-      <span class="bar-score" style="color:#f85149">{r.bear_score}</span>
-    </div>
-  </div>
-  <div class="sigs-hd">📌 信号明细</div>
-  <div class="sigs">{sigs}</div>
-</div>"""
 
     html = f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -588,46 +607,24 @@ body{{font-family:"Microsoft YaHei","PingFang SC",sans-serif;background:#0d1117;
 .hd{{text-align:center;padding:16px 0}}
 .hd h1{{font-size:20px;color:#58a6ff}}
 .hd .t{{color:#8b949e;font-size:12px;margin-top:4px}}
-/* 表格 */
-.tbl-wrap{{overflow-x:auto;margin:0 auto;max-width:960px}}
+.tbl-wrap{{overflow-x:auto;margin:0 auto;max-width:1100px}}
 table{{width:100%;border-collapse:collapse;font-size:13px;white-space:nowrap}}
 th{{background:#161b22;color:#8b949e;font-weight:600;padding:8px 10px;text-align:center;border-bottom:2px solid #30363d;position:sticky;top:0}}
 td{{padding:6px 10px;text-align:center;border-bottom:1px solid #21262d}}
 tr:hover{{background:#161b22}}
-/* 判定区域 */
-.section-title{{font-size:16px;font-weight:700;color:#58a6ff;margin:28px auto 12px;max-width:660px;padding-left:4px}}
-.card{{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:16px;margin:10px auto;max-width:660px}}
-.card-hd{{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px}}
-.card-name{{font-size:16px;font-weight:700;color:#f0f6fc}}
-.card-code{{color:#8b949e;font-size:12px}}
-.badge{{padding:3px 10px;border-radius:14px;font-size:12px;font-weight:600}}
-.badge.bull{{background:rgba(46,160,67,.15);color:#3fb950}}
-.badge.bear{{background:rgba(248,81,73,.15);color:#f85149}}
-.bars{{margin:8px 0}}
-.bar-row{{display:flex;align-items:center;margin:5px 0}}
-.bar-label{{width:65px;font-size:11px}}
-.bar-track{{flex:1;height:16px;background:#0d1117;border-radius:8px;overflow:hidden}}
-.bar-fill{{height:100%;border-radius:8px}}
-.bar-fill.bull{{background:linear-gradient(90deg,#238636,#3fb950)}}
-.bar-fill.bear{{background:linear-gradient(90deg,#da3633,#f85149)}}
-.bar-score{{width:35px;text-align:right;font-weight:700;font-size:12px}}
-.sigs-hd{{font-size:12px;color:#8b949e;margin:8px 0 4px}}
-.sigs .sig{{padding:2px 0;font-size:12px;line-height:1.6}}
 .ft{{text-align:center;color:#484f58;font-size:10px;padding:20px 0}}
-@media(max-width:768px){{table{{font-size:11px}}th,td{{padding:4px 6px}}.card{{padding:12px}}}}
+@media(max-width:768px){{table{{font-size:11px}}th,td{{padding:4px 6px}}}}
 </style></head><body>
 <div class="hd"><h1>📊 集合竞价 - 股票筛选</h1><div class="t">更新时间: {now}</div></div>
 <div class="tbl-wrap">
 <table>
 <thead><tr>
-<th>序号</th><th>代码</th><th>名称</th><th>最新</th><th>涨跌</th><th>涨跌%</th>
-<th>成交量</th><th>成交额</th><th>换手</th><th>振幅</th><th>量比</th>
-<th>外盘</th><th>内盘</th><th>外%</th><th>状态</th>
+<th>代码</th><th>名称</th><th>09:25</th><th>09:26</th><th>搓合量</th>
+<th>竞昨比</th><th>剩余率</th><th>09:26涨幅</th>
+<th>筹码判断</th><th>频次</th><th>策略</th>
 </tr></thead>
 <tbody>{rows}</tbody>
 </table></div>
-<div class="section-title">📋 筹码判定</div>
-{cards}
 <div class="ft">⚠️ 仅供学习参考，不构成投资建议</div></body></html>"""
 
     with open(path, "w", encoding="utf-8") as f:
