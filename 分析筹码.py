@@ -521,11 +521,10 @@ def save_html(results: list[AuctionResult], path: str) -> str:
     # 按涨跌%降序排列
     sorted_results = sorted(results, key=lambda x: x.change_pct, reverse=True)
 
+    # 表格行
     rows = ""
     for i, r in enumerate(sorted_results, 1):
-        # 涨跌颜色
         chg_color = "#f85149" if r.change_pct > 0 else ("#3fb950" if r.change_pct < 0 else "#c9d1d9")
-        # 状态判定
         net = r.bull_score - r.bear_score
         if net > 15:
             status = "🔴"
@@ -552,6 +551,34 @@ def save_html(results: list[AuctionResult], path: str) -> str:
 <td>{status}</td>
 </tr>"""
 
+    # 筹码判定卡片
+    cards = ""
+    for r in sorted_results:
+        vc = "bull" if "抢筹" in r.verdict else "bear"
+        sigs = "".join(f'<div class="sig">{s}</div>' for s in r.signals)
+        cards += f"""
+<div class="card">
+  <div class="card-hd">
+    <span class="card-name">{r.name}</span>
+    <span class="card-code">{r.code}</span>
+    <span class="badge {vc}">{r.verdict}</span>
+  </div>
+  <div class="bars">
+    <div class="bar-row">
+      <span class="bar-label">🟢 抢筹</span>
+      <div class="bar-track"><div class="bar-fill bull" style="width:{r.bull_score}%"></div></div>
+      <span class="bar-score" style="color:#3fb950">{r.bull_score}</span>
+    </div>
+    <div class="bar-row">
+      <span class="bar-label">🔴 出货</span>
+      <div class="bar-track"><div class="bar-fill bear" style="width:{r.bear_score}%"></div></div>
+      <span class="bar-score" style="color:#f85149">{r.bear_score}</span>
+    </div>
+  </div>
+  <div class="sigs-hd">📌 信号明细</div>
+  <div class="sigs">{sigs}</div>
+</div>"""
+
     html = f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>集合竞价 - 股票筛选</title>
@@ -561,13 +588,33 @@ body{{font-family:"Microsoft YaHei","PingFang SC",sans-serif;background:#0d1117;
 .hd{{text-align:center;padding:16px 0}}
 .hd h1{{font-size:20px;color:#58a6ff}}
 .hd .t{{color:#8b949e;font-size:12px;margin-top:4px}}
+/* 表格 */
 .tbl-wrap{{overflow-x:auto;margin:0 auto;max-width:960px}}
 table{{width:100%;border-collapse:collapse;font-size:13px;white-space:nowrap}}
 th{{background:#161b22;color:#8b949e;font-weight:600;padding:8px 10px;text-align:center;border-bottom:2px solid #30363d;position:sticky;top:0}}
 td{{padding:6px 10px;text-align:center;border-bottom:1px solid #21262d}}
 tr:hover{{background:#161b22}}
+/* 判定区域 */
+.section-title{{font-size:16px;font-weight:700;color:#58a6ff;margin:28px auto 12px;max-width:660px;padding-left:4px}}
+.card{{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:16px;margin:10px auto;max-width:660px}}
+.card-hd{{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px}}
+.card-name{{font-size:16px;font-weight:700;color:#f0f6fc}}
+.card-code{{color:#8b949e;font-size:12px}}
+.badge{{padding:3px 10px;border-radius:14px;font-size:12px;font-weight:600}}
+.badge.bull{{background:rgba(46,160,67,.15);color:#3fb950}}
+.badge.bear{{background:rgba(248,81,73,.15);color:#f85149}}
+.bars{{margin:8px 0}}
+.bar-row{{display:flex;align-items:center;margin:5px 0}}
+.bar-label{{width:65px;font-size:11px}}
+.bar-track{{flex:1;height:16px;background:#0d1117;border-radius:8px;overflow:hidden}}
+.bar-fill{{height:100%;border-radius:8px}}
+.bar-fill.bull{{background:linear-gradient(90deg,#238636,#3fb950)}}
+.bar-fill.bear{{background:linear-gradient(90deg,#da3633,#f85149)}}
+.bar-score{{width:35px;text-align:right;font-weight:700;font-size:12px}}
+.sigs-hd{{font-size:12px;color:#8b949e;margin:8px 0 4px}}
+.sigs .sig{{padding:2px 0;font-size:12px;line-height:1.6}}
 .ft{{text-align:center;color:#484f58;font-size:10px;padding:20px 0}}
-@media(max-width:768px){{table{{font-size:11px}}th,td{{padding:4px 6px}}}}
+@media(max-width:768px){{table{{font-size:11px}}th,td{{padding:4px 6px}}.card{{padding:12px}}}}
 </style></head><body>
 <div class="hd"><h1>📊 集合竞价 - 股票筛选</h1><div class="t">更新时间: {now}</div></div>
 <div class="tbl-wrap">
@@ -579,6 +626,8 @@ tr:hover{{background:#161b22}}
 </tr></thead>
 <tbody>{rows}</tbody>
 </table></div>
+<div class="section-title">📋 筹码判定</div>
+{cards}
 <div class="ft">⚠️ 仅供学习参考，不构成投资建议</div></body></html>"""
 
     with open(path, "w", encoding="utf-8") as f:
