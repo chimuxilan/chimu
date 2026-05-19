@@ -27,6 +27,10 @@ HEADERS = {
     "Referer": "https://quote.eastmoney.com/",
 }
 
+# 东方财富行情字段映射（竞价阶段数据更准）
+EASTMONEY_FIELDS = "f43,f44,f45,f46,f47,f48,f57,f58,f60,f170,f31,f32,f33,f34,f35,f36,f39,f40,f19"
+EASTMONEY_UT = "fa5fd1943c7b386f172d6893dbbd4dc0"
+
 # 大盘指数代码
 MARKET_INDICES = {
     "sh000001": "上证指数",
@@ -34,6 +38,146 @@ MARKET_INDICES = {
     "sz399006": "创业板指",
     "sh000300": "沪深300",
 }
+
+
+# ============================================================
+# 时间判断 & 东方财富竞价数据
+# ============================================================
+
+def is_auction_time() -> bool:
+    """是否在集合竞价时段 (9:15-9:25)"""
+    now = datetime.now()
+    h, m = now.hour, now.minute
+    return h == 9 and 15 <= m <= 25
+
+
+def is_near_auction() -> bool:
+    """是否在竞价前后 (9:00-9:30)，用于数据源选择"""
+    now = datetime.now()
+    h, m = now.hour, now.minute
+    return h == 9 and m <= 30
+
+
+def _to_secid(code: str) -> str:
+    """股票代码 → 东方财富 secid"""
+    if code.startswith(("6", "9")):
+        return f"1.{code}"
+    return f"0.{code}"
+
+
+def fetch_auction_data_eastmoney(codes: List[str]) -> dict:
+    """
+    通过东方财富推送接口获取竞价数据
+    返回 {code: {name, price, open, prev_close, volume, amount, change_pct, ...}}
+    """
+    secids = ",".join(_to_secid(c) for c in codes)
+    url = "https://push2.eastmoney.com/api/qt/ulist.np/get"
+    params = {
+        "secids": secids,
+        "fields": "f2,f3,f4,f5,f6,f7,f8,f12,f14,f15,f16,f17,f18,f19,f31,f32,f33,f34,f35",
+        "ut": EASTMONEY_UT,
+    }
+    try:
+        r = requests.get(url, params=params, headers=HEADERS, timeout=15)
+        data = r.json()
+    except Exception as e:
+        print(f"  ⚠ 东方财富请求失败: {e}")
+        return {}
+
+    results = {}
+    diff = data.get("data", {}).get("diff", [])
+    if not diff:
+        return {}
+
+    for item in diff:
+        code = item.get("f12", "")
+        if not code:
+            continue
+
+        def _g(key, t=float):
+            v = item.get(key, 0)
+            try:
+                return t(v) if v is not None and v != "-" else (t(0) if t != str else "")
+            except (ValueError, TypeError):
+                return t(0) if t != str else ""
+
+        # 东方财富价格字段是整数（分），需要除以100
+        results[code] = {
+            "name": _g("f14", str),
+            "code": code,
+            "price": _g("f2") / 100,           # 最新价
+            "change_pct": _g("f3") / 100,       # 涨跌幅
+            "change_amt": _g("f4") / 100,       # 涨跌额
+            "volume": _g("f5", int),             # 成交量(手)
+            "amount": _g("f6") / 10000,          # 成交额(万)
+            "high": _g("f15") / 100,             # 最高
+            "low": _g("f16") / 100,              # 最低
+            "open": _g("f17") / 100,             # 开盘价
+            "prev_close": _g("f18") / 100,       # 昨收
+            "volume_ratio": _g("f19") / 100,     # 量比
+            "turnover": _g("f8") / 100,          # 换手率
+            "amplitude": _g("f7") / 100,         # 振幅
+            # f31/f32: 买一/卖一价(分), f34/f35: 买一/卖一量
+            "bid1_p": _g("f31") / 100,
+            "bid1_v": _g("f34", int),
+            "ask1_p": _g("f32") / 100,
+            "ask1_v": _g("f35", int),
+        }
+    return results
+
+
+def fetch_auction_detail_eastmoney(code: str) -> dict:
+    """
+    获取单只股票的竞价详细数据（含五档买卖挂单）
+    用于精确计算剩余率
+    """
+    secid = _to_secid(code)
+    url = "https://push2.eastmoney.com/api/qt/stock/get"
+    params = {
+        "secid": secid,
+        "fields": "f31,f32,f33,f34,f35,f36,f37,f38,f39,f40,"
+                   "f19,f20,f17,f18,f15,f16,f14,f12,f2,f3,f4,f5,f6,"
+                   "f43,f44,f45,f46,f47,f48,f57,f58,f60,f170",
+        "ut": EASTMONEY_UT,
+    }
+    try:
+        r = requests.get(url, params=params, headers=HEADERS, timeout=10)
+        data = r.json().get("data", {})
+        if not data:
+            return {}
+    except Exception:
+        return {}
+
+    def _g(key, t=float):
+        v = data.get(key, 0)
+        try:
+            return t(v) if v is not None and v != "-" else (t(0) if t != str else "")
+        except (ValueError, TypeError):
+            return t(0) if t != str else ""
+
+    return {
+        "code": code,
+        "name": _g("f58", str),
+        "price": _g("f43") / 100,
+        "prev_close": _g("f60") / 100,
+        "open": _g("f46") / 100,
+        "high": _g("f44") / 100,
+        "low": _g("f45") / 100,
+        "volume": _g("f47", int),
+        "amount": _g("f48") / 10000,
+        "change_pct": _g("f170") / 100,
+        # 五档买卖
+        "bid1_p": _g("f31") / 100, "bid1_v": _g("f32", int),
+        "bid2_p": _g("f35") / 100, "bid2_v": _g("f36", int),
+        "bid3_p": _g("f37") / 100 if "f37" in data else 0,
+        "bid4_p": _g("f38") / 100 if "f38" in data else 0,
+        "ask1_p": _g("f33") / 100, "ask1_v": _g("f34", int),
+        "ask2_p": _g("f39") / 100 if "f39" in data else 0,
+        "ask3_p": _g("f40") / 100 if "f40" in data else 0,
+        "amplitude": _g("f44") / 100 if data.get("f44") else 0,
+        "turnover": _g("f168") / 100 if data.get("f168") else 0,
+        "volume_ratio": _g("f50") / 100 if data.get("f50") else 0,
+    }
 
 
 # ============================================================
@@ -269,41 +413,73 @@ def _to_tencent(code: str) -> str:
 
 
 def fetch_quotes(codes: List[str]) -> dict:
-    """批量获取腾讯实时行情"""
+    """批量获取实时行情，竞价时段优先用东方财富+腾讯补全"""
+    results = {}
+
+    # 竞价时段先用东方财富（开盘价/成交量更准）
+    if is_near_auction():
+        print("  📡 竞价时段，使用东方财富数据源...")
+        results = fetch_auction_data_eastmoney(codes)
+
+    # 腾讯行情（全时段可用，补全五档数据）
     symbols = ",".join(_to_tencent(c) for c in codes)
+    tx_data = {}
     try:
         r = requests.get(f"https://qt.gtimg.cn/q={symbols}", headers=HEADERS, timeout=15)
         r.encoding = "gbk"
+        for line in r.text.strip().split("\n"):
+            m = re.search(r'v_\w+="(.+)"', line)
+            if not m:
+                continue
+            f = m.group(1).split("~")
+            if len(f) < 50:
+                continue
+            code = f[2]
+
+            def _v(i, t=float):
+                try:
+                    return t(f[i]) if f[i] else (t(0) if t != str else "")
+                except (ValueError, IndexError):
+                    return t(0) if t != str else ""
+
+            tx_data[code] = {
+                "name": f[1], "code": code,
+                "price": _v(3), "prev_close": _v(4), "open": _v(5),
+                "volume": _v(6, int), "buy_vol": _v(7, int), "sell_vol": _v(8, int),
+                "bid1_p": _v(9), "bid1_v": _v(10, int),
+                "ask1_p": _v(19), "ask1_v": _v(20, int),
+                "change_pct": _v(32), "high": _v(33), "low": _v(34),
+                "amount": _v(37), "turnover": _v(38),
+                "amplitude": _v(43),
+            }
     except Exception as e:
-        print(f"  ⚠ 行情请求失败: {e}")
-        return {}
+        if not results:
+            print(f"  ⚠ 腾讯行情请求失败: {e}")
 
-    results = {}
-    for line in r.text.strip().split("\n"):
-        m = re.search(r'v_\w+="(.+)"', line)
-        if not m:
-            continue
-        f = m.group(1).split("~")
-        if len(f) < 50:
-            continue
-        code = f[2]
+    if not results:
+        # 非竞价时段，直接用腾讯
+        return tx_data
 
-        def _v(i, t=float):
-            try:
-                return t(f[i]) if f[i] else (t(0) if t != str else "")
-            except (ValueError, IndexError):
-                return t(0) if t != str else ""
+    # 竞价时段：东方财富为主，腾讯补全五档买卖量
+    for code in results:
+        if code in tx_data:
+            tx = tx_data[code]
+            # 用腾讯的五档数据补全（竞价阶段腾讯的买卖量更准）
+            results[code]["buy_vol"] = tx.get("buy_vol", 0)
+            results[code]["sell_vol"] = tx.get("sell_vol", 0)
+            results[code]["bid1_v"] = tx.get("bid1_v", 0)
+            results[code]["ask1_v"] = tx.get("ask1_v", 0)
+            # 如果东方财富价格为0，用腾讯的
+            if results[code].get("price", 0) <= 0:
+                results[code]["price"] = tx["price"]
+            if results[code].get("open", 0) <= 0:
+                results[code]["open"] = tx["open"]
 
-        results[code] = {
-            "name": f[1], "code": code,
-            "price": _v(3), "prev_close": _v(4), "open": _v(5),
-            "volume": _v(6, int), "buy_vol": _v(7, int), "sell_vol": _v(8, int),
-            "bid1_p": _v(9), "bid1_v": _v(10, int),
-            "ask1_p": _v(19), "ask1_v": _v(20, int),
-            "change_pct": _v(32), "high": _v(33), "low": _v(34),
-            "amount": _v(37), "turnover": _v(38),
-            "amplitude": _v(43),
-        }
+    # 补充东方财富没有的代码
+    for code in tx_data:
+        if code not in results:
+            results[code] = tx_data[code]
+
     return results
 
 
@@ -459,6 +635,7 @@ class AuctionResult:
     verdict: str
     confidence: str = "低"
     signals: list = field(default_factory=list)
+    auction_vol_ratio: float = 0  # 竞昨比：竞价量/昨日成交量%
 
 
 def analyze(code: str, quote: dict, hist: List[dict], market_env: dict = None) -> Optional[AuctionResult]:
@@ -470,10 +647,10 @@ def analyze(code: str, quote: dict, hist: List[dict], market_env: dict = None) -
     vol = quote["volume"]
     amt = quote["amount"]
     chg = quote["change_pct"]
-    amp = quote["amplitude"]
-    to = quote["turnover"]
-    bv = quote["buy_vol"]
-    sv = quote["sell_vol"]
+    amp = quote.get("amplitude", 0)
+    to = quote.get("turnover", 0)
+    bv = quote.get("buy_vol", 0)
+    sv = quote.get("sell_vol", 0)
     gap = (op - pc) / pc * 100
 
     avg_vol = 0
@@ -483,8 +660,19 @@ def analyze(code: str, quote: dict, hist: List[dict], market_env: dict = None) -
             avg_vol = np.mean(vs)
     vr = vol / avg_vol if avg_vol > 0 else 1.0
 
-    tv = bv + sv
-    br = (bv / tv * 100) if tv > 0 else 50
+    # ── 外盘比例 ──
+    # 竞价阶段外盘/内盘无意义，用五档挂单估算多空力量
+    if is_near_auction():
+        bid1_v = quote.get("bid1_v", 0)
+        ask1_v = quote.get("ask1_v", 0)
+        total_v = bid1_v + ask1_v
+        if total_v > 0:
+            br = (bid1_v / total_v) * 100
+        else:
+            br = 50.0
+    else:
+        tv = bv + sv
+        br = (bv / tv * 100) if tv > 0 else 50
 
     sigs = []
     bull = 0
@@ -687,6 +875,8 @@ def analyze(code: str, quote: dict, hist: List[dict], market_env: dict = None) -
         buy_vol=bv, sell_vol=sv,
         bull_score=bs, bear_score=rs, verdict=v,
         confidence=confidence, signals=sigs,
+        auction_vol_ratio=round(vol / float(hist[-1].get("volume", 0)) * 100, 1)
+            if hist and float(hist[-1].get("volume", 0)) > 0 else 0,
     )
 
 
@@ -703,7 +893,11 @@ def print_result(r: AuctionResult):
     print(f"  涨跌:{r.change_pct:+.2f}% 跳空:{r.open_gap:+.2f}% {arrow}")
     print(f"  成交:{r.volume:,}手 金额:{r.amount:,.0f}万")
     print(f"  量比:{r.volume_ratio}x 换手:{r.turnover:.2f}% 振幅:{r.amplitude:.2f}%")
-    print(f"  外盘:{r.buy_ratio:.1f}% 内盘:{100-r.buy_ratio:.1f}%")
+
+    if is_near_auction():
+        print(f"  买一量:{r.buy_vol:,} 卖一量:{r.sell_vol:,}")
+    else:
+        print(f"  外盘:{r.buy_ratio:.1f}% 内盘:{100-r.buy_ratio:.1f}%")
     print()
     for s in r.signals:
         print(f"    {s}")
@@ -802,11 +996,24 @@ def save_html(results: List[AuctionResult], path: str, market_indices: dict = No
         strategy = _compute_strategy(r)
         vol_fmt = _format_volume(r.volume)
 
-        # 竞昨比（今开 vs 昨收）
-        if r.prev_close > 0:
+        # 竞昨比：竞价量 / 昨日成交量 × 100%
+        if r.auction_vol_ratio > 0:
+            comp_ratio = f"{r.auction_vol_ratio:.1f}%"
+        elif r.prev_close > 0:
             comp_ratio = f"{(r.open_price - r.prev_close) / r.prev_close * 100:.1f}%"
         else:
             comp_ratio = "-"
+
+        # 剩余率：竞价阶段用五档买卖量估算
+        if is_near_auction():
+            bid1 = r.buy_vol or 0
+            ask1 = r.sell_vol or 0
+            if bid1 + ask1 > 0:
+                remain_rate = f"{bid1 / (bid1 + ask1) * 100:.1f}%"
+            else:
+                remain_rate = "-"
+        else:
+            remain_rate = f"{r.buy_ratio:.1f}%"
 
         rows += f"""<tr>
 <td>{r.code}</td>
@@ -815,7 +1022,7 @@ def save_html(results: List[AuctionResult], path: str, market_indices: dict = No
 <td>{r.price:.2f}</td>
 <td>{vol_fmt}</td>
 <td>{comp_ratio}</td>
-<td>{r.buy_ratio:.1f}%</td>
+<td>{remain_rate}</td>
 <td style="color:{chg_color}">{chg_str}</td>
 <td style="color:{v_color};background:{v_bg};border-radius:4px;font-weight:600">{r.verdict}({r.confidence})</td>
 <td>{freq}</td>
@@ -852,8 +1059,8 @@ tr:hover{{background:#161b22}}
 <div class="tbl-wrap">
 <table>
 <thead><tr>
-<th>代码</th><th>名称</th><th>09:25</th><th>09:26</th><th>搓合量</th>
-<th>竞昨比</th><th>剩余率</th><th>09:26涨幅</th>
+<th>代码</th><th>名称</th><th>开盘价</th><th>最新价</th><th>竞价量</th>
+<th>竞昨比</th><th>剩余率</th><th>涨幅</th>
 <th>筹码判断</th><th>频次</th><th>策略</th>
 </tr></thead>
 <tbody>{rows}</tbody>
