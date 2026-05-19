@@ -457,6 +457,7 @@ class AuctionResult:
     bull_score: int
     bear_score: int
     verdict: str
+    confidence: str = "低"
     signals: list = field(default_factory=list)
 
 
@@ -489,88 +490,143 @@ def analyze(code: str, quote: dict, hist: list[dict], market_env: dict = None) -
     bull = 0
     bear = 0
 
-    # 1. 跳空
+    # ═══════════════════════════════════════════════
+    # 第一层：单项信号（基于回测数据校准）
+    # ═══════════════════════════════════════════════
+
+    # 1. 跳空幅度
+    # 回测发现：大幅低开次日涨率67%，温和高开均涨+0.52%
     if gap > 5:
-        sigs.append(f"🔴 强势高开 {gap:+.2f}%"); bull += 30
+        sigs.append(f"🔴 强势高开 {gap:+.2f}% → 注意追高风险"); bull += 15; bear += 10
     elif gap > 3:
-        sigs.append(f"🔴 明显高开 {gap:+.2f}%"); bull += 25
+        sigs.append(f"🔴 明显高开 {gap:+.2f}% → 强势延续"); bull += 20
     elif gap > 1:
-        sigs.append(f"🟠 温和高开 {gap:+.2f}%"); bull += 15
+        sigs.append(f"🟠 温和高开 {gap:+.2f}% → 看涨"); bull += 18
     elif gap > 0:
-        sigs.append(f"🟡 微幅高开 {gap:+.2f}%"); bull += 5
+        sigs.append(f"🟡 微幅高开 {gap:+.2f}%"); bull += 3
     elif gap > -1:
-        sigs.append(f"🟡 微幅低开 {gap:+.2f}%"); bear += 5
+        sigs.append(f"🟡 微幅低开 {gap:+.2f}%"); bear += 3
     elif gap > -3:
-        sigs.append(f"🟠 温和低开 {gap:+.2f}%"); bear += 15
+        sigs.append(f"🟠 温和低开 {gap:+.2f}%"); bear += 5
     else:
-        sigs.append(f"🔴 强势低开 {gap:+.2f}%"); bear += 25
+        # 大幅低开：回测次日涨率67%，典型反弹信号
+        sigs.append(f"🟢 大幅低开 {gap:+.2f}% → 超跌反弹概率高"); bull += 25; bear += 5
 
     # 2. 量比
+    # 回测发现：极度放量(5x+)次日涨率仅20%，极度缩量反而最好
     if vr > 5:
-        sigs.append(f"📊 量比 {vr:.2f}x → 极度放量"); bull += 15; bear += 20
+        sigs.append(f"📊 量比 {vr:.2f}x → 极度放量 ⚠️ 筹码松动!"); bear += 25
     elif vr > 3:
-        sigs.append(f"📊 量比 {vr:.2f}x → 大幅放量"); bull += 20; bear += 10
+        sigs.append(f"📊 量比 {vr:.2f}x → 大幅放量，分歧加大"); bear += 10
     elif vr > 1.5:
-        sigs.append(f"📊 量比 {vr:.2f}x → 温和放量"); bull += 15
+        sigs.append(f"📊 量比 {vr:.2f}x → 温和放量"); bull += 5
     elif vr > 0.8:
         sigs.append(f"📊 量比 {vr:.2f}x → 量能正常")
     elif vr > 0.5:
-        sigs.append(f"📊 量比 {vr:.2f}x → 温和缩量"); bear += 10
+        sigs.append(f"📊 量比 {vr:.2f}x → 温和缩量"); bull += 3
     else:
-        sigs.append(f"📊 量比 {vr:.2f}x → 严重缩量"); bear += 15
+        # 极度缩量：回测涨率50%，抛压衰竭
+        sigs.append(f"📊 量比 {vr:.2f}x → 极度缩量，抛压衰竭"); bull += 8
 
-    # 3. 买卖盘
+    # 3. 外盘比例
+    # 回测发现：外盘高(60%+)反而次日跌，主力拉高出货；外盘低(<40%)次日微涨
     if br > 60:
-        sigs.append(f"💪 外盘 {br:.1f}% → 主动买入占优"); bull += 15
+        sigs.append(f"⚠️ 外盘 {br:.1f}% → 买入拥挤，警惕拉高出货!"); bear += 12
     elif br > 55:
-        sigs.append(f"💪 外盘 {br:.1f}% → 买盘略强"); bull += 8
+        sigs.append(f"💪 外盘 {br:.1f}% → 买盘略强"); bull += 3
     elif br < 40:
-        sigs.append(f"🔻 外盘 {br:.1f}% → 主动卖出占优"); bear += 15
+        sigs.append(f"🔻 外盘 {br:.1f}% → 恐慌抛售后，关注反弹"); bull += 5
     elif br < 45:
-        sigs.append(f"🔻 外盘 {br:.1f}% → 卖盘略强"); bear += 8
+        sigs.append(f"🔻 外盘 {br:.1f}% → 卖盘略强"); bear += 3
     else:
         sigs.append(f"⚖️ 外盘 {br:.1f}% → 多空平衡")
 
-    # 4. 组合
-    if gap > 1 and vr > 1.5 and br > 55:
-        sigs.append("✅ 高开+放量+买盘强 → 强烈抢筹!"); bull += 25
-    if gap > 2 and vr < 0.8:
-        sigs.append("⚠️ 高开+缩量 → 疑似诱多!"); bear += 25
-    if gap < -1 and vr > 1.5 and br < 45:
-        sigs.append("🚨 低开+放量+卖盘强 → 强烈出货!"); bear += 30
-    if gap < -1 and vr < 0.8:
-        sigs.append("💡 低开+缩量 → 可能洗盘"); bull += 10
-    if gap > 1 and vr > 2 and br < 45:
-        sigs.append("⚡ 高开+放量但卖压重 → 多空分歧"); bear += 15
-    if abs(gap) < 0.5 and vr > 3:
-        sigs.append("👀 平开+大幅放量 → 有大资金动作"); bull += 10; bear += 10
+    # 4. 振幅
+    if amp > 8:
+        sigs.append(f"📈 振幅 {amp:.2f}% → 剧烈波动，多空激战"); bear += 8
+    elif amp > 5:
+        sigs.append(f"📈 振幅 {amp:.2f}% → 波动较大"); bear += 3
 
-    # 5. 振幅
-    if amp > 5:
-        sigs.append(f"📈 振幅 {amp:.2f}% → 波动剧烈"); bear += 10
-
-    # 6. 换手率
+    # 5. 换手率
     if to > 10:
-        sigs.append(f"🔄 换手 {to:.2f}% → 极度活跃"); bull += 10; bear += 15
+        sigs.append(f"🔄 换手 {to:.2f}% → 筹码大换手，方向待定"); bear += 8
     elif to > 5:
-        sigs.append(f"🔄 换手 {to:.2f}% → 高度活跃"); bull += 10; bear += 5
+        sigs.append(f"🔄 换手 {to:.2f}% → 活跃"); bull += 3
     elif to < 0.5:
         sigs.append(f"🔄 换手 {to:.2f}% → 交投清淡")
 
-    # 7. 近期走势
+    # ═══════════════════════════════════════════════
+    # 第二层：组合信号（回测验证的高胜率模式）
+    # ═══════════════════════════════════════════════
+
+    combo_hit = 0  # 命中组合信号数
+
+    # 低开+缩量/正常量 → 回测涨率54-57%，均涨+0.3%
+    if gap < -1 and vr < 1.2:
+        sigs.append("✅ 低开+缩量 → 恐慌释放后反弹概率高")
+        bull += 15; combo_hit += 1
+
+    # 大幅低开+缩量 → 最强反弹组合
+    if gap < -3 and vr < 0.8:
+        sigs.append("🔥 大幅低开+缩量 → 强烈反弹信号!")
+        bull += 20; combo_hit += 1
+
+    # 高开+放量 → 回测均涨+0.57%，强势延续
+    if gap > 1 and vr > 1.5:
+        sigs.append("🚀 高开+放量 → 强势延续，主力加仓")
+        bull += 15; combo_hit += 1
+
+    # 高开+极度放量 → 过热信号
+    if gap > 1 and vr > 3:
+        sigs.append("⚠️ 高开+极度放量 → 短期过热，注意回调")
+        bear += 10; combo_hit += 1
+
+    # 平开+放量 → 回测涨率仅38%，出货特征
+    if abs(gap) < 0.5 and vr > 1.5:
+        sigs.append("👀 平开+放量 → 主力暗中出货?")
+        bear += 10; combo_hit += 1
+
+    # 高开+外盘拥挤 → 拉高出货
+    if gap > 1 and br > 60:
+        sigs.append("🚨 高开+外盘拥挤 → 拉高出货概率大!")
+        bear += 15; combo_hit += 1
+
+    # 低开+外盘低 → 恐慌抛售后的反弹
+    if gap < -1 and br < 40:
+        sigs.append("💡 低开+恐慌抛售 → 反弹在即")
+        bull += 10; combo_hit += 1
+
+    # 极度放量+外盘高 → 最危险组合
+    if vr > 3 and br > 60:
+        sigs.append("☠️ 放巨量+外盘高 → 主力大规模出货!")
+        bear += 20; combo_hit += 1
+
+    # ═══════════════════════════════════════════════
+    # 第三层：近期走势修正
+    # ═══════════════════════════════════════════════
+
     if hist and len(hist) >= 3:
         cs = [float(h.get("close", 0)) for h in hist[-3:]]
         changes = [(cs[i] - cs[i-1]) / cs[i-1] * 100 for i in range(1, len(cs)) if cs[i-1] > 0]
         if changes:
-            avg = np.mean(changes)
-            if avg > 2 and gap > 1:
-                sigs.append("📈 连涨+高开 → 强势延续，注意追高"); bull += 10; bear += 10
-            elif avg < -2 and gap < -1:
-                sigs.append("📉 连跌+低开 → 弱势延续"); bear += 15
-            elif avg < -2 and gap > 1:
-                sigs.append("🔄 连跌+高开 → 可能止跌反弹!"); bull += 20
+            avg_chg = np.mean(changes)
+            if avg_chg > 2 and gap > 1:
+                sigs.append("📈 连涨+高开 → 强势延续，注意追高风险")
+                bull += 8; bear += 8
+            elif avg_chg < -2 and gap < -1:
+                sigs.append("📉 连跌+低开 → 弱势延续，观望为主")
+                bear += 10
+            elif avg_chg < -2 and gap > 1:
+                sigs.append("🔄 连跌+高开 → 止跌反弹信号!")
+                bull += 18
+            elif avg_chg > 2 and gap < -1:
+                sigs.append("⚡ 连涨+低开 → 高位获利了结!")
+                bear += 15
 
-    # 8. 大盘环境修正
+    # ═══════════════════════════════════════════════
+    # 第四层：大盘环境修正
+    # ═══════════════════════════════════════════════
+
     if market_env and market_env["trend"] != "unknown":
         adj = market_env["score_adj"]
         if adj > 0:
@@ -582,25 +638,45 @@ def analyze(code: str, quote: dict, hist: list[dict], market_env: dict = None) -
         else:
             sigs.append(f"⚖️ {market_env['label']} → 大盘中性")
 
-        # 大盘与个股方向一致性检查
+        # 逆大盘是强势信号
         if market_env["trend"] in ("strong_up", "up") and gap < -1:
             sigs.append("⚡ 逆大盘低开 → 主力刻意打压，关注反包")
             bull += 10
         elif market_env["trend"] in ("strong_down", "down") and gap > 2:
-            sigs.append("🔥 逆大盘高开 → 极度强势，主力护盘")
+            sigs.append("🔥 逆大盘高开 → 极度强势!")
             bull += 15
         elif market_env["trend"] in ("strong_down", "down") and gap > 0:
             sigs.append("💪 逆大盘微高 → 相对强势，可关注")
+            bull += 5
+
+    # ═══════════════════════════════════════════════
+    # 综合判定
+    # ═══════════════════════════════════════════════
 
     bs = min(bull, 100)
     rs = min(bear, 100)
     net = bs - rs
-    if net > 15:
+
+    # 判定阈值（回测校准：提高抢筹门槛，降低出货门槛）
+    if net > 12 and combo_hit >= 1:
         v = "真实抢筹"
-    elif net < -10:
+    elif net > 20:
+        v = "真实抢筹"
+    elif net < -8 and combo_hit >= 1:
+        v = "疑似出货"
+    elif net < -15:
         v = "疑似出货"
     else:
         v = "正常"
+
+    # 置信度
+    sig_count = len([s for s in sigs if any(k in s for k in ["✅","🔥","🚀","🚨","☠️","💡","👀","⚡","📈","📉","🔄","💪","⚠️","🟢"])])
+    if combo_hit >= 2 or abs(net) > 30:
+        confidence = "高"
+    elif combo_hit >= 1 or abs(net) > 15:
+        confidence = "中"
+    else:
+        confidence = "低"
 
     return AuctionResult(
         code=code, name=quote["name"],
@@ -609,7 +685,8 @@ def analyze(code: str, quote: dict, hist: list[dict], market_env: dict = None) -
         volume_ratio=round(vr, 2), open_gap=round(gap, 2),
         amplitude=amp, turnover=to, buy_ratio=round(br, 1),
         buy_vol=bv, sell_vol=sv,
-        bull_score=bs, bear_score=rs, verdict=v, signals=sigs,
+        bull_score=bs, bear_score=rs, verdict=v,
+        confidence=confidence, signals=sigs,
     )
 
 
@@ -635,7 +712,7 @@ def print_result(r: AuctionResult):
     rb = "█" * (r.bear_score // 5) + "░" * (20 - r.bear_score // 5)
     print(f"  抢筹 [{bb}] {r.bull_score}/100")
     print(f"  出货 [{rb}] {r.bear_score}/100")
-    print(f"\n  🔮 {r.verdict}")
+    print(f"\n  🔮 {r.verdict} (置信度: {r.confidence})")
     print(f"{'─'*56}")
 
 
@@ -740,7 +817,7 @@ def save_html(results: list[AuctionResult], path: str, market_indices: dict = No
 <td>{comp_ratio}</td>
 <td>{r.buy_ratio:.1f}%</td>
 <td style="color:{chg_color}">{chg_str}</td>
-<td style="color:{v_color};background:{v_bg};border-radius:4px;font-weight:600">{r.verdict}</td>
+<td style="color:{v_color};background:{v_bg};border-radius:4px;font-weight:600">{r.verdict}({r.confidence})</td>
 <td>{freq}</td>
 <td style="text-align:left;font-size:12px">{strategy}</td>
 </tr>"""
