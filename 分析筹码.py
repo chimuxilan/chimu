@@ -27,6 +27,14 @@ HEADERS = {
     "Referer": "https://quote.eastmoney.com/",
 }
 
+# 大盘指数代码
+MARKET_INDICES = {
+    "sh000001": "上证指数",
+    "sz399001": "深证成指",
+    "sz399006": "创业板指",
+    "sh000300": "沪深300",
+}
+
 
 # ============================================================
 # 股票名称 → 代码 查询
@@ -299,6 +307,98 @@ def fetch_quotes(codes: list[str]) -> dict:
     return results
 
 
+def fetch_market_indices() -> dict:
+    """
+    获取大盘指数实时行情
+    返回 {指数代码: {name, price, change_pct, amount, volume, high, low, open, prev_close}}
+    """
+    symbols = ",".join(MARKET_INDICES.keys())
+    try:
+        r = requests.get(f"https://qt.gtimg.cn/q={symbols}", headers=HEADERS, timeout=15)
+        r.encoding = "gbk"
+    except Exception as e:
+        print(f"  ⚠ 大盘行情请求失败: {e}")
+        return {}
+
+    results = {}
+    for line in r.text.strip().split("\n"):
+        m = re.search(r'v_\w+="(.+)"', line)
+        if not m:
+            continue
+        f = m.group(1).split("~")
+        if len(f) < 50:
+            continue
+        code = f[2]
+
+        def _v(i, t=float):
+            try:
+                return t(f[i]) if f[i] else (t(0) if t != str else "")
+            except (ValueError, IndexError):
+                return t(0) if t != str else ""
+
+        results[code] = {
+            "name": f[1],
+            "code": code,
+            "price": _v(3),
+            "prev_close": _v(4),
+            "open": _v(5),
+            "volume": _v(6, int),
+            "change_pct": _v(32),
+            "high": _v(33),
+            "low": _v(34),
+            "amount": _v(37),
+        }
+    return results
+
+
+def judge_market_env(indices: dict) -> dict:
+    """
+    根据三大指数判断大盘环境
+    返回 {trend, label, color, score_adj, desc}
+      score_adj: 对个股抢筹/出货分的修正值
+    """
+    if not indices:
+        return {"trend": "unknown", "label": "未知", "color": "#8b949e",
+                "score_adj": 0, "desc": "未获取到大盘数据"}
+
+    sh = indices.get("000001", {}).get("change_pct", 0)
+    cy = indices.get("399006", {}).get("change_pct", 0)
+    avg = (sh + cy) / 2
+
+    if avg > 1.5:
+        return {"trend": "strong_up", "label": "大盘强势", "color": "#f85149",
+                "score_adj": 8, "desc": f"大盘强势上攻，做多氛围浓厚（上证{sh:+.2f}% 创业板{cy:+.2f}%）"}
+    elif avg > 0.5:
+        return {"trend": "up", "label": "大盘偏多", "color": "#f85149",
+                "score_adj": 4, "desc": f"大盘温和上涨，情绪偏暖（上证{sh:+.2f}% 创业板{cy:+.2f}%）"}
+    elif avg > -0.5:
+        return {"trend": "neutral", "label": "大盘震荡", "color": "#d29922",
+                "score_adj": 0, "desc": f"大盘窄幅震荡，多空平衡（上证{sh:+.2f}% 创业板{cy:+.2f}%）"}
+    elif avg > -1.5:
+        return {"trend": "down", "label": "大盘偏空", "color": "#3fb950",
+                "score_adj": -5, "desc": f"大盘温和下跌，情绪偏冷（上证{sh:+.2f}% 创业板{cy:+.2f}%）"}
+    else:
+        return {"trend": "strong_down", "label": "大盘弱势", "color": "#3fb950",
+                "score_adj": -10, "desc": f"大盘大幅下挫，恐慌情绪蔓延（上证{sh:+.2f}% 创业板{cy:+.2f}%）"}
+
+
+def print_market_overview(indices: dict, env: dict):
+    """终端打印大盘概览"""
+    print(f"\n{'━'*56}")
+    print(f"  📈 大盘实时概况  {env['label']}")
+    print(f"{'━'*56}")
+    for full_code, label in MARKET_INDICES.items():
+        code = full_code[2:]
+        idx = indices.get(code)
+        if not idx:
+            continue
+        chg = idx["change_pct"]
+        arrow = "🔴" if chg > 0 else ("🟢" if chg < 0 else "⚪")
+        print(f"  {arrow} {label:　<6s} {idx['price']:>10.2f}  {chg:+.2f}%")
+    print(f"\n  💡 {env['desc']}")
+    print(f"{'━'*56}")
+
+
 def fetch_hist(code: str, days: int = 10) -> list[dict]:
     """获取近期日K线"""
     try:
@@ -360,7 +460,7 @@ class AuctionResult:
     signals: list = field(default_factory=list)
 
 
-def analyze(code: str, quote: dict, hist: list[dict]) -> Optional[AuctionResult]:
+def analyze(code: str, quote: dict, hist: list[dict], market_env: dict = None) -> Optional[AuctionResult]:
     pc = quote["prev_close"]
     op = quote["open"]
     if pc <= 0 or op <= 0:
@@ -470,6 +570,28 @@ def analyze(code: str, quote: dict, hist: list[dict]) -> Optional[AuctionResult]
             elif avg < -2 and gap > 1:
                 sigs.append("🔄 连跌+高开 → 可能止跌反弹!"); bull += 20
 
+    # 8. 大盘环境修正
+    if market_env and market_env["trend"] != "unknown":
+        adj = market_env["score_adj"]
+        if adj > 0:
+            sigs.append(f"📈 {market_env['label']} → 大盘助涨 +{adj}分")
+            bull += adj
+        elif adj < 0:
+            sigs.append(f"📉 {market_env['label']} → 大盘拖累 {adj}分")
+            bear += abs(adj)
+        else:
+            sigs.append(f"⚖️ {market_env['label']} → 大盘中性")
+
+        # 大盘与个股方向一致性检查
+        if market_env["trend"] in ("strong_up", "up") and gap < -1:
+            sigs.append("⚡ 逆大盘低开 → 主力刻意打压，关注反包")
+            bull += 10
+        elif market_env["trend"] in ("strong_down", "down") and gap > 2:
+            sigs.append("🔥 逆大盘高开 → 极度强势，主力护盘")
+            bull += 15
+        elif market_env["trend"] in ("strong_down", "down") and gap > 0:
+            sigs.append("💪 逆大盘微高 → 相对强势，可关注")
+
     bs = min(bull, 100)
     rs = min(bear, 100)
     net = bs - rs
@@ -552,8 +674,33 @@ def _compute_frequency(r: AuctionResult) -> int:
     return len([s for s in r.signals if any(k in s for k in ["高开", "低开", "放量", "缩量", "买盘", "卖盘", "连涨", "连跌", "平开"])])
 
 
-def save_html(results: list[AuctionResult], path: str) -> str:
+def save_html(results: list[AuctionResult], path: str, market_indices: dict = None, market_env: dict = None) -> str:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # 大盘概览 HTML
+    market_html = ""
+    if market_indices and market_env:
+        env_color = market_env.get("color", "#8b949e")
+        env_label = market_env.get("label", "未知")
+        env_desc = market_env.get("desc", "")
+        idx_rows = ""
+        for full_code, label in MARKET_INDICES.items():
+            code = full_code[2:]
+            idx = market_indices.get(code)
+            if not idx:
+                continue
+            chg = idx["change_pct"]
+            chg_color = "#f85149" if chg > 0 else ("#3fb950" if chg < 0 else "#c9d1d9")
+            idx_rows += f"""<div class="idx-card">
+<div class="idx-name">{label}</div>
+<div class="idx-price" style="color:{chg_color}">{idx['price']:.2f}</div>
+<div class="idx-chg" style="color:{chg_color}">{chg:+.2f}%</div>
+</div>"""
+        market_html = f"""<div class="market-box">
+<div class="market-title">📈 大盘实时概况 <span class="env-tag" style="background:{env_color};color:#fff;padding:2px 8px;border-radius:4px;font-size:12px;margin-left:8px">{env_label}</span></div>
+<div class="idx-row">{idx_rows}</div>
+<div class="market-desc">{env_desc}</div>
+</div>"""
 
     # 按涨幅降序
     sorted_results = sorted(results, key=lambda x: x.change_pct, reverse=True)
@@ -607,6 +754,14 @@ body{{font-family:"Microsoft YaHei","PingFang SC",sans-serif;background:#0d1117;
 .hd{{text-align:center;padding:16px 0}}
 .hd h1{{font-size:20px;color:#58a6ff}}
 .hd .t{{color:#8b949e;font-size:12px;margin-top:4px}}
+.market-box{{max-width:1100px;margin:0 auto 16px;background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 16px}}
+.market-title{{font-size:14px;font-weight:600;color:#58a6ff;margin-bottom:10px}}
+.idx-row{{display:flex;gap:12px;flex-wrap:wrap;justify-content:center}}
+.idx-card{{flex:1;min-width:120px;text-align:center;padding:8px;background:#0d1117;border-radius:6px}}
+.idx-name{{font-size:12px;color:#8b949e;margin-bottom:4px}}
+.idx-price{{font-size:16px;font-weight:700}}
+.idx-chg{{font-size:13px;font-weight:600;margin-top:2px}}
+.market-desc{{font-size:12px;color:#8b949e;margin-top:8px;text-align:center}}
 .tbl-wrap{{overflow-x:auto;margin:0 auto;max-width:1100px}}
 table{{width:100%;border-collapse:collapse;font-size:13px;white-space:nowrap}}
 th{{background:#161b22;color:#8b949e;font-weight:600;padding:8px 10px;text-align:center;border-bottom:2px solid #30363d;position:sticky;top:0}}
@@ -616,6 +771,7 @@ tr:hover{{background:#161b22}}
 @media(max-width:768px){{table{{font-size:11px}}th,td{{padding:4px 6px}}}}
 </style></head><body>
 <div class="hd"><h1>📊 集合竞价 - 股票筛选</h1><div class="t">更新时间: {now}</div></div>
+{market_html}
 <div class="tbl-wrap">
 <table>
 <thead><tr>
@@ -636,10 +792,23 @@ tr:hover{{background:#161b22}}
 # 核心接口
 # ============================================================
 
-def run(codes: list[str], html_path: str = None) -> list[AuctionResult]:
+def run(codes: list[str], html_path: str = None, market_indices: dict = None, market_env: dict = None, quiet: bool = False) -> list[AuctionResult]:
     """
     分析指定股票代码列表
+    market_indices/market_env: 若传入则跳过重复获取
+    quiet: 传入 True 时跳过大盘打印（由调用方负责）
     """
+    if market_indices is None:
+        print("📈 获取大盘指数...")
+        market_indices = fetch_market_indices()
+        market_env = judge_market_env(market_indices)
+        if market_indices:
+            print_market_overview(market_indices, market_env)
+        else:
+            print("  ⚠ 未获取到大盘数据，跳过大盘修正")
+    elif not quiet:
+        print_market_overview(market_indices, market_env)
+
     quotes = fetch_quotes(codes)
     if not quotes:
         return []
@@ -648,15 +817,15 @@ def run(codes: list[str], html_path: str = None) -> list[AuctionResult]:
         if code not in quotes:
             continue
         hist = fetch_hist(code, days=10)
-        r = analyze(code, quotes[code], hist)
+        r = analyze(code, quotes[code], hist, market_env=market_env)
         if r:
             results.append(r)
     if html_path and results:
-        save_html(results, html_path)
+        save_html(results, html_path, market_indices=market_indices, market_env=market_env)
     return results
 
 
-def run_by_names(names: list[str], html_path: str = None) -> list[AuctionResult]:
+def run_by_names(names: list[str], html_path: str = None, market_indices: dict = None, market_env: dict = None, quiet: bool = False) -> list[AuctionResult]:
     """
     通过股票名称查询代码并分析
     """
@@ -675,7 +844,7 @@ def run_by_names(names: list[str], html_path: str = None) -> list[AuctionResult]
     if not codes:
         return []
 
-    results = run(codes, html_path=html_path)
+    results = run(codes, html_path=html_path, market_indices=market_indices, market_env=market_env, quiet=quiet)
     # 补回名称映射
     for r in results:
         if r.code in name_map:
@@ -683,7 +852,7 @@ def run_by_names(names: list[str], html_path: str = None) -> list[AuctionResult]
     return results
 
 
-def run_by_image(image_path: str, html_path: str = None) -> list[AuctionResult]:
+def run_by_image(image_path: str, html_path: str = None, market_indices: dict = None, market_env: dict = None, quiet: bool = False) -> list[AuctionResult]:
     """
     从截图中识别股票并分析
     """
@@ -698,7 +867,7 @@ def run_by_image(image_path: str, html_path: str = None) -> list[AuctionResult]:
         return []
 
     print(f"  识别到 {len(keywords)} 个关键词: {', '.join(keywords)}")
-    return run_by_names(keywords, html_path=html_path)
+    return run_by_names(keywords, html_path=html_path, market_indices=market_indices, market_env=market_env, quiet=quiet)
 
 
 # ============================================================
@@ -738,9 +907,19 @@ def main():
     # 收集所有输入
     all_results = []
 
+    # 获取大盘数据（只获取一次）
+    print("📈 获取大盘指数...")
+    market_indices = fetch_market_indices()
+    market_env = judge_market_env(market_indices)
+    if market_indices:
+        print_market_overview(market_indices, market_env)
+    else:
+        print("  ⚠ 未获取到大盘数据")
+
     # 图片输入
     if args.image:
-        img_results = run_by_image(args.image, html_path=None)
+        img_results = run_by_image(args.image, html_path=None,
+                                    market_indices=market_indices, market_env=market_env, quiet=True)
         all_results.extend(img_results)
 
     # 文本输入（代码或名称）
@@ -757,11 +936,13 @@ def main():
 
         if codes:
             print(f"\n📋 直接代码: {', '.join(codes)}")
-            code_results = run(codes, html_path=None)
+            code_results = run(codes, html_path=None,
+                               market_indices=market_indices, market_env=market_env, quiet=True)
             all_results.extend(code_results)
 
         if names:
-            name_results = run_by_names(names, html_path=None)
+            name_results = run_by_names(names, html_path=None,
+                                        market_indices=market_indices, market_env=market_env, quiet=True)
             all_results.extend(name_results)
 
     if not all_results:
@@ -797,7 +978,7 @@ def main():
         print(f"  ⚠️  仅供参考")
         print(f"{'='*56}")
 
-    path = save_html(all_results, args.html)
+    path = save_html(all_results, args.html, market_indices=market_indices, market_env=market_env)
     print(f"\n✅ HTML报告: {path}")
 
 
