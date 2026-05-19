@@ -17,7 +17,7 @@ import subprocess
 import numpy as np
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, List, Dict
 import argparse
 import os
 import sys
@@ -146,7 +146,7 @@ def _get_mimo_api_key() -> str:
     return ""
 
 
-def extract_stocks_from_image(image_path: str) -> list[str]:
+def extract_stocks_from_image(image_path: str) -> List[str]:
     """
     识别图片中的股票名称或代码
     优先用 MiMo API（需 key），无 key 时用本地 OCR（无需 key）
@@ -167,7 +167,7 @@ def extract_stocks_from_image(image_path: str) -> list[str]:
     return []
 
 
-def _ocr_via_mimo(image_path: str, api_key: str) -> list[str]:
+def _ocr_via_mimo(image_path: str, api_key: str) -> List[str]:
     """用 MiMo 多模态 API 识别"""
     prompt = (
         "请识别这张图片中的所有A股股票名称或代码。"
@@ -212,7 +212,7 @@ def _ocr_via_mimo(image_path: str, api_key: str) -> list[str]:
     return []
 
 
-def _ocr_via_local(image_path: str) -> list[str]:
+def _ocr_via_local(image_path: str) -> List[str]:
     """用本地 OCR 识别（rapidocr-onnxruntime，无需 API Key）"""
     try:
         from rapidocr_onnxruntime import RapidOCR
@@ -268,7 +268,7 @@ def _to_tencent(code: str) -> str:
     return f"sh{code}" if code.startswith(("6", "9")) else f"sz{code}"
 
 
-def fetch_quotes(codes: list[str]) -> dict:
+def fetch_quotes(codes: List[str]) -> dict:
     """批量获取腾讯实时行情"""
     symbols = ",".join(_to_tencent(c) for c in codes)
     try:
@@ -399,7 +399,7 @@ def print_market_overview(indices: dict, env: dict):
     print(f"{'━'*56}")
 
 
-def fetch_hist(code: str, days: int = 10) -> list[dict]:
+def fetch_hist(code: str, days: int = 10) -> List[dict]:
     """获取近期日K线"""
     try:
         r = requests.get(
@@ -461,7 +461,7 @@ class AuctionResult:
     signals: list = field(default_factory=list)
 
 
-def analyze(code: str, quote: dict, hist: list[dict], market_env: dict = None) -> Optional[AuctionResult]:
+def analyze(code: str, quote: dict, hist: List[dict], market_env: dict = None) -> Optional[AuctionResult]:
     pc = quote["prev_close"]
     op = quote["open"]
     if pc <= 0 or op <= 0:
@@ -751,7 +751,7 @@ def _compute_frequency(r: AuctionResult) -> int:
     return len([s for s in r.signals if any(k in s for k in ["高开", "低开", "放量", "缩量", "买盘", "卖盘", "连涨", "连跌", "平开"])])
 
 
-def save_html(results: list[AuctionResult], path: str, market_indices: dict = None, market_env: dict = None) -> str:
+def save_html(results: List[AuctionResult], path: str, market_indices: dict = None, market_env: dict = None) -> str:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     # 大盘概览 HTML
@@ -869,7 +869,7 @@ tr:hover{{background:#161b22}}
 # 核心接口
 # ============================================================
 
-def run(codes: list[str], html_path: str = None, market_indices: dict = None, market_env: dict = None, quiet: bool = False) -> list[AuctionResult]:
+def run(codes: List[str], html_path: str = None, market_indices: dict = None, market_env: dict = None, quiet: bool = False) -> List[AuctionResult]:
     """
     分析指定股票代码列表
     market_indices/market_env: 若传入则跳过重复获取
@@ -902,7 +902,7 @@ def run(codes: list[str], html_path: str = None, market_indices: dict = None, ma
     return results
 
 
-def run_by_names(names: list[str], html_path: str = None, market_indices: dict = None, market_env: dict = None, quiet: bool = False) -> list[AuctionResult]:
+def run_by_names(names: List[str], html_path: str = None, market_indices: dict = None, market_env: dict = None, quiet: bool = False) -> List[AuctionResult]:
     """
     通过股票名称查询代码并分析
     """
@@ -929,7 +929,7 @@ def run_by_names(names: list[str], html_path: str = None, market_indices: dict =
     return results
 
 
-def run_by_image(image_path: str, html_path: str = None, market_indices: dict = None, market_env: dict = None, quiet: bool = False) -> list[AuctionResult]:
+def run_by_image(image_path: str, html_path: str = None, market_indices: dict = None, market_env: dict = None, quiet: bool = False) -> List[AuctionResult]:
     """
     从截图中识别股票并分析
     """
