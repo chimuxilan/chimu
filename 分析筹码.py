@@ -14,7 +14,6 @@ import requests
 import re
 import json
 import subprocess
-import numpy as np
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict
@@ -657,7 +656,7 @@ def analyze(code: str, quote: dict, hist: List[dict], market_env: dict = None) -
     if hist:
         vs = [float(h.get("volume", 0)) for h in hist[-5:] if float(h.get("volume", 0)) > 0]
         if vs:
-            avg_vol = np.mean(vs)
+            avg_vol = sum(vs) / len(vs)
     vr = vol / avg_vol if avg_vol > 0 else 1.0
 
     # ── 外盘比例 ──
@@ -797,7 +796,7 @@ def analyze(code: str, quote: dict, hist: List[dict], market_env: dict = None) -
         cs = [float(h.get("close", 0)) for h in hist[-3:]]
         changes = [(cs[i] - cs[i-1]) / cs[i-1] * 100 for i in range(1, len(cs)) if cs[i-1] > 0]
         if changes:
-            avg_chg = np.mean(changes)
+            avg_chg = sum(changes) / len(changes)
             if avg_chg > 2 and gap > 1:
                 sigs.append("📈 连涨+高开 → 强势延续，注意追高风险")
                 bull += 8; bear += 8
