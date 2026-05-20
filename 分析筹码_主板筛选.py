@@ -995,6 +995,8 @@ def screen_mainboard_strategy() -> list[dict]:
                         return t(0) if t != str else ""
                 tencent_map[code] = {
                     "volume": _v(6, int),       # 手
+                    "buy_vol": _v(7, int),      # 外盘（手）
+                    "sell_vol": _v(8, int),     # 内盘（手）
                     "amount": _v(37),            # 万元
                     "turnover": _v(38),          # 换手率
                     "amplitude": _v(43),         # 振幅
@@ -1059,7 +1061,7 @@ def screen_mainboard_strategy() -> list[dict]:
     if not filtered:
         return []
 
-    # ========== 第五步：3日涨幅 < 15% ==========
+    # ========== 第五步：3日涨幅 < 15% + 获取昨日成交量 ==========
     print("📊 获取3日涨幅...")
     codes_to_fetch = [c["code"] for c in filtered]
     kline_map = _fetch_kline_concurrent(codes_to_fetch, days=5)
@@ -1077,11 +1079,70 @@ def screen_mainboard_strategy() -> list[dict]:
                 c["change_3d"] = round(change_3d, 2)
             else:
                 c["change_3d"] = 0
+            # 取倒数第二条K线的成交量作为"昨日成交量"（最后一条是今天）
+            if len(klines) >= 2:
+                c["yesterday_vol_hist"] = int(float(klines[-2].get("volume", 0)))
+            else:
+                c["yesterday_vol_hist"] = 0
         else:
             c["change_3d"] = 0
+            c["yesterday_vol_hist"] = 0
 
         c["change_pct"] = c["auction_gain"]
         final.append(c)
+
+    # ========== 第六步：计算展示字段 ==========
+    for c in final:
+        code = c["code"]
+        tc = tencent_map.get(code, {})
+
+        # 09:25 价格 = 竞价价格（open_price）
+        c["auction_price"] = c["open_price"]
+
+        # 09:26 价格 = 腾讯接口的当前价（竞价结束后第一笔成交）
+        c["price_0926"] = c["price"]
+
+        # 09:26涨幅 = (09:26价格 - 昨收) / 昨收 * 100
+        if c["prev_close"] > 0:
+            c["chg_0926"] = round((c["price_0926"] - c["prev_close"]) / c["prev_close"] * 100, 2)
+        else:
+            c["chg_0926"] = 0
+
+        # 竞昨比 = 竞价量 / 昨日成交量 * 100（用K线的昨日成交量）
+        auction_vol = c.get("auction_vol", c["volume"])
+        yesterday_vol = c.get("yesterday_vol_hist", 0)
+        if yesterday_vol <= 0:
+            yesterday_vol = c.get("yesterday_vol", 1)
+        c["comp_ratio"] = round(auction_vol / yesterday_vol * 100, 1) if yesterday_vol > 0 else 0
+
+        # 剩余率 = 买盘 / (买盘 + 卖盘) * 100
+        buy_vol = tc.get("buy_vol", 0)
+        sell_vol = tc.get("sell_vol", 0)
+        if buy_vol + sell_vol > 0:
+            c["remaining_rate"] = round(buy_vol / (buy_vol + sell_vol) * 100, 1)
+        else:
+            c["remaining_rate"] = 50.0
+
+        # 筹码判断
+        chg = c["auction_gain"]
+        vr = c.get("volume_ratio", 0)
+        rr = c["remaining_rate"]
+        if chg > 3 and vr > 3 and rr > 60:
+            c["verdict"] = "真实抢筹"
+        elif chg > 2 and vr > 2 and rr > 55:
+            c["verdict"] = "真实抢筹"
+        elif chg > 1 and vr > 2:
+            c["verdict"] = "真实抢筹"
+        elif chg < 0 or (vr > 5 and rr < 45):
+            c["verdict"] = "疑似出货"
+        else:
+            c["verdict"] = "正常"
+
+        # 频次
+        c["frequency"] = _compute_screen_frequency(c)
+
+        # 策略
+        c["strategy"] = _compute_screen_strategy(c)
 
     # 按竞价涨幅从大到小排序
     final.sort(key=lambda x: x["auction_gain"], reverse=True)
@@ -1090,8 +1151,50 @@ def screen_mainboard_strategy() -> list[dict]:
     return final
 
 
+def _compute_screen_strategy(s: dict) -> str:
+    """根据筛选结果推断策略"""
+    chg = s.get("auction_gain", 0)
+    vr = s.get("volume_ratio", 0)
+    chg_3d = s.get("change_3d", 0)
+
+    if chg >= 9.5:
+        return "一字板/涨停"
+    if vr > 5 and chg > 3:
+        return "5w首板、新首板"
+    if vr > 3 and chg > 2:
+        return "新首板"
+    if chg > 3 and chg_3d < 5:
+        return "新首板"
+    if chg > 2:
+        return "四万首板"
+    if chg > 1:
+        return "三万首板"
+    return "观望"
+
+
+def _compute_screen_frequency(s: dict) -> int:
+    """频次：基于量比和涨幅的信号命中数"""
+    freq = 0
+    vr = s.get("volume_ratio", 0)
+    chg = s.get("auction_gain", 0)
+    rr = s.get("remaining_rate", 50)
+    turnover = s.get("turnover", 0)
+
+    if vr > 3:
+        freq += 1
+    if chg > 3:
+        freq += 1
+    if rr > 60:
+        freq += 1
+    if turnover > 1:
+        freq += 1
+    if chg > 1 and vr > 2:
+        freq += 1
+    return freq
+
+
 def save_screen_html(stocks: list[dict], indices: list[dict], path: str) -> str:
-    """保存主板筛选策略HTML报告"""
+    """保存主板筛选策略HTML报告（与截图一致的格式）"""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     # 大盘指数板块
@@ -1115,65 +1218,69 @@ def save_screen_html(stocks: list[dict], indices: list[dict], path: str) -> str:
     # 股票表格
     rows = ""
     for i, s in enumerate(stocks, 1):
-        chg = s["auction_gain"]
-        color = "#f85149" if chg > 3 else ("#ffa657" if chg > 1 else "#c9d1d9")
-        chg_3d = s.get("change_3d", 0)
-        chg_3d_color = "#f85149" if chg_3d > 5 else ("#ffa657" if chg_3d > 0 else "#3fb950")
+        chg_0926 = s.get("chg_0926", 0)
+        chg_color = "#f85149" if chg_0926 > 0 else ("#3fb950" if chg_0926 < 0 else "#c9d1d9")
+
+        # 筹码判断颜色
+        verdict = s.get("verdict", "正常")
+        if verdict == "真实抢筹":
+            v_color = "#f85149"
+            v_bg = "rgba(248,81,73,.12)"
+        elif verdict == "疑似出货":
+            v_color = "#3fb950"
+            v_bg = "rgba(63,185,80,.12)"
+        else:
+            v_color = "#d29922"
+            v_bg = "rgba(210,153,34,.12)"
+
+        vol_fmt = _format_volume(s.get("auction_vol", s.get("volume", 0)))
+        comp_ratio = s.get("comp_ratio", 0)
+        remaining = s.get("remaining_rate", 50)
+        freq = s.get("frequency", 0)
+        strategy = s.get("strategy", "观望")
 
         rows += f"""<tr>
-<td>{i}</td>
 <td>{s["code"]}</td>
 <td style="text-align:left;font-weight:600">{s["name"]}</td>
-<td style="color:{color};font-weight:600">{chg:+.2f}%</td>
-<td>{s["price"]:.2f}</td>
-<td>{s["prev_close"]:.2f}</td>
-<td>{s["market_cap_yi"]:.0f}亿</td>
-<td>{s["volume"]:,}手</td>
-<td>{s.get("vol_ratio_yesterday", 0):.1f}%</td>
-<td>{s.get("turnover", 0):.3f}%</td>
-<td>{s.get("volume_ratio", 0):.1f}x</td>
-<td style="color:{chg_3d_color}">{chg_3d:+.2f}%</td>
+<td>{s["auction_price"]:.2f}</td>
+<td>{s.get("price_0926", s["price"]):.2f}</td>
+<td>{vol_fmt}</td>
+<td>{comp_ratio:.1f}%</td>
+<td>{remaining:.1f}%</td>
+<td style="color:{chg_color};font-weight:600">{chg_0926:+.2f}%</td>
+<td style="color:{v_color};background:{v_bg};border-radius:4px;font-weight:600;padding:4px 8px">{verdict}</td>
+<td>{freq}</td>
+<td style="text-align:left;font-size:12px">{strategy}</td>
 </tr>"""
 
     html = f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>主板筛选策略 - 集合竞价</title>
+<title>集合竞价 - 股票筛选</title>
 <style>
 *{{margin:0;padding:0;box-sizing:border-box}}
 body{{font-family:"Microsoft YaHei","PingFang SC",sans-serif;background:#0d1117;color:#c9d1d9;padding:16px}}
 .hd{{text-align:center;padding:16px 0}}
-.hd h1{{font-size:22px;color:#58a6ff}}
+.hd h1{{font-size:20px;color:#58a6ff}}
 .hd .t{{color:#8b949e;font-size:12px;margin-top:4px}}
-.criteria{{background:#161b22;border-radius:8px;padding:12px 16px;margin:12px auto;max-width:900px;font-size:12px;color:#8b949e;line-height:1.8}}
-.criteria b{{color:#ffa657}}
-.tbl-wrap{{overflow-x:auto;margin:0 auto;max-width:1200px}}
+.tbl-wrap{{overflow-x:auto;margin:0 auto;max-width:1100px}}
 table{{width:100%;border-collapse:collapse;font-size:13px;white-space:nowrap}}
 th{{background:#161b22;color:#8b949e;font-weight:600;padding:8px 10px;text-align:center;border-bottom:2px solid #30363d;position:sticky;top:0}}
 td{{padding:6px 10px;text-align:center;border-bottom:1px solid #21262d}}
 tr:hover{{background:#161b22}}
 .ft{{text-align:center;color:#484f58;font-size:10px;padding:20px 0}}
-.badge{{display:inline-block;background:#238636;color:#fff;border-radius:10px;padding:2px 8px;font-size:11px;margin-left:6px}}
 @media(max-width:768px){{table{{font-size:11px}}th,td{{padding:4px 6px}}}}
 </style></head><body>
-<div class="hd">
-<h1>📊 主板筛选策略 <span class="badge">集合竞价</span></h1>
-<div class="t">更新时间: {now} | 共筛选出 {len(stocks)} 只股票</div>
-</div>
-{idx_html}
-<div class="criteria">
-<b>筛选条件：</b>非ST | 竞价涨幅&gt;1% | 市值&lt;400亿 | 前一日涨停取反 | 非盘中下跌 |
-竞价量/昨成交量&gt;2% | 竞价换手率&gt;0.13% | 竞价量比&gt;3 | 3日涨幅&lt;15% | 现手量&gt;30000手
-</div>
+<div class="hd"><h1>📊 集合竞价 - 股票筛选</h1><div class="t">更新时间: {now}</div></div>
 <div class="tbl-wrap">
 <table>
 <thead><tr>
-<th>#</th><th>代码</th><th>名称</th><th>竞价涨幅</th><th>竞价价</th>
-<th>昨收</th><th>市值</th><th>竞价量</th><th>竞/昨量比</th>
-<th>换手率</th><th>量比</th><th>3日涨幅</th>
+<th>代码</th><th>名称</th><th>09:25</th><th>09:26</th><th>搓合量</th>
+<th>竞昨比</th><th>剩余率</th><th>09:26涨幅</th>
+<th>筹码判断</th><th>频次</th><th>策略</th>
 </tr></thead>
 <tbody>{rows}</tbody>
 </table></div>
-<div class="ft">⚠️ 仅供学习参考，不构成投资建议 | 数据来源: 东方财富</div>
+<div class="ft">⚠️ 仅供学习参考，不构成投资建议</div>
 </body></html>"""
 
     with open(path, "w", encoding="utf-8") as f:
@@ -1223,12 +1330,20 @@ def main():
 
         # 输出结果
         if not args.quiet:
-            print(f"\n{'─'*80}")
-            print(f"  {'#':>3}  {'代码':<8} {'名称':<8} {'竞价涨幅':>8} {'市值':>8} {'竞价量':>10} {'竞/昨量':>8} {'换手率':>8} {'量比':>6} {'3日涨幅':>8}")
-            print(f"{'─'*80}")
+            print(f"\n{'─'*90}")
+            print(f"  {'#':>3}  {'代码':<8} {'名称':<8} {'09:25':>7} {'09:26':>7} {'搓合量':>8} {'竞昨比':>7} {'剩余率':>7} {'09:26涨幅':>9} {'筹码判断':<8} {'频次':>4} {'策略':<12}")
+            print(f"{'─'*90}")
             for i, s in enumerate(stocks, 1):
-                print(f"  {i:>3}  {s['code']:<8} {s['name']:<8} {s['auction_gain']:>+7.2f}% {s['market_cap_yi']:>7.0f}亿 {s['volume']:>9,}手 {s.get('vol_ratio_yesterday',0):>7.1f}% {s.get('turnover',0):>7.3f}% {s.get('volume_ratio',0):>5.1f}x {s.get('change_3d',0):>+7.2f}%")
-            print(f"{'─'*80}")
+                vol_fmt = _format_volume(s.get("auction_vol", s.get("volume", 0)))
+                chg_0926 = s.get("chg_0926", 0)
+                comp_ratio = s.get("comp_ratio", 0)
+                remaining = s.get("remaining_rate", 50)
+                verdict = s.get("verdict", "正常")
+                freq = s.get("frequency", 0)
+                strategy = s.get("strategy", "观望")
+                arrow = "↑" if chg_0926 > 0 else ("↓" if chg_0926 < 0 else "→")
+                print(f"  {i:>3}  {s['code']:<8} {s['name']:<8} {s.get('auction_price', s['price']):>7.2f} {s.get('price_0926', s['price']):>7.2f} {vol_fmt:>8} {comp_ratio:>6.1f}% {remaining:>6.1f}% {chg_0926:>+8.2f}% {verdict:<8} {freq:>4} {strategy:<12}")
+            print(f"{'─'*90}")
 
         # 保存HTML
         html_path = args.html if args.html != "auction_report.html" else "screen_report.html"
