@@ -1123,23 +1123,52 @@ def screen_mainboard_strategy() -> list[dict]:
         else:
             c["remaining_rate"] = 50.0
 
-        # 筹码判断
+        # 筹码判断（筛选保证 chg>1%, vr>3）
         chg = c["auction_gain"]
         vr = c.get("volume_ratio", 0)
         rr = c["remaining_rate"]
-        if chg > 3 and vr > 3 and rr > 60:
-            c["verdict"] = "真实抢筹"
-        elif chg > 2 and vr > 2 and rr > 55:
-            c["verdict"] = "真实抢筹"
-        elif chg > 1 and vr > 2:
-            c["verdict"] = "真实抢筹"
-        elif chg < 0 or (vr > 5 and rr < 45):
-            c["verdict"] = "疑似出货"
-        else:
-            c["verdict"] = "正常"
+        cr = c.get("comp_ratio", 0)
 
-        # 频次
-        c["frequency"] = _compute_screen_frequency(c)
+        # 涨停/接近涨停 → 直接真实抢筹
+        if chg >= 9:
+            c["verdict"] = "真实抢筹"
+        else:
+            score = 0
+            # 涨幅
+            if chg >= 7: score += 3
+            elif chg >= 5: score += 2
+            elif chg >= 3: score += 1
+            # 量比（筛选保证>3）
+            if vr >= 10: score += 3
+            elif vr >= 7: score += 2
+            elif vr >= 5: score += 1
+            # 剩余率
+            if rr >= 65: score += 3
+            elif rr >= 55: score += 1
+            elif rr < 40: score -= 2
+            elif rr < 45: score -= 1
+            # 竞昨比
+            if cr >= 10: score += 2
+            elif cr >= 5: score += 1
+
+            if score >= 4:
+                c["verdict"] = "真实抢筹"
+            elif score <= 0:
+                c["verdict"] = "疑似出货"
+            else:
+                c["verdict"] = "正常"
+
+        # 频次（评分制：命中几个维度的强信号）
+        freq = 0
+        if vr >= 5:
+            freq += 1
+        if chg >= 5:
+            freq += 1
+        if rr >= 60:
+            freq += 1
+        if cr >= 3:
+            freq += 1
+        c["frequency"] = freq
 
         # 策略
         c["strategy"] = _compute_screen_strategy(c)
@@ -1152,24 +1181,24 @@ def screen_mainboard_strategy() -> list[dict]:
 
 
 def _compute_screen_strategy(s: dict) -> str:
-    """根据筛选结果推断策略"""
+    """根据筛选结果推断策略（阈值考虑筛选前提：chg>1%, vr>3）"""
     chg = s.get("auction_gain", 0)
     vr = s.get("volume_ratio", 0)
-    chg_3d = s.get("change_3d", 0)
+    rr = s.get("remaining_rate", 50)
 
     if chg >= 9.5:
         return "一字板/涨停"
-    if vr > 5 and chg > 3:
+    if chg >= 7 and vr >= 5:
         return "5w首板、新首板"
-    if vr > 3 and chg > 2:
+    if chg >= 5 and vr >= 5 and rr >= 55:
+        return "5w首板、新首板"
+    if chg >= 5:
         return "新首板"
-    if chg > 3 and chg_3d < 5:
+    if chg >= 3 and vr >= 5 and rr >= 55:
         return "新首板"
-    if chg > 2:
+    if chg >= 3:
         return "四万首板"
-    if chg > 1:
-        return "三万首板"
-    return "观望"
+    return "三万首板"
 
 
 def _compute_screen_frequency(s: dict) -> int:
