@@ -1194,13 +1194,14 @@ def main():
     parser.add_argument("inputs", nargs="*", help="股票代码或名称（可多个）")
     parser.add_argument("--image", "-i", help="股票截图图片路径")
     parser.add_argument("--html", "-o", default="auction_report.html", help="HTML报告保存路径")
-    parser.add_argument("--screen", "-s", action="store_true", help="主板筛选策略模式")
+    parser.add_argument("--screen", "-s", action="store_true", default=True, help="主板筛选策略模式（默认开启）")
+    parser.add_argument("--no-screen", dest="screen", action="store_false", help="关闭主板筛选，使用传统分析模式")
     parser.add_argument("--quiet", "-q", action="store_true", help="静默模式")
     args = parser.parse_args()
 
-    if not args.inputs and not args.image and not args.screen:
-        parser.print_help()
-        sys.exit(1)
+    # 没有指定股票/图片且没关闭screen → 自动进入筛选模式
+    if not args.inputs and not args.image:
+        args.screen = True
 
     print(f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
