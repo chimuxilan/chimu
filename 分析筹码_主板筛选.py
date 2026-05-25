@@ -2075,10 +2075,9 @@ def main():
 
         if not stocks:
             print("\n❌ 未找到符合条件的股票")
-            sys.exit(1)
 
         # 输出结果
-        if not args.quiet:
+        if stocks and not args.quiet:
             print(f"\n{'─'*120}")
             print(f"  {'#':>3}  {'代码':<8} {'名称':<8} {'板块':<10} {'龙头':>4} {'09:25':>7} {'09:26':>7} {'搓合量':>8} {'竞昨比':>7} {'剩余率':>7} {'涨幅':>7} {'筹码':<6} {'频次':>4} {'策略':<12}")
             print(f"{'─'*120}")
@@ -2097,10 +2096,12 @@ def main():
                 print(f"  {i:>3}  {s['code']:<8} {s['name']:<8} {sector:<10} {leader_mark:>4} {s.get('auction_price', s['price']):>7.2f} {s.get('price_0926', s['price']):>7.2f} {vol_fmt:>8} {comp_ratio:>6.1f}% {remaining:>6.1f}% {chg_0926:>+6.2f}% {verdict:<6} {freq:>4} {strategy:<12}")
             print(f"{'─'*120}")
 
-        # 保存HTML
+        # 保存HTML（无论是否有结果都生成）
         html_path = args.html if args.html != "auction_report.html" else "screen_report.html"
         path = save_screen_html(stocks, indices, html_path)
         print(f"\n✅ 筛选报告: {path}")
+        if not stocks:
+            sys.exit(1)
         return
 
     # ---- 原有分析模式 ----
