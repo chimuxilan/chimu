@@ -303,6 +303,8 @@ def fetch_hist(code: str, days: int = 10) -> list[dict]:
             import time; time.sleep(0.3)
 
     # 备用：腾讯接口
+    try:
+        sym = _to_tencent(code)
         end = datetime.now().strftime("%Y-%m-%d")
         start = (datetime.now() - timedelta(days=days * 2)).strftime("%Y-%m-%d")
         r = requests.get(
@@ -818,6 +820,8 @@ def _check_has_limit_up_in_days(code: str, days: int = 120, cached_klines: list[
         klines = cached_klines if cached_klines is not None else fetch_hist(code, days=days + 30)
         if not klines or len(klines) < 5:
             return False
+        # 只检查最近 N 天的数据
+        klines = klines[-days:]
         # 主板涨停10%，创业板/科创板20%
         if code.startswith(("30", "68")):
             limit_pct = 20
