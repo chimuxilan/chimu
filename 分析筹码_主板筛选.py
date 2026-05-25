@@ -1064,49 +1064,42 @@ def _screen_unified(candidates: list[dict], tencent_map: dict) -> list[dict]:
             continue
 
         # ---- 昨成交量（股→手）----
-        # 注意：板块接口不提供昨日成交量，volume_shares 可能为 0
-        # 当昨日成交量不可用时，后续依赖量比(volume_ratio)替代
         yesterday_vol_shares = c["volume_shares"]
         yesterday_vol_lots = yesterday_vol_shares // 100
+        if yesterday_vol_lots <= 0:
+            _diag["昨成交量>0"] = _diag.get("昨成交量>0", 0) + 1
+            continue
 
         # ---- 条件9: 今日竞价金额/昨日竞价金额 > 1.5倍 ----
-        # 注意：板块接口不提供昨日成交量，volume_shares 可能为 0
-        # 当昨日成交量不可用时，跳过此条件，依赖量比(volume_ratio)替代
-        if yesterday_vol_lots > 0:
-            today_auction_amount = auction_vol * c["price"] * 100      # 手→股 × 价格
-            yesterday_auction_amount = yesterday_vol_lots * c["prev_close"] * 100
-            if yesterday_auction_amount <= 0:
-                _diag["金额比"] = _diag.get("金额比", 0) + 1
-                continue
-            amount_ratio = today_auction_amount / yesterday_auction_amount
-            if amount_ratio <= 1.5:
-                _diag["金额比>1.5"] = _diag.get("金额比>1.5", 0) + 1
-                continue
-        else:
-            amount_ratio = 0  # 不可用，后续依赖量比判断
+        today_auction_amount = auction_vol * c["price"] * 100      # 手→股 × 价格
+        yesterday_auction_amount = yesterday_vol_lots * c["prev_close"] * 100
+        if yesterday_auction_amount <= 0:
+            _diag["金额比"] = _diag.get("金额比", 0) + 1
+            continue
+        amount_ratio = today_auction_amount / yesterday_auction_amount
+        if amount_ratio <= 1.5:
+            _diag["金额比>1.5"] = _diag.get("金额比>1.5", 0) + 1
+            continue
 
         # ---- 条件10: 集合竞价换手率 > 0.11% ----
-        # 注意：竞价时段腾讯接口可能不返回换手率，此时不作为硬性过滤条件
         turnover = tc.get("turnover", 0)
         if turnover <= 0:
             turnover = c.get("turnover_sina", 0)
-        if turnover > 0 and turnover <= 0.11:
+        if turnover <= 0.11:
             _diag["换手率>0.11%"] = _diag.get("换手率>0.11%", 0) + 1
             continue
 
         # ---- 条件11: 集合竞价量比 > 5 ----
-        # 注意：竞价时段腾讯接口可能不返回量比，且板块路径无昨成交量做fallback
-        # 仅当量比数据可用时才作为过滤条件
         volume_ratio = tc.get("volume_ratio_api", 0)
         if volume_ratio <= 0:
             volume_ratio = auction_vol / yesterday_vol_lots if yesterday_vol_lots > 0 else 0
-        if volume_ratio > 0 and volume_ratio <= 5:
+        if volume_ratio <= 5:
             _diag["量比>5"] = _diag.get("量比>5", 0) + 1
             continue
 
         # ---- 通过全部检查，记录 ----
         c["auction_vol"] = auction_vol
-        c["vol_ratio_yesterday"] = round(auction_vol / yesterday_vol_lots * 100, 2) if yesterday_vol_lots > 0 else 0
+        c["vol_ratio_yesterday"] = round(auction_vol / yesterday_vol_lots * 100, 2)
         c["volume_ratio"] = round(volume_ratio, 2)
         c["turnover"] = round(turnover, 4)
         c["yesterday_vol"] = yesterday_vol_lots
@@ -1409,7 +1402,22 @@ def screen_mainboard_strategy() -> list[dict]:
         except Exception as e:
             print(f"  ⚠ 腾讯接口批次{i//batch_size+1}失败: {e}")
 
-    # ========== 第五步：统一策略筛选 ==========
+    # ========== 第五步：补充昨日成交量（板块接口无此数据，从K线获取）==========
+    print(f"📊 获取昨日成交量（{len(all_candidates)} 只候选）...")
+    vol_kline_map = _fetch_kline_concurrent([c["code"] for c in all_candidates], days=5)
+    for c in all_candidates:
+        klines = vol_kline_map.get(c["code"], [])
+        if klines and len(klines) >= 2:
+            try:
+                yesterday_vol = int(float(klines[-2].get("volume", 0)))
+                if yesterday_vol > 0:
+                    c["volume_shares"] = yesterday_vol
+            except (ValueError, TypeError):
+                pass
+    vol_filled = sum(1 for c in all_candidates if c["volume_shares"] > 0)
+    print(f"  ✅ 已补充昨日成交量: {vol_filled}/{len(all_candidates)} 只")
+
+    # ========== 第六步：统一策略筛选 ==========
     print("📊 执行统一策略筛选...")
     filtered = _screen_unified(all_candidates, tencent_map)
     print(f"  通过筛选: {len(filtered)} 只")
@@ -1417,7 +1425,7 @@ def screen_mainboard_strategy() -> list[dict]:
     if not filtered:
         return []
 
-    # ========== 第六步：K线 + MACD 检查 ==========
+    # ========== 第七步：K线 + MACD 检查 ==========
     print("📊 获取K线数据（3日涨幅+2个月涨停+前日涨停+MACD检查）...")
     codes_to_fetch = [c["code"] for c in filtered]
     kline_map = _fetch_kline_concurrent(codes_to_fetch, days=1000)
@@ -1480,7 +1488,7 @@ def screen_mainboard_strategy() -> list[dict]:
         c["change_pct"] = c["auction_gain"]
         final.append(c)
 
-    # ========== 第七步：计算展示字段 ==========
+    # ========== 第八步：计算展示字段 ==========
     for c in final:
         code = c["code"]
         tc = tencent_map.get(code, {})
@@ -1527,7 +1535,7 @@ def screen_mainboard_strategy() -> list[dict]:
         c["frequency"] = freq
         c["strategy"] = _compute_screen_strategy(c)
 
-    # ========== 第八步：排序（板块涨停数降序 → 频次降序 → 涨幅降序）==========
+    # ========== 第九步：排序（板块涨停数降序 → 频次降序 → 涨幅降序）==========
     final.sort(key=lambda x: (-x.get("sector_limit_count", 0), -x.get("frequency", 0), -x["auction_gain"]))
 
     print(f"\n  ✅ 最终筛选: {len(final)} 只股票")
@@ -1543,7 +1551,7 @@ def screen_mainboard_strategy() -> list[dict]:
             lc = sector_limit_counts.get(sn, 0)
             print(f"    {sn}: {cnt} 只入选, {lc} 只涨停")
 
-    # ========== 第九步：板块龙头识别 + 出现次数统计 ==========
+    # ========== 第十步：板块龙头识别 + 出现次数统计 ==========
     sector_groups = {}
     for c in final:
         sn = c.get("sector", "未知")
