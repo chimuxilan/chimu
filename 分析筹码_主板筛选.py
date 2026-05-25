@@ -816,162 +816,528 @@ def _fetch_kline_concurrent(codes: list[str], days: int = 5) -> dict:
     return result
 
 
-def screen_mainboard_strategy() -> list[dict]:
+def _check_has_limit_up_in_days(code: str, days: int = 120) -> bool:
     """
-    主板筛选策略（使用新浪+腾讯接口）：
-    1. 非ST
-    2. 集合竞价涨幅 > 1%
-    3. 市值 < 400亿
-    4. 前一日涨停取反（昨日涨停，今日竞价涨幅>1%但未封涨停）
-    5. 非盘中下跌（竞价价 >= 昨收）
-    6. 今日竞价量/昨日成交量 > 2%
-    7. 集合竞价换手率 > 0.13%
-    8. 集合竞价量比 > 3
-    9. 3日涨幅 < 15%
-    10. 集合竞价现手量 > 30000手
+    检查股票在最近N个交易日内是否有涨停记录
+    通过逐日K线检查涨幅是否接近涨停阈值
     """
-    # ========== 第一步：获取全部A股 ==========
-    print("\n📊 获取A股列表...")
-    all_stocks = []
+    try:
+        klines = fetch_hist(code, days=days + 30)
+        if not klines or len(klines) < 5:
+            return False
+        # 主板涨停10%，创业板/科创板20%
+        if code.startswith(("30", "68")):
+            limit_pct = 20
+        else:
+            limit_pct = 10
+        threshold = limit_pct * 0.95  # 9.5% 或 19.5%
+        for i in range(1, len(klines)):
+            try:
+                prev_c = float(klines[i - 1].get("close", 0))
+                curr_c = float(klines[i].get("close", 0))
+                if prev_c > 0:
+                    chg = (curr_c - prev_c) / prev_c * 100
+                    if chg >= threshold:
+                        return True
+            except (ValueError, TypeError):
+                continue
+    except Exception:
+        pass
+    return False
+
+
+# ============================================================
+# MACD 计算
+# ============================================================
+
+def _compute_macd(closes: list[float], fast: int = 12, slow: int = 26, signal: int = 9) -> tuple[list[float], list[float], list[float]]:
+    """
+    计算 MACD
+    返回: (macd_line, signal_line, histogram)
+    """
+    if len(closes) < slow + signal:
+        return [], [], []
+
+    def _ema(data, period):
+        ema = [0.0] * len(data)
+        k = 2.0 / (period + 1)
+        ema[0] = data[0]
+        for i in range(1, len(data)):
+            ema[i] = data[i] * k + ema[i - 1] * (1 - k)
+        return ema
+
+    ema_fast = _ema(closes, fast)
+    ema_slow = _ema(closes, slow)
+    macd_line = [ema_fast[i] - ema_slow[i] for i in range(len(closes))]
+    signal_line = _ema(macd_line, signal)
+    histogram = [macd_line[i] - signal_line[i] for i in range(len(closes))]
+    return macd_line, signal_line, histogram
+
+
+def fetch_kline_120min(code: str, count: int = 60) -> list[dict]:
+    """
+    获取120分钟K线数据（腾讯接口）
+    """
+    sym = _to_tencent(code)
+    try:
+        r = requests.get(
+            f"https://web.ifzq.gtimg.cn/appstock/app/kline/mkline",
+            params={"param": f"{sym},m120,,{count}", "_var": "kline_m120"},
+            headers=HEADERS, timeout=15,
+        )
+        txt = r.text.split("=", 1)[1] if "=" in r.text else r.text
+        data = json.loads(txt)
+        klines = data.get("data", {}).get(sym, {}).get("m120", [])
+        if klines:
+            return [{"day": k[0], "open": k[1], "close": k[2], "high": k[3], "low": k[4], "volume": k[5]} for k in klines]
+    except Exception:
+        pass
+
+    # 备用：新浪接口
+    try:
+        r = requests.get(
+            "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData",
+            params={"symbol": sym, "scale": "120", "ma": "no", "datalen": count},
+            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn/"},
+            timeout=15,
+        )
+        data = json.loads(r.text)
+        if data:
+            return data
+    except Exception:
+        pass
+    return []
+
+
+def _check_macd_120min_up(code: str) -> bool:
+    """
+    检查120分钟MACD是否向上（MACD线当前 > 前一根 且 MACD > 0）
+    """
+    klines = fetch_kline_120min(code, count=60)
+    if not klines or len(klines) < 35:
+        return False
+    closes = [float(k.get("close", 0)) for k in klines if float(k.get("close", 0)) > 0]
+    if len(closes) < 35:
+        return False
+    macd_line, _, _ = _compute_macd(closes)
+    if len(macd_line) < 2:
+        return False
+    # MACD线向上：当前 > 前一根，且 MACD > 0
+    return macd_line[-1] > macd_line[-2] and macd_line[-1] > 0
+
+
+def _check_weekly_macd_red_growing(code: str) -> bool:
+    """
+    检查周MACD红柱变大
+    用日K线聚合为周K线，计算MACD，检查最近一根红柱 > 前一根
+    """
+    klines = fetch_hist(code, days=200)
+    if not klines or len(klines) < 60:
+        return False
+
+    # 日K线聚合为周K线
+    weekly_closes = []
+    week_close = 0
+    for i, k in enumerate(klines):
+        try:
+            c = float(k.get("close", 0))
+        except (ValueError, TypeError):
+            continue
+        if c <= 0:
+            continue
+        week_close = c
+        # 每5个交易日聚合为一周
+        if (i + 1) % 5 == 0:
+            weekly_closes.append(week_close)
+    # 加上最后一周
+    if week_close > 0 and (len(klines) % 5 != 0):
+        weekly_closes.append(week_close)
+
+    if len(weekly_closes) < 35:
+        return False
+
+    _, _, hist = _compute_macd(weekly_closes)
+    if len(hist) < 2:
+        return False
+    # 红柱 > 0 且变大（当前 > 前一根）
+    return hist[-1] > 0 and hist[-1] > hist[-2]
+
+
+def _check_monthly_macd_red_up(code: str) -> bool:
+    """
+    检查月MACD红柱向上
+    用日K线聚合为月K线，计算MACD，检查最近红柱 > 0 且向上
+    """
+    klines = fetch_hist(code, days=200)
+    if not klines or len(klines) < 60:
+        return False
+
+    # 日K线聚合为月K线（每22个交易日为一个月）
+    monthly_closes = []
+    for i, k in enumerate(klines):
+        try:
+            c = float(k.get("close", 0))
+        except (ValueError, TypeError):
+            continue
+        if c <= 0:
+            continue
+        if (i + 1) % 22 == 0:
+            monthly_closes.append(c)
+    # 补充最后一个月
+    if klines:
+        try:
+            last_c = float(klines[-1].get("close", 0))
+            if last_c > 0 and (len(klines) % 22 != 0):
+                monthly_closes.append(last_c)
+        except (ValueError, TypeError):
+            pass
+
+    if len(monthly_closes) < 35:
+        return False
+
+    _, _, hist = _compute_macd(monthly_closes)
+    if len(hist) < 2:
+        return False
+    # 红柱 > 0 且向上（当前 > 前一根）
+    return hist[-1] > 0 and hist[-1] > hist[-2]
+
+
+def _screen_unified(candidates: list[dict], tencent_map: dict) -> list[dict]:
+    """
+    统一筛选策略 —— 以下全部条件必须同时满足才能入选：
+      1.  主板
+      2.  非ST
+      3.  集合竞价涨幅 > 3% 且 < 10%
+      4.  市值 < 400亿
+      5.  价格 < 120元
+      6.  前一日涨停取反（昨日未涨停）
+      7.  非盘中下跌（竞价价 >= 昨收）
+      8.  开盘跳空高开（open > prev_close）
+      9.  今日竞价金额 / 昨日竞价金额 > 1.5倍
+      10. 集合竞价换手率 > 0.11%
+      11. 集合竞价量比 > 5
+      12. 3日涨幅 < 15%
+      13. 集合竞价现手量 > 40000手
+      14. 2个月内有过涨停
+    """
+    filtered = []
+    for c in candidates:
+        code = c["code"]
+        tc = tencent_map.get(code, {})
+
+        # ---- 条件3: 集合竞价涨幅 > 3% 且 < 10% ----
+        if c["auction_gain"] <= 3 or c["auction_gain"] >= 10:
+            continue
+
+        # ---- 条件4: 市值 < 400亿 ----
+        if c["market_cap_yi"] >= 400:
+            continue
+
+        # ---- 条件5: 价格 < 120元 ----
+        if c["price"] >= 120:
+            continue
+
+        # ---- 条件8: 开盘跳空高开 ----
+        if c["open_price"] <= c["prev_close"]:
+            continue
+
+        # ---- 竞价量 ----
+        auction_vol = tc.get("volume", c["volume"])
+        if auction_vol <= 0:
+            continue
+
+        # ---- 条件13: 集合竞价现手量 > 40000手 ----
+        if auction_vol <= 40000:
+            continue
+
+        # ---- 昨成交量（股→手）----
+        yesterday_vol_shares = c["volume_shares"]
+        yesterday_vol_lots = yesterday_vol_shares // 100
+        if yesterday_vol_lots <= 0:
+            continue
+
+        # ---- 条件9: 今日竞价金额/昨日竞价金额 > 1.5倍 ----
+        today_auction_amount = auction_vol * c["price"] * 100      # 手→股 × 价格
+        yesterday_auction_amount = yesterday_vol_lots * c["prev_close"] * 100
+        if yesterday_auction_amount <= 0:
+            continue
+        amount_ratio = today_auction_amount / yesterday_auction_amount
+        if amount_ratio <= 1.5:
+            continue
+
+        # ---- 条件10: 集合竞价换手率 > 0.11% ----
+        turnover = tc.get("turnover", 0)
+        if turnover <= 0:
+            turnover = c.get("turnover_sina", 0)
+        if turnover <= 0.11:
+            continue
+
+        # ---- 条件11: 集合竞价量比 > 5 ----
+        volume_ratio = tc.get("volume_ratio_api", 0)
+        if volume_ratio <= 0:
+            volume_ratio = auction_vol / yesterday_vol_lots if yesterday_vol_lots > 0 else 0
+        if volume_ratio <= 5:
+            continue
+
+        # ---- 通过全部检查，记录 ----
+        c["auction_vol"] = auction_vol
+        c["vol_ratio_yesterday"] = round(auction_vol / yesterday_vol_lots * 100, 2)
+        c["volume_ratio"] = round(volume_ratio, 2)
+        c["turnover"] = round(turnover, 4)
+        c["yesterday_vol"] = yesterday_vol_lots
+        c["amount_ratio"] = round(amount_ratio, 2)
+        filtered.append(c)
+
+    return filtered
+
+
+def _fetch_sectors_with_stocks() -> dict:
+    """
+    获取行业板块列表及各板块下的股票
+    返回: {sector_name: {"code": sector_code, "stocks": [stock_items]}}
+    """
+    sectors = {}
     page = 1
     while True:
         try:
             r = requests.get(
-                "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData",
-                params={
-                    "page": str(page), "num": "80", "sort": "symbol",
-                    "asc": "1", "node": "hs_a", "symbol": "", "_s_r_a": "page",
-                },
+                "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeStockCount",
+                params={"node": "industry"},
                 headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "User-Agent": "Mozilla/5.0",
                     "Referer": "https://finance.sina.com.cn/",
                 },
-                timeout=20,
+                timeout=15,
             )
-            data = json.loads(r.text)
-            if not data:
-                break
-            all_stocks.extend(data)
-            if len(data) < 80:
-                break
-            page += 1
-        except Exception as e:
-            print(f"  ⚠ 第{page}页失败: {e}")
+            total = int(r.text.strip().strip('"'))
+            break
+        except Exception:
+            total = 0
             break
 
-    if not all_stocks:
-        print("  ✗ 无法获取股票列表")
+    # 获取行业板块列表
+    try:
+        r = requests.get(
+            "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData",
+            params={"page": "1", "num": "100", "sort": "symbol", "asc": "1",
+                     "node": "industry", "symbol": "", "_s_r_a": "page"},
+            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn/"},
+            timeout=15,
+        )
+        industry_list = json.loads(r.text)
+        if industry_list:
+            for item in industry_list:
+                sname = item.get("name", "")
+                scode = item.get("symbol", "") or item.get("code", "")
+                if sname:
+                    sectors[sname] = {"code": scode, "stocks": []}
+    except Exception as e:
+        print(f"  ⚠ 获取行业列表失败: {e}")
+        return sectors
+
+    if not sectors:
+        return sectors
+
+    # 获取每个板块的股票（并发获取）
+    def _fetch_sector_stocks(sname, scode):
+        try:
+            r = requests.get(
+                "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData",
+                params={"page": "1", "num": "1000", "sort": "symbol", "asc": "1",
+                         "node": scode, "symbol": "", "_s_r_a": "page"},
+                headers={"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn/"},
+                timeout=15,
+            )
+            data = json.loads(r.text)
+            return sname, data if data else []
+        except Exception:
+            return sname, []
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [executor.submit(_fetch_sector_stocks, sn, sectors[sn]["code"]) for sn in sectors]
+        for future in concurrent.futures.as_completed(futures):
+            sname, stocks = future.result()
+            sectors[sname]["stocks"] = stocks
+
+    return sectors
+
+
+def screen_mainboard_strategy() -> list[dict]:
+    """
+    板块优先统一筛选策略：
+    1. 实时分析大盘哪个板块涨停最多
+    2. 优先在涨停最多的板块里筛选
+    3. 阶梯式在其他板块筛选
+    4. 结果按板块涨停数 + 频次排列
+
+    统一筛选条件（全部满足才能入选）：
+      1.  主板  2.  非ST  3.  涨幅>3%且<10%  4.  市值<400亿
+      5.  价格<120元  6.  前一日涨停取反  7.  非盘中下跌
+      8.  开盘跳空高开  9.  竞价金额比>1.5倍  10. 换手率>0.11%
+      11. 量比>5  12. 3日涨幅<15%  13. 现手量>40000手
+      14. 2个月内有涨停  15. 120分钟MACD向上
+      16. 月MACD红柱向上  17. 周MACD红柱变大
+    """
+    # ========== 第一步：获取板块及股票 ==========
+    print("\n📊 获取行业板块数据...")
+    sectors = _fetch_sectors_with_stocks()
+    if not sectors:
+        print("  ⚠ 板块API不可用，回退到全市场筛选")
+        return _screen_fallback_all_market()
+
+    print(f"  共 {len(sectors)} 个行业板块")
+
+    # ========== 第二步：统计每个板块的涨停数 ==========
+    print("📊 统计各板块涨停数...")
+    sector_limit_counts = {}   # {sector_name: limit_up_count}
+    sector_all_stocks = {}     # {sector_name: [all_stocks_in_sector]}
+    total_stocks = 0
+
+    for sname, sdata in sectors.items():
+        stocks = sdata.get("stocks", [])
+        if not stocks:
+            continue
+
+        valid_stocks = []
+        limit_count = 0
+        for item in stocks:
+            code = str(item.get("code", ""))
+            name = str(item.get("name", ""))
+            symbol = str(item.get("symbol", ""))
+            if not code or len(code) != 6 or not code[0].isdigit():
+                continue
+            if symbol.startswith("bj"):
+                continue
+            if not code.startswith(("60", "00", "30", "68")):
+                continue
+            if "ST" in name.upper():
+                continue
+
+            # 计算涨幅判断是否涨停
+            trade = item.get("trade", "0")
+            settlement = item.get("settlement", "0")
+            try:
+                price = float(trade) if trade else 0
+                prev_close = float(settlement) if settlement else 0
+            except (ValueError, TypeError):
+                continue
+            if prev_close <= 0 or price <= 0:
+                continue
+
+            gain = (price - prev_close) / prev_close * 100
+
+            # 判断涨停
+            if code.startswith(("30", "68")):
+                limit_pct = 20
+            else:
+                limit_pct = 10
+            if gain >= limit_pct * 0.95:
+                limit_count += 1
+
+            valid_stocks.append(item)
+
+        sector_all_stocks[sname] = valid_stocks
+        sector_limit_counts[sname] = limit_count
+        total_stocks += len(valid_stocks)
+
+    # 按涨停数降序排列板块
+    sorted_sectors = sorted(sector_limit_counts.items(), key=lambda x: x[1], reverse=True)
+    print(f"  板块涨停排名 (Top 10):")
+    for i, (sname, cnt) in enumerate(sorted_sectors[:10], 1):
+        print(f"    {i}. {sname}: {cnt} 只涨停")
+
+    # ========== 第三步：按板块优先级逐板块筛选 ==========
+    print(f"\n📊 按板块优先级筛选 ({total_stocks} 只股票)...")
+
+    all_candidates = []   # 带板块标签的候选股
+    sector_for_stock = {} # {code: sector_name}
+
+    for sname, limit_cnt in sorted_sectors:
+        stocks = sector_all_stocks.get(sname, [])
+        if not stocks:
+            continue
+
+        # 初筛该板块的股票
+        for item in stocks:
+            code = str(item.get("code", ""))
+            name = str(item.get("name", ""))
+            symbol = str(item.get("symbol", ""))
+            if not code or len(code) != 6:
+                continue
+
+            mktcap = item.get("mktcap", 0)
+            try:
+                mktcap = float(mktcap) if mktcap else 0
+            except (ValueError, TypeError):
+                continue
+            if mktcap <= 0:
+                continue
+            market_cap_yi = mktcap / 10000
+            if market_cap_yi >= 400:
+                continue
+
+            trade = item.get("trade", "0")
+            settlement = item.get("settlement", "0")
+            try:
+                price = float(trade) if trade else 0
+                prev_close = float(settlement) if settlement else 0
+            except (ValueError, TypeError):
+                continue
+            if prev_close <= 0 or price <= 0 or price >= 120:
+                continue
+
+            auction_gain = (price - prev_close) / prev_close * 100
+            if auction_gain <= 3 or auction_gain >= 10:
+                continue
+
+            open_price = item.get("open", "0")
+            try:
+                open_price = float(open_price) if open_price else price
+            except (ValueError, TypeError):
+                open_price = price
+            if open_price < prev_close:
+                continue
+
+            volume = item.get("volume", 0)
+            try:
+                volume = int(volume) if volume else 0
+            except (ValueError, TypeError):
+                continue
+            if volume <= 0:
+                continue
+
+            turnover = item.get("turnoverratio", "0")
+            try:
+                turnover = float(turnover) if turnover else 0
+            except (ValueError, TypeError):
+                turnover = 0
+
+            cand = {
+                "code": code, "name": name, "symbol": symbol,
+                "price": price, "prev_close": prev_close,
+                "auction_gain": round(auction_gain, 2),
+                "open_price": open_price,
+                "volume_shares": volume,
+                "volume": volume // 100,
+                "market_cap_yi": round(market_cap_yi, 2),
+                "turnover_sina": turnover,
+                "sector": sname,
+                "sector_limit_count": limit_cnt,
+            }
+            all_candidates.append(cand)
+            sector_for_stock[code] = sname
+
+    print(f"  初筛候选: {len(all_candidates)} 只")
+
+    if not all_candidates:
         return []
-    print(f"  共 {len(all_stocks)} 只A股")
 
-    # ========== 第二步：初筛 ==========
-    print("📊 初筛中...")
-    candidates = []
-    for item in all_stocks:
-        code = str(item.get("code", ""))
-        name = str(item.get("name", ""))
-        symbol = str(item.get("symbol", ""))
-        if not code or not name or len(code) != 6:
-            continue
-
-        # 只要沪深A股（排除北交所 bj 开头）
-        if symbol.startswith("bj"):
-            continue
-        if not code.startswith(("60", "00", "30", "68")):
-            continue
-
-        # 排除ST
-        if "ST" in name.upper():
-            continue
-
-        # 市值（亿元）: mktcap 单位是万元
-        mktcap = item.get("mktcap", 0)
-        try:
-            mktcap = float(mktcap) if mktcap else 0
-        except (ValueError, TypeError):
-            continue
-        if mktcap <= 0:
-            continue
-        market_cap_yi = mktcap / 10000  # 万元 → 亿元
-        if market_cap_yi >= 400:
-            continue
-
-        # 当前价 / 昨收
-        trade = item.get("trade", "0")
-        settlement = item.get("settlement", "0")
-        try:
-            price = float(trade) if trade else 0
-            prev_close = float(settlement) if settlement else 0
-        except (ValueError, TypeError):
-            continue
-        if prev_close <= 0 or price <= 0:
-            continue
-
-        # 集合竞价涨幅 > 1%
-        auction_gain = (price - prev_close) / prev_close * 100
-        if auction_gain < 1:
-            continue
-
-        # 前一日涨停取反
-        if code.startswith("68"):
-            limit_pct = 20
-        elif code.startswith("30"):
-            limit_pct = 20
-        else:
-            limit_pct = 10
-        limit_price = round(prev_close * (1 + limit_pct / 100), 2)
-        if prev_close >= limit_price * 0.99:
-            continue  # 昨日涨停
-
-        # 非盘中下跌（竞价价 >= 昨收）
-        open_price = item.get("open", "0")
-        try:
-            open_price = float(open_price) if open_price else price
-        except (ValueError, TypeError):
-            open_price = price
-        if open_price < prev_close:
-            continue
-
-        # 成交量（新浪接口volume单位是股）
-        volume = item.get("volume", 0)
-        try:
-            volume = int(volume) if volume else 0
-        except (ValueError, TypeError):
-            continue
-        if volume <= 0:
-            continue
-
-        # 换手率
-        turnover = item.get("turnoverratio", "0")
-        try:
-            turnover = float(turnover) if turnover else 0
-        except (ValueError, TypeError):
-            turnover = 0
-
-        candidates.append({
-            "code": code, "name": name, "symbol": symbol,
-            "price": price, "prev_close": prev_close,
-            "auction_gain": round(auction_gain, 2),
-            "open_price": open_price,
-            "volume_shares": volume,  # 股
-            "volume": volume // 100,  # 转换为手
-            "market_cap_yi": round(market_cap_yi, 2),
-            "turnover_sina": turnover,
-        })
-
-    print(f"  初筛: {len(candidates)} 只")
-
-    if not candidates:
-        return []
-
-    # ========== 第三步：获取集合竞价详细数据（腾讯接口） ==========
+    # ========== 第四步：批量获取腾讯实时数据 ==========
     print("📊 获取竞价详细数据...")
-
-    # 用腾讯接口批量获取实时数据（含量比等）
     tencent_map = {}
     batch_size = 50
-    for i in range(0, len(candidates), batch_size):
-        batch = candidates[i:i + batch_size]
+    for i in range(0, len(all_candidates), batch_size):
+        batch = all_candidates[i:i + batch_size]
         symbols = ",".join(c["symbol"] for c in batch)
         try:
             r = requests.get(
@@ -983,7 +1349,6 @@ def screen_mainboard_strategy() -> list[dict]:
                 m = re.search(r'v_(\w+)="(.+)"', line)
                 if not m:
                     continue
-                sym = m.group(1)
                 fields = m.group(2).split("~")
                 if len(fields) < 50:
                     continue
@@ -994,77 +1359,29 @@ def screen_mainboard_strategy() -> list[dict]:
                     except (ValueError, IndexError):
                         return t(0) if t != str else ""
                 tencent_map[code] = {
-                    "volume": _v(6, int),       # 手
-                    "buy_vol": _v(7, int),      # 外盘（手）
-                    "sell_vol": _v(8, int),     # 内盘（手）
-                    "amount": _v(37),            # 万元
-                    "turnover": _v(38),          # 换手率
-                    "amplitude": _v(43),         # 振幅
-                    "volume_ratio_api": _v(49),  # 量比
+                    "volume": _v(6, int),
+                    "buy_vol": _v(7, int),
+                    "sell_vol": _v(8, int),
+                    "amount": _v(37),
+                    "turnover": _v(38),
+                    "amplitude": _v(43),
+                    "volume_ratio_api": _v(49),
                 }
         except Exception as e:
             print(f"  ⚠ 腾讯接口批次{i//batch_size+1}失败: {e}")
 
-    # ========== 第四步：应用量比/换手/竞价量过滤 ==========
-    print("📊 应用策略过滤...")
-    filtered = []
-    for c in candidates:
-        code = c["code"]
-        tc = tencent_map.get(code, {})
-
-        # 竞价量（优先用腾讯接口，单位：手）
-        auction_vol = tc.get("volume", c["volume"])
-        if auction_vol <= 0:
-            continue
-
-        # 昨成交量（股→手）
-        # 新浪volume是股，需要转换
-        yesterday_vol_shares = c["volume_shares"]
-        yesterday_vol_lots = yesterday_vol_shares // 100  # 近似（非竞价时段=全天成交量）
-        if yesterday_vol_lots <= 0:
-            continue
-
-        # 今日竞价量/昨日成交量 > 2%
-        vol_ratio_yesterday = auction_vol / yesterday_vol_lots * 100
-        if vol_ratio_yesterday <= 2:
-            continue
-
-        # 换手率（优先用腾讯接口）
-        turnover = tc.get("turnover", 0)
-        if turnover <= 0:
-            turnover = c.get("turnover_sina", 0)
-        if turnover <= 0.13:
-            continue
-
-        # 量比（优先用腾讯接口的量比字段）
-        volume_ratio = tc.get("volume_ratio_api", 0)
-        if volume_ratio <= 0:
-            # 手动计算：竞价量 / 近5日均量
-            avg_vol = yesterday_vol_lots
-            volume_ratio = auction_vol / avg_vol if avg_vol > 0 else 0
-        if volume_ratio <= 3:
-            continue
-
-        # 竞价现手量 > 30000手
-        if auction_vol <= 30000:
-            continue
-
-        c["auction_vol"] = auction_vol
-        c["vol_ratio_yesterday"] = round(vol_ratio_yesterday, 2)
-        c["volume_ratio"] = round(volume_ratio, 2)
-        c["turnover"] = round(turnover, 4)
-        c["yesterday_vol"] = yesterday_vol_lots
-        filtered.append(c)
-
-    print(f"  量比/换手筛选: {len(filtered)} 只")
+    # ========== 第五步：统一策略筛选 ==========
+    print("📊 执行统一策略筛选...")
+    filtered = _screen_unified(all_candidates, tencent_map)
+    print(f"  通过筛选: {len(filtered)} 只")
 
     if not filtered:
         return []
 
-    # ========== 第五步：3日涨幅 < 15% + 获取昨日成交量 ==========
-    print("📊 获取3日涨幅...")
+    # ========== 第六步：K线 + MACD 检查 ==========
+    print("📊 获取K线数据（3日涨幅+2个月涨停+前日涨停+MACD检查）...")
     codes_to_fetch = [c["code"] for c in filtered]
-    kline_map = _fetch_kline_concurrent(codes_to_fetch, days=5)
+    kline_map = _fetch_kline_concurrent(codes_to_fetch, days=200)
 
     final = []
     for c in filtered:
@@ -1079,104 +1396,380 @@ def screen_mainboard_strategy() -> list[dict]:
                 c["change_3d"] = round(change_3d, 2)
             else:
                 c["change_3d"] = 0
-            # 取倒数第二条K线的成交量作为"昨日成交量"（最后一条是今天）
             if len(klines) >= 2:
                 c["yesterday_vol_hist"] = int(float(klines[-2].get("volume", 0)))
             else:
                 c["yesterday_vol_hist"] = 0
+
+            if code.startswith(("30", "68")):
+                limit_pct = 20
+            else:
+                limit_pct = 10
+            if len(klines) >= 3:
+                try:
+                    dby_close = float(klines[-3].get("close", 0))
+                    y_close = float(klines[-2].get("close", 0))
+                    if dby_close > 0:
+                        y_chg = (y_close - dby_close) / dby_close * 100
+                        if y_chg >= limit_pct * 0.95:
+                            continue
+                except (ValueError, TypeError):
+                    pass
         else:
             c["change_3d"] = 0
             c["yesterday_vol_hist"] = 0
 
+        if not _check_has_limit_up_in_days(code, days=60):
+            continue
+        if not _check_macd_120min_up(code):
+            continue
+        if not _check_monthly_macd_red_up(code):
+            continue
+        if not _check_weekly_macd_red_growing(code):
+            continue
+
         c["change_pct"] = c["auction_gain"]
         final.append(c)
 
-    # ========== 第六步：计算展示字段 ==========
+    # ========== 第七步：计算展示字段 ==========
     for c in final:
         code = c["code"]
         tc = tencent_map.get(code, {})
-
-        # 09:25 价格 = 竞价价格（open_price）
         c["auction_price"] = c["open_price"]
-
-        # 09:26 价格 = 腾讯接口的当前价（竞价结束后第一笔成交）
         c["price_0926"] = c["price"]
+        c["chg_0926"] = round((c["price_0926"] - c["prev_close"]) / c["prev_close"] * 100, 2) if c["prev_close"] > 0 else 0
 
-        # 09:26涨幅 = (09:26价格 - 昨收) / 昨收 * 100
-        if c["prev_close"] > 0:
-            c["chg_0926"] = round((c["price_0926"] - c["prev_close"]) / c["prev_close"] * 100, 2)
-        else:
-            c["chg_0926"] = 0
-
-        # 竞昨比 = 竞价量 / 昨日成交量 * 100（用K线的昨日成交量）
         auction_vol = c.get("auction_vol", c["volume"])
-        yesterday_vol = c.get("yesterday_vol_hist", 0)
-        if yesterday_vol <= 0:
-            yesterday_vol = c.get("yesterday_vol", 1)
+        yesterday_vol = c.get("yesterday_vol_hist", 0) or c.get("yesterday_vol", 1)
         c["comp_ratio"] = round(auction_vol / yesterday_vol * 100, 1) if yesterday_vol > 0 else 0
 
-        # 剩余率 = 买盘 / (买盘 + 卖盘) * 100
         buy_vol = tc.get("buy_vol", 0)
         sell_vol = tc.get("sell_vol", 0)
-        if buy_vol + sell_vol > 0:
-            c["remaining_rate"] = round(buy_vol / (buy_vol + sell_vol) * 100, 1)
-        else:
-            c["remaining_rate"] = 50.0
+        c["remaining_rate"] = round(buy_vol / (buy_vol + sell_vol) * 100, 1) if (buy_vol + sell_vol) > 0 else 50.0
 
-        # 筹码判断（筛选保证 chg>1%, vr>3）
         chg = c["auction_gain"]
         vr = c.get("volume_ratio", 0)
         rr = c["remaining_rate"]
         cr = c.get("comp_ratio", 0)
 
-        # 涨停/接近涨停 → 直接真实抢筹
         if chg >= 9:
             c["verdict"] = "真实抢筹"
         else:
             score = 0
-            # 涨幅
             if chg >= 7: score += 3
             elif chg >= 5: score += 2
             elif chg >= 3: score += 1
-            # 量比（筛选保证>3）
             if vr >= 10: score += 3
             elif vr >= 7: score += 2
             elif vr >= 5: score += 1
-            # 剩余率
             if rr >= 65: score += 3
             elif rr >= 55: score += 1
             elif rr < 40: score -= 2
             elif rr < 45: score -= 1
-            # 竞昨比
             if cr >= 10: score += 2
             elif cr >= 5: score += 1
+            c["verdict"] = "真实抢筹" if score >= 4 else ("疑似出货" if score <= 0 else "正常")
 
-            if score >= 4:
-                c["verdict"] = "真实抢筹"
-            elif score <= 0:
-                c["verdict"] = "疑似出货"
-            else:
-                c["verdict"] = "正常"
-
-        # 频次（评分制：命中几个维度的强信号）
         freq = 0
-        if vr >= 5:
-            freq += 1
-        if chg >= 5:
-            freq += 1
-        if rr >= 60:
-            freq += 1
-        if cr >= 3:
-            freq += 1
+        if vr >= 5: freq += 1
+        if chg >= 5: freq += 1
+        if rr >= 60: freq += 1
+        if cr >= 3: freq += 1
         c["frequency"] = freq
-
-        # 策略
         c["strategy"] = _compute_screen_strategy(c)
 
-    # 按竞价涨幅从大到小排序
-    final.sort(key=lambda x: x["auction_gain"], reverse=True)
+    # ========== 第八步：排序（板块涨停数降序 → 频次降序 → 涨幅降序）==========
+    final.sort(key=lambda x: (-x.get("sector_limit_count", 0), -x.get("frequency", 0), -x["auction_gain"]))
 
-    print(f"  ✅ 最终筛选: {len(final)} 只股票")
+    print(f"\n  ✅ 最终筛选: {len(final)} 只股票")
+
+    # 输出板块分布统计
+    sector_result = {}
+    for c in final:
+        sn = c.get("sector", "未知")
+        sector_result[sn] = sector_result.get(sn, 0) + 1
+    if sector_result:
+        print("  📊 入选股票板块分布:")
+        for sn, cnt in sorted(sector_result.items(), key=lambda x: -x[1]):
+            lc = sector_limit_counts.get(sn, 0)
+            print(f"    {sn}: {cnt} 只入选, {lc} 只涨停")
+
+    # ========== 第九步：板块龙头识别 + 出现次数统计 ==========
+    # 按板块分组，每个板块选出龙头（综合评分最高）
+    sector_groups = {}
+    for c in final:
+        sn = c.get("sector", "未知")
+        sector_groups.setdefault(sn, []).append(c)
+
+    leader_scores = {}  # {code: composite_score}
+    for sn, stocks_in_sector in sector_groups.items():
+        best_code = None
+        best_score = -999
+        for s in stocks_in_sector:
+            # 综合评分：涨幅权重 + 量比权重 + 频次权重
+            chg = s.get("auction_gain", 0)
+            vr = s.get("volume_ratio", 0)
+            freq = s.get("frequency", 0)
+            comp = chg * 3 + vr * 2 + freq * 10
+            if comp > best_score:
+                best_score = comp
+                best_code = s["code"]
+        if best_code:
+            leader_scores[best_code] = best_score
+
+    # 读取历史龙头出现次数
+    leader_freq_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "leader_frequency.json")
+    try:
+        with open(leader_freq_path, "r", encoding="utf-8") as f:
+            leader_freq_history = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        leader_freq_history = {}
+
+    # 更新今日龙头出现次数
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    for code in leader_scores:
+        if code not in leader_freq_history:
+            leader_freq_history[code] = {"count": 0, "dates": []}
+        if today_str not in leader_freq_history[code]["dates"]:
+            leader_freq_history[code]["count"] += 1
+            leader_freq_history[code]["dates"].append(today_str)
+            # 只保留最近60天记录
+            leader_freq_history[code]["dates"] = leader_freq_history[code]["dates"][-60:]
+
+    # 保存历史
+    try:
+        with open(leader_freq_path, "w", encoding="utf-8") as f:
+            json.dump(leader_freq_history, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+    # 标记龙头 + 写入出现次数
+    for c in final:
+        code = c["code"]
+        c["is_leader"] = code in leader_scores
+        c["leader_count"] = leader_freq_history.get(code, {}).get("count", 0)
+
+    # 按龙头出现次数降序排列（龙头在前，非龙头在后）
+    final.sort(key=lambda x: (-int(x.get("is_leader", False)), -x.get("leader_count", 0),
+                               -x.get("sector_limit_count", 0), -x.get("frequency", 0)))
+
+    # 输出龙头出现次数统计
+    leader_stats = [(c["code"], c["name"], c.get("sector", ""), c.get("leader_count", 0))
+                    for c in final if c.get("is_leader")]
+    if leader_stats:
+        leader_stats.sort(key=lambda x: -x[3])
+        print(f"\n  🏆 板块龙头出现次数统计:")
+        for code, name, sector, cnt in leader_stats:
+            print(f"    {name}({code}) [{sector}] — 出现 {cnt} 次")
+
+    return final
+
+
+def _screen_fallback_all_market() -> list[dict]:
+    """
+    板块API不可用时的回退方案：全市场筛选（保留兼容性）
+    """
+    print("📊 全市场回退筛选...")
+    all_stocks = []
+    page = 1
+    while True:
+        try:
+            r = requests.get(
+                "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData",
+                params={"page": str(page), "num": "80", "sort": "symbol",
+                         "asc": "1", "node": "hs_a", "symbol": "", "_s_r_a": "page"},
+                headers={"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn/"},
+                timeout=20,
+            )
+            data = json.loads(r.text)
+            if not data:
+                break
+            all_stocks.extend(data)
+            if len(data) < 80:
+                break
+            page += 1
+        except Exception as e:
+            print(f"  ⚠ 第{page}页失败: {e}")
+            break
+
+    if not all_stocks:
+        return []
+
+    candidates = []
+    for item in all_stocks:
+        code = str(item.get("code", ""))
+        name = str(item.get("name", ""))
+        symbol = str(item.get("symbol", ""))
+        if not code or len(code) != 6:
+            continue
+        if symbol.startswith("bj") or not code.startswith(("60", "00", "30", "68")):
+            continue
+        if "ST" in name.upper():
+            continue
+
+        mktcap = item.get("mktcap", 0)
+        try:
+            mktcap = float(mktcap) if mktcap else 0
+        except (ValueError, TypeError):
+            continue
+        if mktcap <= 0:
+            continue
+        market_cap_yi = mktcap / 10000
+        if market_cap_yi >= 400:
+            continue
+
+        trade = item.get("trade", "0")
+        settlement = item.get("settlement", "0")
+        try:
+            price = float(trade) if trade else 0
+            prev_close = float(settlement) if settlement else 0
+        except (ValueError, TypeError):
+            continue
+        if prev_close <= 0 or price <= 0 or price >= 120:
+            continue
+
+        auction_gain = (price - prev_close) / prev_close * 100
+        if auction_gain <= 3 or auction_gain >= 10:
+            continue
+
+        open_price = item.get("open", "0")
+        try:
+            open_price = float(open_price) if open_price else price
+        except (ValueError, TypeError):
+            open_price = price
+        if open_price < prev_close:
+            continue
+
+        volume = item.get("volume", 0)
+        try:
+            volume = int(volume) if volume else 0
+        except (ValueError, TypeError):
+            continue
+        if volume <= 0:
+            continue
+
+        turnover = item.get("turnoverratio", "0")
+        try:
+            turnover = float(turnover) if turnover else 0
+        except (ValueError, TypeError):
+            turnover = 0
+
+        candidates.append({
+            "code": code, "name": name, "symbol": symbol,
+            "price": price, "prev_close": prev_close,
+            "auction_gain": round(auction_gain, 2),
+            "open_price": open_price,
+            "volume_shares": volume,
+            "volume": volume // 100,
+            "market_cap_yi": round(market_cap_yi, 2),
+            "turnover_sina": turnover,
+            "sector": "全市场",
+            "sector_limit_count": 0,
+        })
+
+    if not candidates:
+        return []
+
+    tencent_map = {}
+    batch_size = 50
+    for i in range(0, len(candidates), batch_size):
+        batch = candidates[i:i + batch_size]
+        symbols = ",".join(c["symbol"] for c in batch)
+        try:
+            r = requests.get(f"https://qt.gtimg.cn/q={symbols}", headers=HEADERS, timeout=15)
+            r.encoding = "gbk"
+            for line in r.text.strip().split("\n"):
+                m = re.search(r'v_(\w+)="(.+)"', line)
+                if not m:
+                    continue
+                fields = m.group(2).split("~")
+                if len(fields) < 50:
+                    continue
+                code = fields[2]
+                def _v(idx, t=float):
+                    try:
+                        return t(fields[idx]) if fields[idx] else (t(0) if t != str else "")
+                    except (ValueError, IndexError):
+                        return t(0) if t != str else ""
+                tencent_map[code] = {"volume": _v(6, int), "buy_vol": _v(7, int), "sell_vol": _v(8, int),
+                                      "amount": _v(37), "turnover": _v(38), "amplitude": _v(43), "volume_ratio_api": _v(49)}
+        except Exception:
+            pass
+
+    filtered = _screen_unified(candidates, tencent_map)
+    if not filtered:
+        return []
+
+    kline_map = _fetch_kline_concurrent([c["code"] for c in filtered], days=200)
+    final = []
+    for c in filtered:
+        code = c["code"]
+        klines = kline_map.get(code, [])
+        if klines and len(klines) >= 4:
+            closes = [float(k.get("close", 0)) for k in klines[-4:]]
+            if closes[0] > 0 and (closes[-1] - closes[0]) / closes[0] * 100 >= 15:
+                continue
+            c["change_3d"] = round((closes[-1] - closes[0]) / closes[0] * 100, 2) if closes[0] > 0 else 0
+            c["yesterday_vol_hist"] = int(float(klines[-2].get("volume", 0))) if len(klines) >= 2 else 0
+            if code.startswith(("30", "68")):
+                lp = 20
+            else:
+                lp = 10
+            if len(klines) >= 3:
+                try:
+                    dby = float(klines[-3].get("close", 0))
+                    yc = float(klines[-2].get("close", 0))
+                    if dby > 0 and (yc - dby) / dby * 100 >= lp * 0.95:
+                        continue
+                except (ValueError, TypeError):
+                    pass
+        else:
+            c["change_3d"] = 0
+            c["yesterday_vol_hist"] = 0
+
+        if not _check_has_limit_up_in_days(code, days=60):
+            continue
+        if not _check_macd_120min_up(code):
+            continue
+        if not _check_monthly_macd_red_up(code):
+            continue
+        if not _check_weekly_macd_red_growing(code):
+            continue
+        c["change_pct"] = c["auction_gain"]
+        final.append(c)
+
+    for c in final:
+        tc = tencent_map.get(c["code"], {})
+        c["auction_price"] = c["open_price"]
+        c["price_0926"] = c["price"]
+        c["chg_0926"] = round((c["price_0926"] - c["prev_close"]) / c["prev_close"] * 100, 2) if c["prev_close"] > 0 else 0
+        av = c.get("auction_vol", c["volume"])
+        yv = c.get("yesterday_vol_hist", 0) or c.get("yesterday_vol", 1)
+        c["comp_ratio"] = round(av / yv * 100, 1) if yv > 0 else 0
+        bv, sv = tc.get("buy_vol", 0), tc.get("sell_vol", 0)
+        c["remaining_rate"] = round(bv / (bv + sv) * 100, 1) if (bv + sv) > 0 else 50.0
+        chg, vr, rr, cr = c["auction_gain"], c.get("volume_ratio", 0), c["remaining_rate"], c.get("comp_ratio", 0)
+        if chg >= 9: c["verdict"] = "真实抢筹"
+        else:
+            s = 0
+            if chg >= 7: s += 3
+            elif chg >= 5: s += 2
+            elif chg >= 3: s += 1
+            if vr >= 10: s += 3
+            elif vr >= 7: s += 2
+            elif vr >= 5: s += 1
+            if rr >= 65: s += 3
+            elif rr >= 55: s += 1
+            elif rr < 40: s -= 2
+            elif rr < 45: s -= 1
+            if cr >= 10: s += 2
+            elif cr >= 5: s += 1
+            c["verdict"] = "真实抢筹" if s >= 4 else ("疑似出货" if s <= 0 else "正常")
+        freq = (1 if vr >= 5 else 0) + (1 if chg >= 5 else 0) + (1 if rr >= 60 else 0) + (1 if cr >= 3 else 0)
+        c["frequency"] = freq
+        c["strategy"] = _compute_screen_strategy(c)
+
+    final.sort(key=lambda x: (-x.get("frequency", 0), -x["auction_gain"]))
     return final
 
 
@@ -1267,10 +1860,18 @@ def save_screen_html(stocks: list[dict], indices: list[dict], path: str) -> str:
         remaining = s.get("remaining_rate", 50)
         freq = s.get("frequency", 0)
         strategy = s.get("strategy", "观望")
+        sector = s.get("sector", "-")
+        sector_lc = s.get("sector_limit_count", 0)
+        is_leader = s.get("is_leader", False)
+        leader_count = s.get("leader_count", 0)
+        leader_mark = "🏆" if is_leader else ""
+        leader_color = "#f0883e" if is_leader else "#8b949e"
 
         rows += f"""<tr>
 <td>{s["code"]}</td>
 <td style="text-align:left;font-weight:600">{s["name"]}</td>
+<td style="text-align:left;font-size:12px">{sector}<span style="color:#8b949e;font-size:10px">({sector_lc}涨停)</span></td>
+<td style="color:{leader_color};font-weight:{'700' if is_leader else '400'}">{leader_mark}{leader_count}</td>
 <td>{s["auction_price"]:.2f}</td>
 <td>{s.get("price_0926", s["price"]):.2f}</td>
 <td>{vol_fmt}</td>
@@ -1282,16 +1883,39 @@ def save_screen_html(stocks: list[dict], indices: list[dict], path: str) -> str:
 <td style="text-align:left;font-size:12px">{strategy}</td>
 </tr>"""
 
+    # 板块分布统计
+    sector_stats = {}
+    for s in stocks:
+        sn = s.get("sector", "未知")
+        sector_stats[sn] = sector_stats.get(sn, 0) + 1
+    sector_html = ""
+    if sector_stats:
+        sector_cells = ""
+        for sn, cnt in sorted(sector_stats.items(), key=lambda x: -x[1]):
+            sector_cells += f'<span style="background:#161b22;border-radius:4px;padding:4px 8px;margin:2px;display:inline-block;font-size:12px">{sn}: <b>{cnt}</b>只</span> '
+        sector_html = f'<div style="text-align:center;margin-bottom:12px">{sector_cells}</div>'
+
+    # 板块龙头出现次数统计（HTML）
+    leader_html = ""
+    leader_data = [(s["code"], s["name"], s.get("sector", ""), s.get("leader_count", 0))
+                   for s in stocks if s.get("is_leader")]
+    if leader_data:
+        leader_data.sort(key=lambda x: -x[3])
+        leader_cells = ""
+        for code, name, sector, cnt in leader_data:
+            leader_cells += f'<span style="background:#161b22;border:1px solid #f0883e;border-radius:4px;padding:4px 8px;margin:2px;display:inline-block;font-size:12px">🏆 {name}({code}) <span style="color:#f0883e;font-weight:700">{cnt}次</span> <span style="color:#8b949e;font-size:10px">{sector}</span></span> '
+        leader_html = f'<div style="text-align:center;margin-bottom:12px;padding:8px;background:rgba(240,136,62,.08);border-radius:8px"><div style="color:#f0883e;font-size:13px;font-weight:600;margin-bottom:6px">🏆 板块龙头出现次数统计</div>{leader_cells}</div>'
+
     html = f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>集合竞价 - 股票筛选</title>
+<title>集合竞价 - 板块优先筛选</title>
 <style>
 *{{margin:0;padding:0;box-sizing:border-box}}
 body{{font-family:"Microsoft YaHei","PingFang SC",sans-serif;background:#0d1117;color:#c9d1d9;padding:16px}}
 .hd{{text-align:center;padding:16px 0}}
 .hd h1{{font-size:20px;color:#58a6ff}}
 .hd .t{{color:#8b949e;font-size:12px;margin-top:4px}}
-.tbl-wrap{{overflow-x:auto;margin:0 auto;max-width:1100px}}
+.tbl-wrap{{overflow-x:auto;margin:0 auto;max-width:1200px}}
 table{{width:100%;border-collapse:collapse;font-size:13px;white-space:nowrap}}
 th{{background:#161b22;color:#8b949e;font-weight:600;padding:8px 10px;text-align:center;border-bottom:2px solid #30363d;position:sticky;top:0}}
 td{{padding:6px 10px;text-align:center;border-bottom:1px solid #21262d}}
@@ -1299,11 +1923,14 @@ tr:hover{{background:#161b22}}
 .ft{{text-align:center;color:#484f58;font-size:10px;padding:20px 0}}
 @media(max-width:768px){{table{{font-size:11px}}th,td{{padding:4px 6px}}}}
 </style></head><body>
-<div class="hd"><h1>📊 集合竞价 - 股票筛选</h1><div class="t">更新时间: {now}</div></div>
+<div class="hd"><h1>📊 集合竞价 - 板块优先筛选</h1><div class="t">更新时间: {now}</div></div>
+{idx_html}
+{leader_html}
+{sector_html}
 <div class="tbl-wrap">
 <table>
 <thead><tr>
-<th>代码</th><th>名称</th><th>09:25</th><th>09:26</th><th>搓合量</th>
+<th>代码</th><th>名称</th><th>板块(涨停数)</th><th>龙头次数</th><th>09:25</th><th>09:26</th><th>搓合量</th>
 <th>竞昨比</th><th>剩余率</th><th>09:26涨幅</th>
 <th>筹码判断</th><th>频次</th><th>策略</th>
 </tr></thead>
@@ -1359,9 +1986,9 @@ def main():
 
         # 输出结果
         if not args.quiet:
-            print(f"\n{'─'*90}")
-            print(f"  {'#':>3}  {'代码':<8} {'名称':<8} {'09:25':>7} {'09:26':>7} {'搓合量':>8} {'竞昨比':>7} {'剩余率':>7} {'09:26涨幅':>9} {'筹码判断':<8} {'频次':>4} {'策略':<12}")
-            print(f"{'─'*90}")
+            print(f"\n{'─'*120}")
+            print(f"  {'#':>3}  {'代码':<8} {'名称':<8} {'板块':<10} {'龙头':>4} {'09:25':>7} {'09:26':>7} {'搓合量':>8} {'竞昨比':>7} {'剩余率':>7} {'涨幅':>7} {'筹码':<6} {'频次':>4} {'策略':<12}")
+            print(f"{'─'*120}")
             for i, s in enumerate(stocks, 1):
                 vol_fmt = _format_volume(s.get("auction_vol", s.get("volume", 0)))
                 chg_0926 = s.get("chg_0926", 0)
@@ -1370,9 +1997,12 @@ def main():
                 verdict = s.get("verdict", "正常")
                 freq = s.get("frequency", 0)
                 strategy = s.get("strategy", "观望")
-                arrow = "↑" if chg_0926 > 0 else ("↓" if chg_0926 < 0 else "→")
-                print(f"  {i:>3}  {s['code']:<8} {s['name']:<8} {s.get('auction_price', s['price']):>7.2f} {s.get('price_0926', s['price']):>7.2f} {vol_fmt:>8} {comp_ratio:>6.1f}% {remaining:>6.1f}% {chg_0926:>+8.2f}% {verdict:<8} {freq:>4} {strategy:<12}")
-            print(f"{'─'*90}")
+                sector = s.get("sector", "-")[:8]
+                is_leader = s.get("is_leader", False)
+                leader_count = s.get("leader_count", 0)
+                leader_mark = f"🏆{leader_count}" if is_leader else f"  {leader_count}"
+                print(f"  {i:>3}  {s['code']:<8} {s['name']:<8} {sector:<10} {leader_mark:>4} {s.get('auction_price', s['price']):>7.2f} {s.get('price_0926', s['price']):>7.2f} {vol_fmt:>8} {comp_ratio:>6.1f}% {remaining:>6.1f}% {chg_0926:>+6.2f}% {verdict:<6} {freq:>4} {strategy:<12}")
+            print(f"{'─'*120}")
 
         # 保存HTML
         html_path = args.html if args.html != "auction_report.html" else "screen_report.html"
