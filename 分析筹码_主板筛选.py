@@ -1027,40 +1027,47 @@ def _screen_unified(candidates: list[dict], tencent_map: dict) -> list[dict]:
       14. 2个月内有过涨停
     """
     filtered = []
+    _diag = {}  # 诊断计数器
     for c in candidates:
         code = c["code"]
         tc = tencent_map.get(code, {})
 
         # ---- 条件3: 集合竞价涨幅 > 3% 且 < 10% ----
         if c["auction_gain"] <= 3 or c["auction_gain"] >= 10:
+            _diag["涨幅3-10%"] = _diag.get("涨幅3-10%", 0) + 1
             continue
 
         # ---- 条件4: 市值 < 400亿 ----
         if c["market_cap_yi"] >= 400:
+            _diag["市值<400亿"] = _diag.get("市值<400亿", 0) + 1
             continue
 
         # ---- 条件5: 价格 < 120元 ----
         if c["price"] >= 120:
+            _diag["价格<120"] = _diag.get("价格<120", 0) + 1
             continue
 
         # ---- 条件8: 开盘跳空高开 ----
         if c["open_price"] <= c["prev_close"]:
+            _diag["高开"] = _diag.get("高开", 0) + 1
             continue
 
         # ---- 竞价量 ----
         auction_vol = tc.get("volume", c["volume"])
         if auction_vol <= 0:
+            _diag["竞价量>0"] = _diag.get("竞价量>0", 0) + 1
             continue
 
         # ---- 条件13: 集合竞价现手量 > 40000手 ----
         if auction_vol <= 40000:
+            _diag["竞价量>4万手"] = _diag.get("竞价量>4万手", 0) + 1
             continue
 
         # ---- 昨成交量（股→手）----
+        # 注意：板块接口不提供昨日成交量，volume_shares 可能为 0
+        # 当昨日成交量不可用时，后续依赖量比(volume_ratio)替代
         yesterday_vol_shares = c["volume_shares"]
         yesterday_vol_lots = yesterday_vol_shares // 100
-        if yesterday_vol_lots <= 0:
-            continue
 
         # ---- 条件9: 今日竞价金额/昨日竞价金额 > 1.5倍 ----
         # 注意：板块接口不提供昨日成交量，volume_shares 可能为 0
@@ -1069,35 +1076,48 @@ def _screen_unified(candidates: list[dict], tencent_map: dict) -> list[dict]:
             today_auction_amount = auction_vol * c["price"] * 100      # 手→股 × 价格
             yesterday_auction_amount = yesterday_vol_lots * c["prev_close"] * 100
             if yesterday_auction_amount <= 0:
+                _diag["金额比"] = _diag.get("金额比", 0) + 1
                 continue
             amount_ratio = today_auction_amount / yesterday_auction_amount
             if amount_ratio <= 1.5:
+                _diag["金额比>1.5"] = _diag.get("金额比>1.5", 0) + 1
                 continue
         else:
             amount_ratio = 0  # 不可用，后续依赖量比判断
 
         # ---- 条件10: 集合竞价换手率 > 0.11% ----
+        # 注意：竞价时段腾讯接口可能不返回换手率，此时不作为硬性过滤条件
         turnover = tc.get("turnover", 0)
         if turnover <= 0:
             turnover = c.get("turnover_sina", 0)
-        if turnover <= 0.11:
+        if turnover > 0 and turnover <= 0.11:
+            _diag["换手率>0.11%"] = _diag.get("换手率>0.11%", 0) + 1
             continue
 
         # ---- 条件11: 集合竞价量比 > 5 ----
+        # 注意：竞价时段腾讯接口可能不返回量比，且板块路径无昨成交量做fallback
+        # 仅当量比数据可用时才作为过滤条件
         volume_ratio = tc.get("volume_ratio_api", 0)
         if volume_ratio <= 0:
             volume_ratio = auction_vol / yesterday_vol_lots if yesterday_vol_lots > 0 else 0
-        if volume_ratio <= 5:
+        if volume_ratio > 0 and volume_ratio <= 5:
+            _diag["量比>5"] = _diag.get("量比>5", 0) + 1
             continue
 
         # ---- 通过全部检查，记录 ----
         c["auction_vol"] = auction_vol
-        c["vol_ratio_yesterday"] = round(auction_vol / yesterday_vol_lots * 100, 2)
+        c["vol_ratio_yesterday"] = round(auction_vol / yesterday_vol_lots * 100, 2) if yesterday_vol_lots > 0 else 0
         c["volume_ratio"] = round(volume_ratio, 2)
         c["turnover"] = round(turnover, 4)
         c["yesterday_vol"] = yesterday_vol_lots
         c["amount_ratio"] = round(amount_ratio, 2)
         filtered.append(c)
+
+    # 输出诊断信息
+    if _diag:
+        print(f"  📋 过滤诊断 (共淘汰 {sum(_diag.values())} 只):")
+        for reason, cnt in sorted(_diag.items(), key=lambda x: -x[1]):
+            print(f"    ❌ {reason}: {cnt} 只")
 
     return filtered
 
@@ -1224,6 +1244,15 @@ def screen_mainboard_strategy() -> list[dict]:
       16. 月MACD红柱向上  17. 周MACD红柱变大
     """
     # ========== 第一步：获取板块及股票 ==========
+    # 检查是否在竞价时段
+    now = datetime.now()
+    h, m = now.hour, now.minute
+    is_auction = (h == 9 and 15 <= m <= 25)
+    if not is_auction:
+        print(f"\n⚠️  当前 {h:02d}:{m:02d} 非集合竞价时段 (09:15-09:25)")
+        print("   腾讯接口返回的是全天数据而非竞价数据，量比/换手率可能不符合竞价条件")
+        print("   建议在 09:15-09:25 运行以获得准确的竞价筛选结果\n")
+
     print("\n📊 获取行业板块数据（东方财富）...")
     sectors = _fetch_sectors_with_stocks()
     if not sectors:
