@@ -494,7 +494,7 @@ class AuctionStockSelector:
 # ============================================================
 
 class ResultRenderer:
-    """结果渲染器 — 支持终端彩色输出"""
+    """结果渲染器 — 支持终端彩色输出 + HTML报告"""
 
     # ANSI 颜色
     COLORS = {
@@ -516,6 +516,18 @@ class ResultRenderer:
         RiskZone.SAFE: "green",
         RiskZone.WARNING: "yellow",
         RiskZone.DANGER: "red",
+    }
+
+    # HTML 颜色映射
+    HTML_CHIP = {
+        ChipStatus.REAL_BUY: ("#10b981", "#ecfdf5"),
+        ChipStatus.NORMAL: ("#6366f1", "#eef2ff"),
+        ChipStatus.SUSPECT_SELL: ("#ef4444", "#fef2f2"),
+    }
+    HTML_RISK = {
+        RiskZone.SAFE: ("#10b981", "#ecfdf5"),
+        RiskZone.WARNING: ("#f59e0b", "#fffbeb"),
+        RiskZone.DANGER: ("#ef4444", "#fef2f2"),
     }
 
     @classmethod
@@ -636,6 +648,210 @@ class ResultRenderer:
         else:
             print(f"{c['yellow']}⚠️ 今日无符合条件的推荐标的{c['reset']}")
         print()
+
+    # ---- HTML 报告 ----
+
+    @classmethod
+    def render_html(cls, candidates: list[StockCandidate], output_path: str = "auction_report.html"):
+        """生成 HTML 选股报告"""
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        strong = [s for s in candidates if s.freq >= Config.FREQ_STRONG]
+        real_buy = [s for s in candidates if s.chip_status == ChipStatus.REAL_BUY]
+        safe = [s for s in candidates if s.risk_zone == RiskZone.SAFE]
+        recommend = [
+            s for s in candidates
+            if s.freq >= 3
+            and s.chip_status != ChipStatus.SUSPECT_SELL
+            and s.risk_score < Config.RISK_WARN_MAX
+        ]
+        recommend.sort(key=lambda s: (s.dragon.is_dragon, s.final_score), reverse=True)
+
+        def freq_badge(freq):
+            if freq >= 4:
+                return f'<span style="background:#ef4444;color:#fff;padding:2px 8px;border-radius:4px;font-weight:700">{freq}</span>'
+            elif freq >= 3:
+                return f'<span style="background:#f59e0b;color:#fff;padding:2px 8px;border-radius:4px;font-weight:700">{freq}</span>'
+            return f'<span style="background:#64748b;color:#fff;padding:2px 8px;border-radius:4px">{freq}</span>'
+
+        def chip_badge(status):
+            color, bg = cls.HTML_CHIP.get(status, ("#6366f1", "#eef2ff"))
+            return f'<span style="background:{bg};color:{color};padding:2px 8px;border-radius:4px;font-size:13px">{status.value}</span>'
+
+        def risk_badge(zone):
+            color, bg = cls.HTML_RISK.get(zone, ("#6366f1", "#eef2ff"))
+            return f'<span style="background:{bg};color:{color};padding:2px 8px;border-radius:4px;font-size:13px">{zone.value}</span>'
+
+        def score_bar(score):
+            if score >= 80:
+                color = "#10b981"
+            elif score >= 50:
+                color = "#f59e0b"
+            else:
+                color = "#ef4444"
+            return (f'<div style="display:flex;align-items:center;gap:6px">'
+                    f'<div style="background:#e2e8f0;border-radius:4px;height:8px;width:80px;overflow:hidden">'
+                    f'<div style="background:{color};height:100%;width:{score}%;border-radius:4px"></div></div>'
+                    f'<span style="font-weight:600;color:{color}">{score:.0f}</span></div>')
+
+        def change_str(v):
+            return f'<span style="color:#ef4444;font-weight:600">+{v:.2f}%</span>'
+
+        # 信号详情弹出内容
+        def signal_popover(candidate):
+            rows = ""
+            for sig in candidate.signals:
+                icon = "✅" if sig.triggered else "❌"
+                conf = f' <span style="color:#64748b">({sig.confidence:.0%})</span>' if sig.triggered else ""
+                rows += f"<tr><td>{icon}</td><td>{sig.name}</td><td>{conf}</td><td style='color:#64748b'>{sig.detail}</td></tr>"
+            return f'<table style="font-size:12px;border-collapse:collapse"><tr style="font-weight:600"><td>状态</td><td>信号</td><td>置信度</td><td>详情</td></tr>{rows}</table>'
+
+        # 主表格行
+        table_rows = ""
+        for i, s in enumerate(candidates):
+            dragon = "🐉 龙头" if s.dragon.is_dragon else "—"
+            rank = f"#{s.rank_0925}" if s.rank_0925 else "—"
+            popover = signal_popover(s).replace("'", "&#39;").replace('"', "&quot;")
+            table_rows += f"""
+            <tr class="row-main" onclick="this.nextElementSibling.classList.toggle('hidden')">
+              <td style="font-family:monospace;font-weight:600">{s.code}</td>
+              <td>{s.name}</td>
+              <td>{change_str(s.auction_change)}</td>
+              <td>{freq_badge(s.freq)}</td>
+              <td>{chip_badge(s.chip_status)}</td>
+              <td style="color:#64748b">{rank}</td>
+              <td>{dragon}</td>
+              <td style="font-family:monospace">{s.risk_score:.1f}</td>
+              <td>{risk_badge(s.risk_zone)}</td>
+              <td>{score_bar(s.final_score)}</td>
+            </tr>
+            <tr class="row-detail hidden">
+              <td colspan="10" style="background:#f8fafc;padding:12px 20px">{popover}</td>
+            </tr>"""
+
+        # 推荐标的
+        recommend_html = ""
+        for i, s in enumerate(recommend[:20], 1):
+            tags = []
+            if s.dragon.is_dragon:
+                tags.append('<span style="background:#7c3aed;color:#fff;padding:2px 6px;border-radius:3px;font-size:12px">🐉 龙头确认</span>')
+            if s.chip_status == ChipStatus.REAL_BUY:
+                tags.append('<span style="background:#10b981;color:#fff;padding:2px 6px;border-radius:3px;font-size:12px">💰 真实抢筹</span>')
+            tag_html = " ".join(tags)
+            recommend_html += f"""
+            <div style="display:flex;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid #f1f5f9">
+              <span style="font-size:20px;font-weight:700;color:#94a3b8;width:28px">{i}</span>
+              <div style="flex:1">
+                <div style="font-weight:600;font-size:15px">{s.code} {s.name} {tag_html}</div>
+                <div style="color:#64748b;font-size:13px;margin-top:2px">
+                  频次 {s.freq} · 评分 {s.final_score:.0f} · 风险值 {s.risk_score:.1f} · 涨幅 +{s.auction_change:.2f}%
+                </div>
+              </div>
+            </div>"""
+
+        html = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>竞价选股报告 - {now}</title>
+<style>
+  * {{ margin:0; padding:0; box-sizing:border-box; }}
+  body {{ font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;
+         background:#f1f5f9; color:#1e293b; line-height:1.6; }}
+  .container {{ max-width:1200px; margin:0 auto; padding:20px; }}
+  .header {{ background:linear-gradient(135deg,#1e293b 0%,#334155 100%); color:#fff;
+             padding:32px; border-radius:16px; margin-bottom:24px; }}
+  .header h1 {{ font-size:24px; font-weight:700; }}
+  .header .sub {{ color:#94a3b8; font-size:14px; margin-top:4px; }}
+  .stats {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:16px; margin-bottom:24px; }}
+  .stat-card {{ background:#fff; border-radius:12px; padding:20px; box-shadow:0 1px 3px rgba(0,0,0,0.06); }}
+  .stat-card .label {{ color:#64748b; font-size:13px; }}
+  .stat-card .value {{ font-size:28px; font-weight:700; margin-top:4px; }}
+  .stat-card .value.green {{ color:#10b981; }}
+  .stat-card .value.yellow {{ color:#f59e0b; }}
+  .stat-card .value.red {{ color:#ef4444; }}
+  .stat-card .value.purple {{ color:#7c3aed; }}
+  .panel {{ background:#fff; border-radius:12px; box-shadow:0 1px 3px rgba(0,0,0,0.06);
+            margin-bottom:24px; overflow:hidden; }}
+  .panel-head {{ padding:16px 20px; border-bottom:1px solid #e2e8f0; font-weight:600; font-size:16px; }}
+  table {{ width:100%; border-collapse:collapse; font-size:14px; }}
+  th {{ background:#f8fafc; padding:12px 14px; text-align:left; font-weight:600; color:#475569;
+       border-bottom:2px solid #e2e8f0; font-size:13px; white-space:nowrap; }}
+  td {{ padding:10px 14px; border-bottom:1px solid #f1f5f9; }}
+  .row-main {{ cursor:pointer; transition:background .15s; }}
+  .row-main:hover {{ background:#f8fafc; }}
+  .hidden {{ display:none; }}
+  .footer {{ text-align:center; color:#94a3b8; font-size:12px; padding:20px; }}
+  .recommend-item:last-child {{ border-bottom:none; }}
+  @media (max-width:768px) {{
+    .container {{ padding:12px; }}
+    .stats {{ grid-template-columns:repeat(2,1fr); }}
+    table {{ font-size:12px; }}
+    th, td {{ padding:8px 6px; }}
+  }}
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <h1>📊 竞价选股报告</h1>
+    <div class="sub">多信号共振选股系统 · 生成时间: {now} · 候选池 {len(candidates)} 只</div>
+  </div>
+
+  <div class="stats">
+    <div class="stat-card">
+      <div class="label">候选池总数</div>
+      <div class="value">{len(candidates)}</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">强信号 (≥3)</div>
+      <div class="value yellow">{len(strong)}</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">真实抢筹</div>
+      <div class="value green">{len(real_buy)}</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">安全区</div>
+      <div class="value green">{len(safe)}</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">最终推荐</div>
+      <div class="value purple">{len(recommend)}</div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-head">🎯 最终推荐标的</div>
+    <div>{recommend_html if recommend else '<div style="padding:20px;color:#94a3b8;text-align:center">今日无符合条件的推荐标的</div>'}</div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-head">📋 全部候选标的 <span style="font-weight:400;color:#94a3b8;font-size:13px">(点击行展开信号详情)</span></div>
+    <div style="overflow-x:auto">
+      <table>
+        <thead>
+          <tr>
+            <th>代码</th><th>名称</th><th>涨幅</th><th>频次</th>
+            <th>筹码判断</th><th>排名</th><th>龙头</th>
+            <th>风险值</th><th>风险区</th><th>综合评分</th>
+          </tr>
+        </thead>
+        <tbody>{table_rows}</tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="footer">
+    竞价选股系统 · 数据仅供参考，不构成投资建议 · 风险自担
+  </div>
+</div>
+</body>
+</html>"""
+
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(html)
+        print(f"📄 HTML 报告已保存至: {output_path}")
 
 
 # ============================================================
@@ -1136,6 +1352,8 @@ def main():
     parser.add_argument("--source", choices=["auto", "eastmoney", "tencent"],
                         default="auto",
                         help="数据源: auto(自动切换) | eastmoney | tencent")
+    parser.add_argument("--html", type=str, nargs="?", const="auction_report.html",
+                        help="生成 HTML 报告 (默认: auction_report.html)")
     args = parser.parse_args()
 
     setup_logging(args.verbose)
@@ -1164,6 +1382,10 @@ def main():
             renderer.render_signal_detail(s)
 
     renderer.render_summary(candidates)
+
+    # 生成 HTML 报告
+    if args.html is not None:
+        renderer.render_html(candidates, args.html)
 
     # 输出 JSON（方便后续对接）
     result_json = []
