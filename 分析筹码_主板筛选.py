@@ -13,12 +13,12 @@ A股集合竞价 · 抢筹/出货分析工具 v3
 import requests
 import re
 import json
-import subprocess
 import numpy as np
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 from typing import Optional
 import argparse
+import html as html_module
 import os
 import sys
 import concurrent.futures
@@ -64,8 +64,8 @@ def search_stock_code(keyword: str) -> Optional[dict]:
                     name = parts[2]
                     if code and code.isdigit() and len(code) == 6:
                         return {"code": code, "name": name, "market": market}
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"  ⚠ 腾讯搜索接口异常: {e}")
 
     # 新浪搜索接口（备用）
     try:
@@ -85,8 +85,8 @@ def search_stock_code(keyword: str) -> Optional[dict]:
                 if tag.startswith("gp"):
                     code = tag[2:]
                     return {"code": code, "name": name, "market": "sh" if code.startswith(("6", "9")) else "sz"}
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"  ⚠ 新浪搜索接口异常: {e}")
 
     return None
 
@@ -122,21 +122,8 @@ def resolve_stock_input(text: str) -> Optional[dict]:
 # ============================================================
 
 def _get_mimo_api_key() -> str:
-    """从环境变量或 openclaw 配置中获取 MiMo API Key"""
-    key = os.environ.get("MIMO_API_KEY", "")
-    if key:
-        return key
-    config_path = os.path.expanduser("~/.openclaw/openclaw.json")
-    if os.path.exists(config_path):
-        try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-            key = cfg.get("models", {}).get("providers", {}).get("xiaomi", {}).get("apiKey", "")
-            if key:
-                return key
-        except Exception:
-            pass
-    return ""
+    """从环境变量获取 MiMo API Key"""
+    return os.environ.get("MIMO_API_KEY", "")
 
 
 def extract_stocks_from_image(image_path: str) -> list[str]:
@@ -210,14 +197,8 @@ def _ocr_via_local(image_path: str) -> list[str]:
     try:
         from rapidocr_onnxruntime import RapidOCR
     except ImportError:
-        print("  ⚠ 未安装本地 OCR 库，正在自动安装...")
-        try:
-            subprocess.run([sys.executable, "-m", "pip", "install", "rapidocr-onnxruntime", "-q"],
-                           capture_output=True, timeout=120)
-            from rapidocr_onnxruntime import RapidOCR
-        except Exception:
-            print("  ✗ 安装失败，请手动运行: pip install rapidocr-onnxruntime")
-            return []
+        print("  ✗ 未安装本地 OCR 库，请手动运行: pip install rapidocr-onnxruntime")
+        return []
 
     try:
         print("  📷 使用本地 OCR 识别中...")
@@ -294,7 +275,8 @@ def fetch_quotes(codes: list[str]) -> dict:
             "bid1_p": _v(9), "bid1_v": _v(10, int),
             "ask1_p": _v(19), "ask1_v": _v(20, int),
             "change_pct": _v(32), "high": _v(33), "low": _v(34),
-            "amount": _v(37), "turnover": _v(38),
+            "amount": _v(37),          # 腾讯接口返回单位：万元
+            "turnover": _v(38),
             "amplitude": _v(43),
         }
     return results
@@ -312,8 +294,8 @@ def fetch_hist(code: str, days: int = 10) -> list[dict]:
         data = json.loads(r.text)
         if data:
             return data
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"  ⚠ 新浪K线接口异常({code}): {e}")
 
     try:
         sym = _to_tencent(code)
@@ -329,8 +311,8 @@ def fetch_hist(code: str, days: int = 10) -> list[dict]:
         klines = data.get("data", {}).get(sym, {})
         klines = klines.get("day") or klines.get("qfqday") or []
         return [{"day": k[0], "open": k[1], "close": k[2], "high": k[3], "low": k[4], "volume": k[5]} for k in klines]
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"  ⚠ 腾讯K线接口异常({code}): {e}")
     return []
 
 
@@ -406,11 +388,23 @@ def analyze(code: str, quote: dict, hist: list[dict]) -> Optional[AuctionResult]
     else:
         sigs.append(f"🔴 强势低开 {gap:+.2f}%"); bear += 25
 
-    # 2. 量比
+    # 2. 量比（根据涨跌方向判断多空倾向）
     if vr > 5:
-        sigs.append(f"📊 量比 {vr:.2f}x → 极度放量"); bull += 15; bear += 20
+        sigs.append(f"📊 量比 {vr:.2f}x → 极度放量")
+        if gap > 0:
+            bull += 25  # 高开放量 → 抢筹
+        elif gap < 0:
+            bear += 25  # 低开放量 → 出货
+        else:
+            bull += 10; bear += 10  # 平开放量 → 多空分歧
     elif vr > 3:
-        sigs.append(f"📊 量比 {vr:.2f}x → 大幅放量"); bull += 20; bear += 10
+        sigs.append(f"📊 量比 {vr:.2f}x → 大幅放量")
+        if gap > 0:
+            bull += 20
+        elif gap < 0:
+            bear += 20
+        else:
+            bull += 10; bear += 5
     elif vr > 1.5:
         sigs.append(f"📊 量比 {vr:.2f}x → 温和放量"); bull += 15
     elif vr > 0.8:
@@ -548,11 +542,6 @@ def _compute_strategy(r: AuctionResult) -> str:
     return "观望"
 
 
-def _compute_frequency(r: AuctionResult) -> int:
-    """频次：信号命中数"""
-    return len([s for s in r.signals if any(k in s for k in ["高开", "低开", "放量", "缩量", "买盘", "卖盘", "连涨", "连跌", "平开"])])
-
-
 def save_html(results: list[AuctionResult], path: str) -> str:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -575,7 +564,7 @@ def save_html(results: list[AuctionResult], path: str) -> str:
             v_color = "#d29922"
             v_bg = "rgba(210,153,34,.12)"
 
-        freq = _compute_frequency(r)
+        freq = len([s for s in r.signals if any(k in s for k in ["高开", "低开", "放量", "缩量", "买盘", "卖盘", "连涨", "连跌", "平开"])])
         strategy = _compute_strategy(r)
         vol_fmt = _format_volume(r.volume)
 
@@ -586,8 +575,8 @@ def save_html(results: list[AuctionResult], path: str) -> str:
             comp_ratio = "-"
 
         rows += f"""<tr>
-<td>{r.code}</td>
-<td style="text-align:left;font-weight:600">{r.name}</td>
+<td>{html_module.escape(r.code)}</td>
+<td style="text-align:left;font-weight:600">{html_module.escape(r.name)}</td>
 <td>{r.open_price:.2f}</td>
 <td>{r.price:.2f}</td>
 <td>{vol_fmt}</td>
@@ -816,13 +805,13 @@ def _fetch_kline_concurrent(codes: list[str], days: int = 5) -> dict:
     return result
 
 
-def _check_has_limit_up_in_days(code: str, days: int = 120) -> bool:
+def _check_has_limit_up_in_days(code: str, days: int = 120, cached_klines: list[dict] = None) -> bool:
     """
     检查股票在最近N个交易日内是否有涨停记录
     通过逐日K线检查涨幅是否接近涨停阈值
     """
     try:
-        klines = fetch_hist(code, days=days + 30)
+        klines = cached_klines if cached_klines is not None else fetch_hist(code, days=days + 30)
         if not klines or len(klines) < 5:
             return False
         # 主板涨停10%，创业板/科创板20%
@@ -841,8 +830,8 @@ def _check_has_limit_up_in_days(code: str, days: int = 120) -> bool:
                         return True
             except (ValueError, TypeError):
                 continue
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"  ⚠ 涨停检查异常({code}): {e}")
     return False
 
 
@@ -890,8 +879,8 @@ def fetch_kline_120min(code: str, count: int = 60) -> list[dict]:
         klines = data.get("data", {}).get(sym, {}).get("m120", [])
         if klines:
             return [{"day": k[0], "open": k[1], "close": k[2], "high": k[3], "low": k[4], "volume": k[5]} for k in klines]
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"  ⚠ 腾讯120分钟K线异常({code}): {e}")
 
     # 备用：新浪接口
     try:
@@ -904,8 +893,8 @@ def fetch_kline_120min(code: str, count: int = 60) -> list[dict]:
         data = json.loads(r.text)
         if data:
             return data
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"  ⚠ 新浪120分钟K线异常({code}): {e}")
     return []
 
 
@@ -926,32 +915,43 @@ def _check_macd_120min_up(code: str) -> bool:
     return macd_line[-1] > macd_line[-2] and macd_line[-1] > 0
 
 
-def _check_weekly_macd_red_growing(code: str) -> bool:
+def _check_weekly_macd_red_growing(code: str, cached_klines: list[dict] = None) -> bool:
     """
     检查周MACD红柱变大
-    用日K线聚合为周K线，计算MACD，检查最近一根红柱 > 前一根
+    用日K线按真实日历周聚合为周K线，计算MACD，检查最近一根红柱 > 前一根
     """
-    klines = fetch_hist(code, days=200)
+    klines = cached_klines if cached_klines is not None else fetch_hist(code, days=1000)
     if not klines or len(klines) < 60:
         return False
 
-    # 日K线聚合为周K线
+    # 日K线按真实日历周聚合为周K线（每周最后一个交易日的收盘价）
     weekly_closes = []
-    week_close = 0
-    for i, k in enumerate(klines):
+    last_week = -1
+    last_close_in_week = 0.0
+    for k in klines:
         try:
             c = float(k.get("close", 0))
+            day_str = k.get("day", "")
         except (ValueError, TypeError):
             continue
-        if c <= 0:
+        if c <= 0 or not day_str:
             continue
-        week_close = c
-        # 每5个交易日聚合为一周
-        if (i + 1) % 5 == 0:
-            weekly_closes.append(week_close)
-    # 加上最后一周
-    if week_close > 0 and (len(klines) % 5 != 0):
-        weekly_closes.append(week_close)
+        try:
+            dt = datetime.strptime(day_str[:10], "%Y-%m-%d")
+            iso_week = dt.isocalendar()[1]
+            iso_year = dt.year
+            week_key = iso_year * 100 + iso_week
+        except (ValueError, IndexError):
+            continue
+        if last_week >= 0 and week_key != last_week:
+            # 上一周结束，追加上一周最后一个交易日的收盘价
+            weekly_closes.append(last_close_in_week)
+        last_week = week_key
+        last_close_in_week = c
+    # 追加最后一周的收盘价
+    if last_close_in_week > 0:
+        if not weekly_closes or weekly_closes[-1] != last_close_in_week:
+            weekly_closes.append(last_close_in_week)
 
     if len(weekly_closes) < 35:
         return False
@@ -963,34 +963,40 @@ def _check_weekly_macd_red_growing(code: str) -> bool:
     return hist[-1] > 0 and hist[-1] > hist[-2]
 
 
-def _check_monthly_macd_red_up(code: str) -> bool:
+def _check_monthly_macd_red_up(code: str, cached_klines: list[dict] = None) -> bool:
     """
     检查月MACD红柱向上
-    用日K线聚合为月K线，计算MACD，检查最近红柱 > 0 且向上
+    用日K线按真实日历月聚合为月K线，计算MACD，检查最近红柱 > 0 且向上
     """
-    klines = fetch_hist(code, days=200)
+    klines = cached_klines if cached_klines is not None else fetch_hist(code, days=1000)
     if not klines or len(klines) < 60:
         return False
 
-    # 日K线聚合为月K线（每22个交易日为一个月）
+    # 日K线按真实日历月聚合为月K线（每月最后一个交易日的收盘价）
     monthly_closes = []
-    for i, k in enumerate(klines):
+    last_month = -1
+    last_close_in_month = 0.0
+    for k in klines:
         try:
             c = float(k.get("close", 0))
+            day_str = k.get("day", "")
         except (ValueError, TypeError):
             continue
-        if c <= 0:
+        if c <= 0 or not day_str:
             continue
-        if (i + 1) % 22 == 0:
-            monthly_closes.append(c)
-    # 补充最后一个月
-    if klines:
         try:
-            last_c = float(klines[-1].get("close", 0))
-            if last_c > 0 and (len(klines) % 22 != 0):
-                monthly_closes.append(last_c)
-        except (ValueError, TypeError):
-            pass
+            dt = datetime.strptime(day_str[:10], "%Y-%m-%d")
+            month_key = dt.year * 100 + dt.month
+        except (ValueError, IndexError):
+            continue
+        if last_month >= 0 and month_key != last_month:
+            monthly_closes.append(last_close_in_month)
+        last_month = month_key
+        last_close_in_month = c
+    # 追加最后一个月的收盘价
+    if last_close_in_month > 0:
+        if not monthly_closes or monthly_closes[-1] != last_close_in_month:
+            monthly_closes.append(last_close_in_month)
 
     if len(monthly_closes) < 35:
         return False
@@ -1057,13 +1063,18 @@ def _screen_unified(candidates: list[dict], tencent_map: dict) -> list[dict]:
             continue
 
         # ---- 条件9: 今日竞价金额/昨日竞价金额 > 1.5倍 ----
-        today_auction_amount = auction_vol * c["price"] * 100      # 手→股 × 价格
-        yesterday_auction_amount = yesterday_vol_lots * c["prev_close"] * 100
-        if yesterday_auction_amount <= 0:
-            continue
-        amount_ratio = today_auction_amount / yesterday_auction_amount
-        if amount_ratio <= 1.5:
-            continue
+        # 注意：板块接口不提供昨日成交量，volume_shares 可能为 0
+        # 当昨日成交量不可用时，跳过此条件，依赖量比(volume_ratio)替代
+        if yesterday_vol_lots > 0:
+            today_auction_amount = auction_vol * c["price"] * 100      # 手→股 × 价格
+            yesterday_auction_amount = yesterday_vol_lots * c["prev_close"] * 100
+            if yesterday_auction_amount <= 0:
+                continue
+            amount_ratio = today_auction_amount / yesterday_auction_amount
+            if amount_ratio <= 1.5:
+                continue
+        else:
+            amount_ratio = 0  # 不可用，后续依赖量比判断
 
         # ---- 条件10: 集合竞价换手率 > 0.11% ----
         turnover = tc.get("turnover", 0)
@@ -1093,65 +1104,88 @@ def _screen_unified(candidates: list[dict], tencent_map: dict) -> list[dict]:
 
 def _fetch_sectors_with_stocks() -> dict:
     """
-    获取行业板块列表及各板块下的股票
+    通过东方财富 push2test 接口获取行业板块列表及各板块下的股票
     返回: {sector_name: {"code": sector_code, "stocks": [stock_items]}}
     """
+    EM_HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://quote.eastmoney.com/center/boardlist.html",
+    }
     sectors = {}
-    page = 1
-    while True:
-        try:
-            r = requests.get(
-                "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeStockCount",
-                params={"node": "industry"},
-                headers={
-                    "User-Agent": "Mozilla/5.0",
-                    "Referer": "https://finance.sina.com.cn/",
-                },
-                timeout=15,
-            )
-            total = int(r.text.strip().strip('"'))
-            break
-        except Exception:
-            total = 0
-            break
 
-    # 获取行业板块列表
+    # 第一步：获取行业板块列表（涨停数倒序，取前50个板块）
     try:
         r = requests.get(
-            "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData",
-            params={"page": "1", "num": "100", "sort": "symbol", "asc": "1",
-                     "node": "industry", "symbol": "", "_s_r_a": "page"},
-            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn/"},
-            timeout=15,
+            "https://push2test.eastmoney.com/api/qt/clist/get",
+            params={
+                "cb": "jQuery", "pn": "1", "pz": "50", "po": "1", "np": "1",
+                "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+                "fltt": "2", "invt": "2", "fid": "f3",
+                "fs": "m:90+t:2+f:!50",
+                "fields": "f2,f3,f12,f14,f104,f105",
+            },
+            headers=EM_HEADERS, timeout=15,
         )
-        industry_list = json.loads(r.text)
-        if industry_list:
-            for item in industry_list:
-                sname = item.get("name", "")
-                scode = item.get("symbol", "") or item.get("code", "")
-                if sname:
-                    sectors[sname] = {"code": scode, "stocks": []}
+        m = re.search(r"jQuery\((.+)\);", r.text)
+        if m:
+            data = json.loads(m.group(1))
+            items = data.get("data", {}).get("diff", [])
+            for item in items:
+                scode = item.get("f12", "")
+                sname = item.get("f14", "")
+                limit_up = item.get("f104", 0)
+                limit_down = item.get("f105", 0)
+                change_pct = item.get("f3", 0)
+                if scode and sname:
+                    sectors[sname] = {
+                        "code": scode,
+                        "stocks": [],
+                        "limit_up": limit_up,
+                        "limit_down": limit_down,
+                        "change_pct": change_pct,
+                    }
     except Exception as e:
-        print(f"  ⚠ 获取行业列表失败: {e}")
+        print(f"  ⚠ 东方财富板块列表获取失败: {e}")
         return sectors
 
     if not sectors:
         return sectors
 
-    # 获取每个板块的股票（并发获取）
+    # 第二步：并发获取每个板块的成分股
     def _fetch_sector_stocks(sname, scode):
         try:
             r = requests.get(
-                "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData",
-                params={"page": "1", "num": "1000", "sort": "symbol", "asc": "1",
-                         "node": scode, "symbol": "", "_s_r_a": "page"},
-                headers={"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn/"},
-                timeout=15,
+                "https://push2test.eastmoney.com/api/qt/clist/get",
+                params={
+                    "cb": "jQuery", "pn": "1", "pz": "1000", "po": "1", "np": "1",
+                    "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+                    "fltt": "2", "invt": "2", "fid": "f3",
+                    "fs": f"b:{scode}",
+                    "fields": "f2,f3,f12,f14",
+                },
+                headers=EM_HEADERS, timeout=15,
             )
-            data = json.loads(r.text)
-            return sname, data if data else []
+            m = re.search(r"jQuery\((.+)\);", r.text)
+            if m:
+                data = json.loads(m.group(1))
+                items = data.get("data", {}).get("diff", [])
+                stocks = []
+                for it in items:
+                    code = str(it.get("f12", ""))
+                    name = it.get("f14", "")
+                    price = it.get("f2", 0)
+                    change_pct = it.get("f3", 0)
+                    if code and len(code) == 6 and code[0].isdigit():
+                        stocks.append({
+                            "code": code, "name": name,
+                            "symbol": ("sh" if code.startswith(("6", "9")) else "sz") + code,
+                            "trade": str(price), "settlement": "0",
+                            "changepercent": str(change_pct),
+                        })
+                return sname, stocks
         except Exception:
-            return sname, []
+            pass
+        return sname, []
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         futures = [executor.submit(_fetch_sector_stocks, sn, sectors[sn]["code"]) for sn in sectors]
@@ -1161,14 +1195,25 @@ def _fetch_sectors_with_stocks() -> dict:
 
     return sectors
 
+def _get_board_type(code: str) -> str:
+    """根据股票代码前缀判断板块类型"""
+    if code.startswith("60"):
+        return "沪主板"
+    elif code.startswith("00"):
+        return "深主板"
+    elif code.startswith("30"):
+        return "创业板"
+    elif code.startswith("68"):
+        return "科创板"
+    return "其他"
+
 
 def screen_mainboard_strategy() -> list[dict]:
     """
-    板块优先统一筛选策略：
+    板块优先统一筛选策略（东方财富 push2test 接口）：
     1. 实时分析大盘哪个板块涨停最多
     2. 优先在涨停最多的板块里筛选
-    3. 阶梯式在其他板块筛选
-    4. 结果按板块涨停数 + 频次排列
+    3. 结果按板块涨停数 + 频次排列
 
     统一筛选条件（全部满足才能入选）：
       1.  主板  2.  非ST  3.  涨幅>3%且<10%  4.  市值<400亿
@@ -1179,7 +1224,7 @@ def screen_mainboard_strategy() -> list[dict]:
       16. 月MACD红柱向上  17. 周MACD红柱变大
     """
     # ========== 第一步：获取板块及股票 ==========
-    print("\n📊 获取行业板块数据...")
+    print("\n📊 获取行业板块数据（东方财富）...")
     sectors = _fetch_sectors_with_stocks()
     if not sectors:
         print("  ⚠ 板块API不可用，回退到全市场筛选")
@@ -1189,17 +1234,17 @@ def screen_mainboard_strategy() -> list[dict]:
 
     # ========== 第二步：统计每个板块的涨停数 ==========
     print("📊 统计各板块涨停数...")
-    sector_limit_counts = {}   # {sector_name: limit_up_count}
-    sector_all_stocks = {}     # {sector_name: [all_stocks_in_sector]}
+    sector_limit_counts = {}
+    sector_all_stocks = {}
     total_stocks = 0
 
     for sname, sdata in sectors.items():
         stocks = sdata.get("stocks", [])
+        limit_count = sdata.get("limit_up", 0)
         if not stocks:
             continue
 
         valid_stocks = []
-        limit_count = 0
         for item in stocks:
             code = str(item.get("code", ""))
             name = str(item.get("name", ""))
@@ -1212,35 +1257,12 @@ def screen_mainboard_strategy() -> list[dict]:
                 continue
             if "ST" in name.upper():
                 continue
-
-            # 计算涨幅判断是否涨停
-            trade = item.get("trade", "0")
-            settlement = item.get("settlement", "0")
-            try:
-                price = float(trade) if trade else 0
-                prev_close = float(settlement) if settlement else 0
-            except (ValueError, TypeError):
-                continue
-            if prev_close <= 0 or price <= 0:
-                continue
-
-            gain = (price - prev_close) / prev_close * 100
-
-            # 判断涨停
-            if code.startswith(("30", "68")):
-                limit_pct = 20
-            else:
-                limit_pct = 10
-            if gain >= limit_pct * 0.95:
-                limit_count += 1
-
             valid_stocks.append(item)
 
         sector_all_stocks[sname] = valid_stocks
         sector_limit_counts[sname] = limit_count
         total_stocks += len(valid_stocks)
 
-    # 按涨停数降序排列板块
     sorted_sectors = sorted(sector_limit_counts.items(), key=lambda x: x[1], reverse=True)
     print(f"  板块涨停排名 (Top 10):")
     for i, (sname, cnt) in enumerate(sorted_sectors[:10], 1):
@@ -1249,15 +1271,13 @@ def screen_mainboard_strategy() -> list[dict]:
     # ========== 第三步：按板块优先级逐板块筛选 ==========
     print(f"\n📊 按板块优先级筛选 ({total_stocks} 只股票)...")
 
-    all_candidates = []   # 带板块标签的候选股
-    sector_for_stock = {} # {code: sector_name}
+    all_candidates = []
 
     for sname, limit_cnt in sorted_sectors:
         stocks = sector_all_stocks.get(sname, [])
         if not stocks:
             continue
 
-        # 初筛该板块的股票
         for item in stocks:
             code = str(item.get("code", ""))
             name = str(item.get("name", ""))
@@ -1265,67 +1285,50 @@ def screen_mainboard_strategy() -> list[dict]:
             if not code or len(code) != 6:
                 continue
 
-            mktcap = item.get("mktcap", 0)
+            # 东方财富返回的涨跌幅是百分比
+            change_pct = 0
             try:
-                mktcap = float(mktcap) if mktcap else 0
+                change_pct = float(item.get("changepercent", item.get("change_pct", 0)))
             except (ValueError, TypeError):
-                continue
-            if mktcap <= 0:
-                continue
-            market_cap_yi = mktcap / 10000
-            if market_cap_yi >= 400:
+                pass
+
+            # 价格
+            try:
+                price = float(item.get("trade", 0))
+            except (ValueError, TypeError):
                 continue
 
-            trade = item.get("trade", "0")
-            settlement = item.get("settlement", "0")
-            try:
-                price = float(trade) if trade else 0
-                prev_close = float(settlement) if settlement else 0
-            except (ValueError, TypeError):
-                continue
+            # 东方财富成分股接口没有 settlement（昨收），需要从 trade 和 changepercent 反算
+            if change_pct != 0 and price > 0:
+                prev_close = price / (1 + change_pct / 100)
+            else:
+                prev_close = price  # fallback
+
             if prev_close <= 0 or price <= 0 or price >= 120:
                 continue
 
-            auction_gain = (price - prev_close) / prev_close * 100
+            auction_gain = change_pct if change_pct != 0 else 0
             if auction_gain <= 3 or auction_gain >= 10:
                 continue
 
-            open_price = item.get("open", "0")
-            try:
-                open_price = float(open_price) if open_price else price
-            except (ValueError, TypeError):
-                open_price = price
-            if open_price < prev_close:
+            if price < prev_close * 0.999:  # 允许0.1%误差
                 continue
 
-            volume = item.get("volume", 0)
-            try:
-                volume = int(volume) if volume else 0
-            except (ValueError, TypeError):
-                continue
-            if volume <= 0:
-                continue
-
-            turnover = item.get("turnoverratio", "0")
-            try:
-                turnover = float(turnover) if turnover else 0
-            except (ValueError, TypeError):
-                turnover = 0
+            mktcap = 0  # 东方财富成分股接口没有市值字段，后续由腾讯接口补充
 
             cand = {
                 "code": code, "name": name, "symbol": symbol,
-                "price": price, "prev_close": prev_close,
+                "price": price, "prev_close": round(prev_close, 2),
                 "auction_gain": round(auction_gain, 2),
-                "open_price": open_price,
-                "volume_shares": volume,
-                "volume": volume // 100,
-                "market_cap_yi": round(market_cap_yi, 2),
-                "turnover_sina": turnover,
+                "open_price": price,
+                "volume_shares": 0,
+                "volume": 0,
+                "market_cap_yi": mktcap,
+                "turnover_sina": 0,
                 "sector": sname,
                 "sector_limit_count": limit_cnt,
             }
             all_candidates.append(cand)
-            sector_for_stock[code] = sname
 
     print(f"  初筛候选: {len(all_candidates)} 只")
 
@@ -1358,6 +1361,13 @@ def screen_mainboard_strategy() -> list[dict]:
                         return t(fields[idx]) if fields[idx] else (t(0) if t != str else "")
                     except (ValueError, IndexError):
                         return t(0) if t != str else ""
+
+                # 补充市值信息
+                mktcap = _v(45)  # 万亿→亿
+                for c in all_candidates:
+                    if c["code"] == code and c["market_cap_yi"] <= 0:
+                        c["market_cap_yi"] = round(mktcap, 2) if mktcap > 0 else 0
+
                 tencent_map[code] = {
                     "volume": _v(6, int),
                     "buy_vol": _v(7, int),
@@ -1381,7 +1391,7 @@ def screen_mainboard_strategy() -> list[dict]:
     # ========== 第六步：K线 + MACD 检查 ==========
     print("📊 获取K线数据（3日涨幅+2个月涨停+前日涨停+MACD检查）...")
     codes_to_fetch = [c["code"] for c in filtered]
-    kline_map = _fetch_kline_concurrent(codes_to_fetch, days=200)
+    kline_map = _fetch_kline_concurrent(codes_to_fetch, days=1000)
 
     final = []
     for c in filtered:
@@ -1401,6 +1411,16 @@ def screen_mainboard_strategy() -> list[dict]:
             else:
                 c["yesterday_vol_hist"] = 0
 
+            # 用K线数据修正昨收价
+            if len(klines) >= 2:
+                try:
+                    real_prev_close = float(klines[-2].get("close", 0))
+                    if real_prev_close > 0:
+                        c["prev_close"] = real_prev_close
+                        c["auction_gain"] = round((c["price"] - real_prev_close) / real_prev_close * 100, 2)
+                except (ValueError, TypeError):
+                    pass
+
             if code.startswith(("30", "68")):
                 limit_pct = 20
             else:
@@ -1419,13 +1439,13 @@ def screen_mainboard_strategy() -> list[dict]:
             c["change_3d"] = 0
             c["yesterday_vol_hist"] = 0
 
-        if not _check_has_limit_up_in_days(code, days=60):
+        if not _check_has_limit_up_in_days(code, days=60, cached_klines=klines):
             continue
         if not _check_macd_120min_up(code):
             continue
-        if not _check_monthly_macd_red_up(code):
+        if not _check_monthly_macd_red_up(code, cached_klines=klines):
             continue
-        if not _check_weekly_macd_red_growing(code):
+        if not _check_weekly_macd_red_growing(code, cached_klines=klines):
             continue
 
         c["change_pct"] = c["auction_gain"]
@@ -1495,18 +1515,16 @@ def screen_mainboard_strategy() -> list[dict]:
             print(f"    {sn}: {cnt} 只入选, {lc} 只涨停")
 
     # ========== 第九步：板块龙头识别 + 出现次数统计 ==========
-    # 按板块分组，每个板块选出龙头（综合评分最高）
     sector_groups = {}
     for c in final:
         sn = c.get("sector", "未知")
         sector_groups.setdefault(sn, []).append(c)
 
-    leader_scores = {}  # {code: composite_score}
+    leader_scores = {}
     for sn, stocks_in_sector in sector_groups.items():
         best_code = None
         best_score = -999
         for s in stocks_in_sector:
-            # 综合评分：涨幅权重 + 量比权重 + 频次权重
             chg = s.get("auction_gain", 0)
             vr = s.get("volume_ratio", 0)
             freq = s.get("frequency", 0)
@@ -1517,7 +1535,6 @@ def screen_mainboard_strategy() -> list[dict]:
         if best_code:
             leader_scores[best_code] = best_score
 
-    # 读取历史龙头出现次数
     leader_freq_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "leader_frequency.json")
     try:
         with open(leader_freq_path, "r", encoding="utf-8") as f:
@@ -1525,7 +1542,6 @@ def screen_mainboard_strategy() -> list[dict]:
     except (FileNotFoundError, json.JSONDecodeError):
         leader_freq_history = {}
 
-    # 更新今日龙头出现次数
     today_str = datetime.now().strftime("%Y-%m-%d")
     for code in leader_scores:
         if code not in leader_freq_history:
@@ -1533,27 +1549,22 @@ def screen_mainboard_strategy() -> list[dict]:
         if today_str not in leader_freq_history[code]["dates"]:
             leader_freq_history[code]["count"] += 1
             leader_freq_history[code]["dates"].append(today_str)
-            # 只保留最近60天记录
             leader_freq_history[code]["dates"] = leader_freq_history[code]["dates"][-60:]
 
-    # 保存历史
     try:
         with open(leader_freq_path, "w", encoding="utf-8") as f:
             json.dump(leader_freq_history, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
 
-    # 标记龙头 + 写入出现次数
     for c in final:
         code = c["code"]
         c["is_leader"] = code in leader_scores
         c["leader_count"] = leader_freq_history.get(code, {}).get("count", 0)
 
-    # 按龙头出现次数降序排列（龙头在前，非龙头在后）
     final.sort(key=lambda x: (-int(x.get("is_leader", False)), -x.get("leader_count", 0),
                                -x.get("sector_limit_count", 0), -x.get("frequency", 0)))
 
-    # 输出龙头出现次数统计
     leader_stats = [(c["code"], c["name"], c.get("sector", ""), c.get("leader_count", 0))
                     for c in final if c.get("is_leader")]
     if leader_stats:
@@ -1563,7 +1574,6 @@ def screen_mainboard_strategy() -> list[dict]:
             print(f"    {name}({code}) [{sector}] — 出现 {cnt} 次")
 
     return final
-
 
 def _screen_fallback_all_market() -> list[dict]:
     """
@@ -1663,7 +1673,7 @@ def _screen_fallback_all_market() -> list[dict]:
             "volume": volume // 100,
             "market_cap_yi": round(market_cap_yi, 2),
             "turnover_sina": turnover,
-            "sector": "全市场",
+            "sector": _get_board_type(code),
             "sector_limit_count": 0,
         })
 
@@ -1700,7 +1710,7 @@ def _screen_fallback_all_market() -> list[dict]:
     if not filtered:
         return []
 
-    kline_map = _fetch_kline_concurrent([c["code"] for c in filtered], days=200)
+    kline_map = _fetch_kline_concurrent([c["code"] for c in filtered], days=1000)
     final = []
     for c in filtered:
         code = c["code"]
@@ -1727,13 +1737,13 @@ def _screen_fallback_all_market() -> list[dict]:
             c["change_3d"] = 0
             c["yesterday_vol_hist"] = 0
 
-        if not _check_has_limit_up_in_days(code, days=60):
+        if not _check_has_limit_up_in_days(code, days=60, cached_klines=klines):
             continue
         if not _check_macd_120min_up(code):
             continue
-        if not _check_monthly_macd_red_up(code):
+        if not _check_monthly_macd_red_up(code, cached_klines=klines):
             continue
-        if not _check_weekly_macd_red_growing(code):
+        if not _check_weekly_macd_red_growing(code, cached_klines=klines):
             continue
         c["change_pct"] = c["auction_gain"]
         final.append(c)
@@ -1769,7 +1779,68 @@ def _screen_fallback_all_market() -> list[dict]:
         c["frequency"] = freq
         c["strategy"] = _compute_screen_strategy(c)
 
-    final.sort(key=lambda x: (-x.get("frequency", 0), -x["auction_gain"]))
+    # 按板块类型分组，识别龙头
+    board_groups = {}
+    for c in final:
+        bt = c.get("sector", _get_board_type(c["code"]))
+        c["sector"] = bt
+        board_groups.setdefault(bt, []).append(c)
+
+    leader_scores = {}
+    for bt, stocks_in_board in board_groups.items():
+        best_code = None
+        best_score = -999
+        for s in stocks_in_board:
+            chg = s.get("auction_gain", 0)
+            vr = s.get("volume_ratio", 0)
+            freq = s.get("frequency", 0)
+            comp = chg * 3 + vr * 2 + freq * 10
+            if comp > best_score:
+                best_score = comp
+                best_code = s["code"]
+        if best_code:
+            leader_scores[best_code] = best_score
+
+    # 读取历史龙头出现次数
+    leader_freq_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "leader_frequency.json")
+    try:
+        with open(leader_freq_path, "r", encoding="utf-8") as f:
+            leader_freq_history = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        leader_freq_history = {}
+
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    for code in leader_scores:
+        if code not in leader_freq_history:
+            leader_freq_history[code] = {"count": 0, "dates": []}
+        if today_str not in leader_freq_history[code]["dates"]:
+            leader_freq_history[code]["count"] += 1
+            leader_freq_history[code]["dates"].append(today_str)
+            leader_freq_history[code]["dates"] = leader_freq_history[code]["dates"][-60:]
+
+    try:
+        with open(leader_freq_path, "w", encoding="utf-8") as f:
+            json.dump(leader_freq_history, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+    for c in final:
+        code = c["code"]
+        c["is_leader"] = code in leader_scores
+        c["leader_count"] = leader_freq_history.get(code, {}).get("count", 0)
+
+    final.sort(key=lambda x: (-int(x.get("is_leader", False)), -x.get("leader_count", 0),
+                               -x.get("frequency", 0), -x["auction_gain"]))
+
+    # 输出龙头统计
+    leader_stats = [(c["code"], c["name"], c.get("sector", ""), c.get("leader_count", 0))
+                    for c in final if c.get("is_leader")]
+    if leader_stats:
+        leader_stats.sort(key=lambda x: -x[3])
+        print(f"\n  🏆 板块龙头出现次数统计:")
+        for code, name, sector, cnt in leader_stats:
+            print(f"    {name}({code}) [{sector}] — 出现 {cnt} 次")
+
     return final
 
 
@@ -1792,27 +1863,6 @@ def _compute_screen_strategy(s: dict) -> str:
     if chg >= 3:
         return "四万首板"
     return "三万首板"
-
-
-def _compute_screen_frequency(s: dict) -> int:
-    """频次：基于量比和涨幅的信号命中数"""
-    freq = 0
-    vr = s.get("volume_ratio", 0)
-    chg = s.get("auction_gain", 0)
-    rr = s.get("remaining_rate", 50)
-    turnover = s.get("turnover", 0)
-
-    if vr > 3:
-        freq += 1
-    if chg > 3:
-        freq += 1
-    if rr > 60:
-        freq += 1
-    if turnover > 1:
-        freq += 1
-    if chg > 1 and vr > 2:
-        freq += 1
-    return freq
 
 
 def save_screen_html(stocks: list[dict], indices: list[dict], path: str) -> str:
@@ -1868,9 +1918,9 @@ def save_screen_html(stocks: list[dict], indices: list[dict], path: str) -> str:
         leader_color = "#f0883e" if is_leader else "#8b949e"
 
         rows += f"""<tr>
-<td>{s["code"]}</td>
-<td style="text-align:left;font-weight:600">{s["name"]}</td>
-<td style="text-align:left;font-size:12px">{sector}<span style="color:#8b949e;font-size:10px">({sector_lc}涨停)</span></td>
+<td>{html_module.escape(s["code"])}</td>
+<td style="text-align:left;font-weight:600">{html_module.escape(s["name"])}</td>
+<td style="text-align:left;font-size:12px">{html_module.escape(sector)}<span style="color:#8b949e;font-size:10px">({sector_lc}涨停)</span></td>
 <td style="color:{leader_color};font-weight:{'700' if is_leader else '400'}">{leader_mark}{leader_count}</td>
 <td>{s["auction_price"]:.2f}</td>
 <td>{s.get("price_0926", s["price"]):.2f}</td>
@@ -1892,7 +1942,7 @@ def save_screen_html(stocks: list[dict], indices: list[dict], path: str) -> str:
     if sector_stats:
         sector_cells = ""
         for sn, cnt in sorted(sector_stats.items(), key=lambda x: -x[1]):
-            sector_cells += f'<span style="background:#161b22;border-radius:4px;padding:4px 8px;margin:2px;display:inline-block;font-size:12px">{sn}: <b>{cnt}</b>只</span> '
+            sector_cells += f'<span style="background:#161b22;border-radius:4px;padding:4px 8px;margin:2px;display:inline-block;font-size:12px">{html_module.escape(sn)}: <b>{cnt}</b>只</span> '
         sector_html = f'<div style="text-align:center;margin-bottom:12px">{sector_cells}</div>'
 
     # 板块龙头出现次数统计（HTML）
@@ -1903,7 +1953,7 @@ def save_screen_html(stocks: list[dict], indices: list[dict], path: str) -> str:
         leader_data.sort(key=lambda x: -x[3])
         leader_cells = ""
         for code, name, sector, cnt in leader_data:
-            leader_cells += f'<span style="background:#161b22;border:1px solid #f0883e;border-radius:4px;padding:4px 8px;margin:2px;display:inline-block;font-size:12px">🏆 {name}({code}) <span style="color:#f0883e;font-weight:700">{cnt}次</span> <span style="color:#8b949e;font-size:10px">{sector}</span></span> '
+            leader_cells += f'<span style="background:#161b22;border:1px solid #f0883e;border-radius:4px;padding:4px 8px;margin:2px;display:inline-block;font-size:12px">🏆 {html_module.escape(name)}({html_module.escape(code)}) <span style="color:#f0883e;font-weight:700">{cnt}次</span> <span style="color:#8b949e;font-size:10px">{html_module.escape(sector)}</span></span> '
         leader_html = f'<div style="text-align:center;margin-bottom:12px;padding:8px;background:rgba(240,136,62,.08);border-radius:8px"><div style="color:#f0883e;font-size:13px;font-weight:600;margin-bottom:6px">🏆 板块龙头出现次数统计</div>{leader_cells}</div>'
 
     html = f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
