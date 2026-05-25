@@ -283,22 +283,26 @@ def fetch_quotes(codes: list[str]) -> dict:
 
 
 def fetch_hist(code: str, days: int = 10) -> list[dict]:
-    """获取近期日K线"""
-    try:
-        r = requests.get(
-            "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData",
-            params={"symbol": _to_tencent(code), "scale": "240", "ma": "no", "datalen": days},
-            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn/"},
-            timeout=15,
-        )
-        data = json.loads(r.text)
-        if data:
-            return data
-    except Exception as e:
-        print(f"  ⚠ 新浪K线接口异常({code}): {e}")
+    """获取近期日K线（带重试）"""
+    # 尝试新浪接口（带重试）
+    for attempt in range(2):
+        try:
+            r = requests.get(
+                "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData",
+                params={"symbol": _to_tencent(code), "scale": "240", "ma": "no", "datalen": days},
+                headers={"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn/"},
+                timeout=15,
+            )
+            if r.text and r.text.strip():
+                data = json.loads(r.text)
+                if data:
+                    return data
+        except Exception:
+            pass
+        if attempt == 0:
+            import time; time.sleep(0.3)
 
-    try:
-        sym = _to_tencent(code)
+    # 备用：腾讯接口
         end = datetime.now().strftime("%Y-%m-%d")
         start = (datetime.now() - timedelta(days=days * 2)).strftime("%Y-%m-%d")
         r = requests.get(
@@ -797,7 +801,7 @@ def _fetch_kline_concurrent(codes: list[str], days: int = 5) -> dict:
         except Exception:
             return code, []
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         futures = [executor.submit(_fetch_one, c) for c in codes]
         for future in concurrent.futures.as_completed(futures):
             code, hist = future.result()
@@ -1402,11 +1406,11 @@ def screen_mainboard_strategy() -> list[dict]:
         except Exception as e:
             print(f"  ⚠ 腾讯接口批次{i//batch_size+1}失败: {e}")
 
-    # ========== 第五步：补充昨日成交量（板块接口无此数据，从K线获取）==========
-    print(f"📊 获取昨日成交量（{len(all_candidates)} 只候选）...")
-    vol_kline_map = _fetch_kline_concurrent([c["code"] for c in all_candidates], days=5)
+    # ========== 第五步：获取K线数据（用于补充成交量 + 后续MACD检查）==========
+    print(f"📊 获取K线数据（{len(all_candidates)} 只候选，1000天）...")
+    kline_map_all = _fetch_kline_concurrent([c["code"] for c in all_candidates], days=1000)
     for c in all_candidates:
-        klines = vol_kline_map.get(c["code"], [])
+        klines = kline_map_all.get(c["code"], [])
         if klines and len(klines) >= 2:
             try:
                 yesterday_vol = int(float(klines[-2].get("volume", 0)))
@@ -1425,15 +1429,13 @@ def screen_mainboard_strategy() -> list[dict]:
     if not filtered:
         return []
 
-    # ========== 第七步：K线 + MACD 检查 ==========
-    print("📊 获取K线数据（3日涨幅+2个月涨停+前日涨停+MACD检查）...")
-    codes_to_fetch = [c["code"] for c in filtered]
-    kline_map = _fetch_kline_concurrent(codes_to_fetch, days=1000)
+    # ========== 第七步：K线 + MACD 检查（复用第五步数据）==========
+    print("📊 执行K线+MACD检查...")
 
     final = []
     for c in filtered:
         code = c["code"]
-        klines = kline_map.get(code, [])
+        klines = kline_map_all.get(code, [])
         if klines and len(klines) >= 4:
             closes = [float(k.get("close", 0)) for k in klines[-4:]]
             if closes[0] > 0:
