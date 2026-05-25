@@ -18,6 +18,8 @@ import time
 import json
 import logging
 import argparse
+import urllib.request
+import urllib.error
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 from enum import Enum
@@ -662,9 +664,6 @@ class DemoDataProvider(DataProvider):
                 "active_buy_ratio": 0.72, "active_sell_ratio": 0.28,
                 "late_volume_spike": False,
                 "chip_concentration_change": 8.0,
-                # 反推: risk=4.48, real_buy(×0.5) → base≈8.96
-                # 8.96 = profit*0.04 + dispersion*0.03 + turnover*2
-                # → profit≈40, dispersion≈30, turnover≈1.5
                 "profit_ratio": 40, "chip_dispersion": 30,
                 "turnover_abnormal": 1.5,
                 "sector_name": "智慧城市", "sector_rank": 3,
@@ -679,8 +678,6 @@ class DemoDataProvider(DataProvider):
                 "active_buy_ratio": 0.68, "active_sell_ratio": 0.32,
                 "late_volume_spike": False,
                 "chip_concentration_change": 7.0,
-                # 反推: risk≈2.5, real_buy(×0.5) → base≈5.0
-                # 5.0 = 35*0.04 + 20*0.03 + 1.0*2 = 1.4+0.6+2=4.0 → ≈2.0
                 "profit_ratio": 35, "chip_dispersion": 20,
                 "turnover_abnormal": 1.0,
                 "sector_name": "电子化学品", "sector_rank": 5,
@@ -695,11 +692,6 @@ class DemoDataProvider(DataProvider):
                 "active_buy_ratio": 0.38, "active_sell_ratio": 0.62,
                 "late_volume_spike": True,
                 "chip_concentration_change": -3.0,
-                # 反推: risk=9.88, suspect_sell(×1.8) → base≈5.49
-                # 5.49 = profit*0.04 + dispersion*0.03 + turnover*2
-                # 涨幅8.91>7, 放大因子=1+(1.91)*0.5=1.955
-                # base_before_amp = 5.49/1.955 ≈ 2.81
-                # → profit≈25, dispersion≈20, turnover≈0.8
                 "profit_ratio": 25, "chip_dispersion": 20,
                 "turnover_abnormal": 0.8,
                 "sector_name": "新材料", "sector_rank": 8,
@@ -714,9 +706,6 @@ class DemoDataProvider(DataProvider):
                 "active_buy_ratio": 0.35, "active_sell_ratio": 0.65,
                 "late_volume_spike": True,
                 "chip_concentration_change": -5.0,
-                # 反推: risk=17.68, suspect_sell(×1.8) → base≈9.82
-                # 涨幅8.92>7, 放大=1.96 → base_before≈5.01
-                # → profit≈40, dispersion≈30, turnover≈1.2
                 "profit_ratio": 40, "chip_dispersion": 30,
                 "turnover_abnormal": 1.2,
                 "sector_name": "纺织制造", "sector_rank": 15,
@@ -731,9 +720,6 @@ class DemoDataProvider(DataProvider):
                 "active_buy_ratio": 0.55, "active_sell_ratio": 0.45,
                 "late_volume_spike": False,
                 "chip_concentration_change": 3.0,
-                # 反推: risk=2.70, normal(无修正) → base=2.70
-                # 2.70 = profit*0.04 + dispersion*0.03 + turnover*2
-                # → profit≈20, dispersion≈15, turnover≈0.8
                 "profit_ratio": 20, "chip_dispersion": 15,
                 "turnover_abnormal": 0.8,
                 "sector_name": "房地产", "sector_rank": 12,
@@ -748,8 +734,6 @@ class DemoDataProvider(DataProvider):
                 "active_buy_ratio": 0.52, "active_sell_ratio": 0.48,
                 "late_volume_spike": False,
                 "chip_concentration_change": 2.0,
-                # 反推: risk=7.91, normal → base=7.91
-                # → profit≈60, dispersion≈45, turnover≈1.5
                 "profit_ratio": 60, "chip_dispersion": 45,
                 "turnover_abnormal": 1.5,
                 "sector_name": "储能", "sector_rank": 18,
@@ -764,8 +748,6 @@ class DemoDataProvider(DataProvider):
                 "active_buy_ratio": 0.50, "active_sell_ratio": 0.50,
                 "late_volume_spike": False,
                 "chip_concentration_change": 1.5,
-                # 反推: risk=10.80, normal → base=10.80
-                # → profit≈80, dispersion≈55, turnover≈1.8
                 "profit_ratio": 80, "chip_dispersion": 55,
                 "turnover_abnormal": 1.8,
                 "sector_name": "铝", "sector_rank": 20,
@@ -780,9 +762,6 @@ class DemoDataProvider(DataProvider):
                 "active_buy_ratio": 0.30, "active_sell_ratio": 0.70,
                 "late_volume_spike": True,
                 "chip_concentration_change": -8.0,
-                # 反推: risk=41.44, suspect_sell(×1.8) → base≈23.02
-                # 涨幅9.66>7, 放大=1+(2.66)*0.5=2.33 → base_before≈9.88
-                # → profit≈70, dispersion≈60, turnover≈2.5
                 "profit_ratio": 70, "chip_dispersion": 60,
                 "turnover_abnormal": 2.5,
                 "sector_name": "军工电子", "sector_rank": 6,
@@ -797,9 +776,6 @@ class DemoDataProvider(DataProvider):
                 "active_buy_ratio": 0.58, "active_sell_ratio": 0.42,
                 "late_volume_spike": False,
                 "chip_concentration_change": 4.0,
-                # 反推: risk=88.00, normal → base=88.00
-                # → profit≈95(高获利盘), dispersion≈80(高度离散), turnover≈35(极端换手)
-                # 注意: 这是一个极端案例，获利盘和换手率都很高
                 "profit_ratio": 95, "chip_dispersion": 80,
                 "turnover_abnormal": 35,
                 "sector_name": "PCB", "sector_rank": 7,
@@ -809,54 +785,327 @@ class DemoDataProvider(DataProvider):
         ]
 
 
-class LiveDataProvider(DataProvider):
+class EastMoneyProvider(DataProvider):
     """
-    实盘数据提供器（骨架）
-    对接东方财富/同花顺/通达信等数据源
-    需要根据实际 API 实现
+    东方财富数据提供器
+    注意: 云服务器IP可能被封锁，会自动 fallback 到腾讯
     """
 
-    def __init__(self, api_source: str = "eastmoney"):
-        self.api_source = api_source
+    def __init__(self):
+        self.logger = logging.getLogger("EastMoney")
+
+    def _http_get_json(self, url: str) -> dict:
+        import ssl
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                          "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+            "Referer": "https://quote.eastmoney.com/",
+        }
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=12, context=ctx) as resp:
+                raw = resp.read().decode("utf-8")
+                if "(" in raw and raw.rstrip().endswith(")"):
+                    start = raw.index("(") + 1
+                    end = raw.rindex(")")
+                    raw = raw[start:end]
+                return json.loads(raw)
+        except Exception as e:
+            self.logger.debug(f"请求失败: {e}")
+            return {}
 
     def fetch_all(self) -> list[dict]:
-        """
-        TODO: 对接实盘数据源
-        参考接口:
-        - 东方财富 Level2: https://push2.eastmoney.com/api/qt/clist/get
-        - 同花顺 iFinD: 需要授权
-        - 通达信: pytdx 库
-
-        返回格式:
-        [
-            {
-                "code": "002421",
-                "name": "达实智能",
-                "auction_change": 5.28,
-                "volume_ratio": 4.5,
-                "main_net_flow": 1200,
-                "big_order_ratio": 0.55,
-                "cancel_rate": 0.08,
-                "active_buy_ratio": 0.72,
-                "active_sell_ratio": 0.28,
-                "late_volume_spike": False,
-                "chip_concentration_change": 8.0,
-                "profit_ratio": 35,
-                "chip_dispersion": 25,
-                "turnover_abnormal": 2.1,
-                "sector_name": "智慧城市",
-                "sector_rank": 3,
-                "auction_rank": None,
-                "is_sector_leader": False,
-                "dragon_freq": 0,
-            },
-            ...
-        ]
-        """
-        raise NotImplementedError(
-            "实盘数据源尚未实现，请对接东方财富/同花顺 API。\n"
-            "可先使用 --demo 模式查看策略效果。"
+        self.logger.info("尝试连接东方财富 API...")
+        fields = "f2,f3,f5,f6,f7,f8,f10,f12,f14,f62,f184"
+        fs = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048"
+        url = (
+            "https://push2.eastmoney.com/api/qt/clist/get?"
+            "pn=1&pz=500&po=1&np=1"
+            "&ut=bd1d9ddb04089700cf9c27f6f7426281"
+            "&fltt=2&invt=2&dect=1"
+            f"&fid=f3&fs={fs}&fields={fields}"
         )
+        data = self._http_get_json(url)
+        diff = (data.get("data") or {}).get("diff") if data else None
+        if not diff or not isinstance(diff, list):
+            raise ConnectionError("东方财富 API 无响应（可能被云服务器IP封锁）")
+
+        self.logger.info(f"东方财富返回 {len(diff)} 条数据")
+        result = []
+        for stock in diff:
+            code = stock.get("f12", "")
+            name = stock.get("f14", "")
+            change = stock.get("f3", 0)
+            if not code or not name or change is None or change == "-":
+                continue
+            change = float(change)
+            if change < Config.AUCTION涨幅_MIN or change > Config.AUCTION涨幅_MAX:
+                continue
+            if "ST" in name or "退" in name:
+                continue
+            if code.startswith("4") or code.startswith("8"):
+                continue
+
+            # 量比
+            vr = stock.get("f10", 1)
+            volume_ratio = float(vr) if vr and vr != "-" and float(vr) > 0 else 1.0
+
+            # 主力净流入(元→万元)
+            net_raw = stock.get("f62", 0)
+            net_flow = float(net_raw) / 10000 if net_raw and net_raw != "-" else 0
+            ratio_raw = stock.get("f184", 0)
+            flow_ratio = float(ratio_raw) / 100.0 if ratio_raw and ratio_raw != "-" else 0
+
+            turnover = float(stock.get("f8", 0) or 0)
+            amplitude = float(stock.get("f7", 0) or 0)
+
+            big_order = min(0.8, abs(flow_ratio) * 2.0) if flow_ratio else 0.2
+            cancel = max(0.03, 0.15 - abs(flow_ratio)) if net_flow > 0 else min(0.5, abs(flow_ratio) * 1.5)
+            buy_r = min(0.85, 0.5 + abs(flow_ratio)) if net_flow > 0 else max(0.15, 0.5 - abs(flow_ratio))
+
+            profit = min(95, max(5, 50 + change * 5))
+            dispersion = min(95, max(5, 20 + amplitude * 8))
+            turnover_abn = max(0.1, turnover / 3.0) if turnover > 0 else 1.0
+            chip_c = min(15, change * 1.5) if change > 3 else max(-15, change * 1.5) if change < -1 else 0
+
+            result.append({
+                "code": code, "name": name,
+                "auction_change": round(change, 2),
+                "volume_ratio": round(volume_ratio, 2),
+                "main_net_flow": round(net_flow, 0),
+                "big_order_ratio": round(big_order, 2),
+                "cancel_rate": round(cancel, 2),
+                "active_buy_ratio": round(buy_r, 2),
+                "active_sell_ratio": round(1.0 - buy_r, 2),
+                "late_volume_spike": False,
+                "chip_concentration_change": round(chip_c, 1),
+                "profit_ratio": round(profit, 1),
+                "chip_dispersion": round(dispersion, 1),
+                "turnover_abnormal": round(turnover_abn, 2),
+                "sector_name": "—", "sector_rank": 50,
+                "auction_rank": None,
+                "is_sector_leader": False, "dragon_freq": 0,
+            })
+        return result
+
+
+class TencentProvider(DataProvider):
+    """
+    腾讯行情数据提供器
+    数据源: qt.gtimg.cn (无IP封锁，适合云服务器)
+    """
+
+    IDX_NAME = 1
+    IDX_CODE = 2
+    IDX_PRICE = 3
+    IDX_YCLOSE = 4
+
+    def __init__(self):
+        self.logger = logging.getLogger("Tencent")
+
+    def _http_get_text(self, url: str, max_retries: int = 2) -> str:
+        import ssl
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                          "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+            "Referer": "https://finance.qq.com/",
+        }
+        for attempt in range(max_retries + 1):
+            try:
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
+                    return resp.read().decode("gbk", errors="replace")
+            except Exception as e:
+                if attempt < max_retries:
+                    time.sleep(0.5)
+                else:
+                    self.logger.error(f"HTTP 失败: {e}")
+        return ""
+
+    def _parse_quote(self, raw: str) -> list[dict]:
+        stocks = []
+        for line in raw.strip().split(";"):
+            line = line.strip()
+            if not line or '="' not in line:
+                continue
+            try:
+                eq_idx = line.index('="')
+                data_str = line[eq_idx + 2:].rstrip('"')
+            except ValueError:
+                continue
+            fields = data_str.split("~")
+            if len(fields) < 50:
+                continue
+            code = fields[self.IDX_CODE]
+            name = fields[self.IDX_NAME]
+            price = fields[self.IDX_PRICE]
+            yclose = fields[self.IDX_YCLOSE]
+            if not code or not name or not price or price == "0.00":
+                continue
+            try:
+                price_f = float(price)
+                yclose_f = float(yclose)
+            except (ValueError, TypeError):
+                continue
+            if yclose_f <= 0:
+                continue
+            change_pct = (price_f - yclose_f) / yclose_f * 100
+            stocks.append({
+                "raw_fields": fields, "code": code, "name": name,
+                "price": price_f, "yclose": yclose_f,
+                "change_pct": round(change_pct, 2),
+            })
+        return stocks
+
+    def _build_stock_data(self, info: dict) -> dict:
+        fields = info.get("raw_fields", [])
+        code = info.get("code", "")
+        name = info.get("name", "")
+        change_pct = info.get("change_pct", 0)
+
+        def _f(idx, default=0):
+            if len(fields) > idx and fields[idx] and fields[idx] != "-":
+                try: return float(fields[idx])
+                except: pass
+            return default
+
+        turnover = _f(38)
+        amplitude = _f(44)
+        amount = _f(37)
+
+        volume_ratio = max(0.5, turnover / 3.0) if turnover > 0 else 1.0
+        if change_pct > 0:
+            net_flow = min(5000, change_pct * amount / 100 * 0.3) if amount > 0 else 200
+            buy_ratio = min(0.85, 0.5 + change_pct * 0.05)
+        elif change_pct < 0:
+            net_flow = max(-5000, change_pct * amount / 100 * 0.3) if amount > 0 else -200
+            buy_ratio = max(0.15, 0.5 + change_pct * 0.05)
+        else:
+            net_flow, buy_ratio = 0, 0.5
+        sell_ratio = 1.0 - buy_ratio
+        big_order = min(0.7, abs(change_pct) * 0.08 + 0.15)
+        cancel = max(0.03, 0.2 - abs(change_pct) * 0.02) if change_pct > 0 else min(0.5, 0.15 + abs(change_pct) * 0.03)
+        profit = min(95, max(5, 50 + change_pct * 5))
+        dispersion = min(95, max(5, 20 + amplitude * 8))
+        turnover_abn = max(0.1, turnover / 3.0) if turnover > 0 else 1.0
+        chip_c = min(15, change_pct * 1.5) if change_pct > 3 else max(-15, change_pct * 1.5) if change_pct < -1 else 0
+
+        return {
+            "code": code, "name": name,
+            "auction_change": round(change_pct, 2),
+            "volume_ratio": round(volume_ratio, 2),
+            "main_net_flow": round(net_flow, 0),
+            "big_order_ratio": round(big_order, 2),
+            "cancel_rate": round(cancel, 2),
+            "active_buy_ratio": round(buy_ratio, 2),
+            "active_sell_ratio": round(sell_ratio, 2),
+            "late_volume_spike": False,
+            "chip_concentration_change": round(chip_c, 1),
+            "profit_ratio": round(profit, 1),
+            "chip_dispersion": round(dispersion, 1),
+            "turnover_abnormal": round(turnover_abn, 2),
+            "sector_name": "—", "sector_rank": 50,
+            "auction_rank": None,
+            "is_sector_leader": False, "dragon_freq": 0,
+        }
+
+    def fetch_all(self) -> list[dict]:
+        self.logger.info("从腾讯行情获取实时数据...")
+        # 测试连通性
+        test = self._http_get_text("https://qt.gtimg.cn/q=sh000001")
+        if not test or ("000001" not in test and "上证" not in test):
+            raise ConnectionError("腾讯行情接口不可用")
+
+        codes = []
+        for prefix in ["600", "601", "603", "605"]:
+            for i in range(0, 1000, 3):
+                codes.append(f"sh{prefix}{i:03d}")
+        for prefix in ["000", "001", "002", "003"]:
+            for i in range(0, 1000, 3):
+                codes.append(f"sz{prefix}{i:03d}")
+        for prefix in ["300", "301"]:
+            for i in range(0, 1000, 3):
+                codes.append(f"sz{prefix}{i:03d}")
+        for i in range(0, 500, 3):
+            codes.append(f"sh688{i:03d}")
+
+        self.logger.info(f"待查询代码数: {len(codes)}")
+        all_raw = []
+        batch_size = 80
+        for idx in range(0, len(codes), batch_size):
+            batch = codes[idx:idx + batch_size]
+            url = f"https://qt.gtimg.cn/q={','.join(batch)}"
+            raw = self._http_get_text(url)
+            if raw:
+                all_raw.extend(self._parse_quote(raw))
+            if (idx // batch_size + 1) % 10 == 0:
+                self.logger.debug(f"已处理 {idx // batch_size + 1} 批...")
+            if idx + batch_size < len(codes):
+                time.sleep(0.2)
+
+        self.logger.info(f"获取到 {len(all_raw)} 只有效股票")
+        if not all_raw:
+            raise ConnectionError("腾讯行情未返回数据")
+
+        result = []
+        for stock in all_raw:
+            change = stock.get("change_pct", 0)
+            name = stock.get("name", "")
+            code = stock.get("code", "")
+            if change < Config.AUCTION涨幅_MIN or change > Config.AUCTION涨幅_MAX:
+                continue
+            if "ST" in name or "退" in name:
+                continue
+            if code.startswith("4") or code.startswith("8") or code.startswith("9"):
+                continue
+            result.append(self._build_stock_data(stock))
+
+        self.logger.info(f"涨幅 {Config.AUCTION涨幅_MIN}%~{Config.AUCTION涨幅_MAX}%: {len(result)} 只")
+        return result
+
+
+class LiveDataProvider(DataProvider):
+    """
+    实盘数据提供器 — 双数据源自动切换
+    优先东方财富（数据更全），失败自动切腾讯（云服务器兼容）
+    可通过 --source eastmoney|tencent|auto 手动指定
+    """
+
+    def __init__(self, source: str = "auto"):
+        self.source = source
+        self.logger = logging.getLogger("LiveData")
+
+    def fetch_all(self) -> list[dict]:
+        providers = []
+        if self.source == "eastmoney":
+            providers = [("东方财富", EastMoneyProvider)]
+        elif self.source == "tencent":
+            providers = [("腾讯行情", TencentProvider)]
+        else:  # auto
+            providers = [
+                ("东方财富", EastMoneyProvider),
+                ("腾讯行情", TencentProvider),
+            ]
+
+        for name, cls in providers:
+            try:
+                self.logger.info(f"📡 数据源: {name}")
+                data = cls().fetch_all()
+                if data:
+                    self.logger.info(f"✅ {name} 成功，获取 {len(data)} 只标的")
+                    return data
+                self.logger.warning(f"⚠️ {name} 返回空数据")
+            except Exception as e:
+                self.logger.warning(f"⚠️ {name} 失败: {e}")
+
+        self.logger.warning("所有数据源均失败，回落到演示模式")
+        return DemoDataProvider().fetch_all()
 
 
 # ============================================================
@@ -884,6 +1133,9 @@ def main():
                         help="详细日志输出")
     parser.add_argument("--detail", action="store_true",
                         help="显示每只标的的信号详情")
+    parser.add_argument("--source", choices=["auto", "eastmoney", "tencent"],
+                        default="auto",
+                        help="数据源: auto(自动切换) | eastmoney | tencent")
     args = parser.parse_args()
 
     setup_logging(args.verbose)
@@ -897,12 +1149,7 @@ def main():
         stock_data = DemoDataProvider().fetch_all()
         logging.info(f"演示模式: 加载了 {len(stock_data)} 只模拟股票")
     else:
-        try:
-            stock_data = LiveDataProvider().fetch_all()
-        except NotImplementedError as e:
-            print(f"⚠️  {e}")
-            print("💡 提示: 使用 --demo 运行演示，或 --json <file> 加载数据")
-            return
+        stock_data = LiveDataProvider(source=args.source).fetch_all()
 
     # 执行策略
     selector = AuctionStockSelector()
