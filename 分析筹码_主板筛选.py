@@ -1050,7 +1050,7 @@ def _fetch_em_stock_details(codes: list[str]) -> dict:
         for attempt in range(3):
             try:
                 r = requests.get(
-                    "https://push2.eastmoney.com/api/qt/ulist.np/get",
+                    "https://push2test.eastmoney.com/api/qt/ulist.np/get",
                     params={
                         "cb": "jQuery", "fltt": "2", "invt": "2",
                         "ut": "bd1d9ddb04089700cf9c27f6f7426281",
