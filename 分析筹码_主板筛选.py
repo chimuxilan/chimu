@@ -1042,10 +1042,11 @@ def _fetch_em_stock_details(codes: list[str]) -> dict:
         market = "1" if code.startswith(("6", "9")) else "0"
         secids.append(f"{market}.{code}")
 
-    batch_size = 50
+    batch_size = 30
     for i in range(0, len(secids), batch_size):
         batch = secids[i:i + batch_size]
         resp_text = None
+        last_err = ""
         for attempt in range(3):
             try:
                 r = requests.get(
@@ -1061,10 +1062,13 @@ def _fetch_em_stock_details(codes: list[str]) -> dict:
                 if r.status_code == 200 and r.text:
                     resp_text = r.text
                     break
-            except Exception:
-                import time; time.sleep(0.5 * (attempt + 1))
+                else:
+                    last_err = f"HTTP {r.status_code}"
+            except Exception as e:
+                last_err = str(e)
+            import time; time.sleep(1.5 * (attempt + 1))
         if not resp_text:
-            print(f"  ⚠ 东方财富批量接口批次{i // batch_size + 1}失败(重试3次)")
+            print(f"  ⚠ 东方财富批量接口批次{i // batch_size + 1}失败(重试3次): {last_err}")
             continue
         try:
             m = re.search(r"jQuery\((.+)\);", resp_text)
@@ -1227,38 +1231,51 @@ def _fetch_sectors_with_stocks() -> dict:
     sectors = {}
 
     # 第一步：获取行业板块列表（涨停数倒序，取前50个板块）
-    try:
-        r = requests.get(
-            "https://push2test.eastmoney.com/api/qt/clist/get",
-            params={
-                "cb": "jQuery", "pn": "1", "pz": "50", "po": "1", "np": "1",
-                "ut": "bd1d9ddb04089700cf9c27f6f7426281",
-                "fltt": "2", "invt": "2", "fid": "f3",
-                "fs": "m:90+t:2+f:!50",
-                "fields": "f2,f3,f12,f14,f104,f105",
-            },
-            headers=EM_HEADERS, timeout=15,
-        )
-        m = re.search(r"jQuery\((.+)\);", r.text)
-        if m:
-            data = json.loads(m.group(1))
-            items = data.get("data", {}).get("diff", [])
-            for item in items:
-                scode = item.get("f12", "")
-                sname = item.get("f14", "")
-                limit_up = item.get("f104", 0)
-                limit_down = item.get("f105", 0)
-                change_pct = item.get("f3", 0)
-                if scode and sname:
-                    sectors[sname] = {
-                        "code": scode,
-                        "stocks": [],
-                        "limit_up": limit_up,
-                        "limit_down": limit_down,
-                        "change_pct": change_pct,
-                    }
-    except Exception as e:
-        print(f"  ⚠ 东方财富板块列表获取失败: {e}")
+    resp_text = None
+    for attempt in range(3):
+        try:
+            r = requests.get(
+                "https://push2test.eastmoney.com/api/qt/clist/get",
+                params={
+                    "cb": "jQuery", "pn": "1", "pz": "50", "po": "1", "np": "1",
+                    "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+                    "fltt": "2", "invt": "2", "fid": "f3",
+                    "fs": "m:90+t:2+f:!50",
+                    "fields": "f2,f3,f12,f14,f104,f105",
+                },
+                headers=EM_HEADERS, timeout=15,
+            )
+            if r.status_code == 200 and r.text:
+                resp_text = r.text
+                break
+        except Exception:
+            pass
+        import time; time.sleep(1.0 * (attempt + 1))
+    if resp_text:
+        try:
+            m = re.search(r"jQuery\((.+)\);", resp_text)
+            if m:
+                data = json.loads(m.group(1))
+                items = data.get("data", {}).get("diff", [])
+                for item in items:
+                    scode = item.get("f12", "")
+                    sname = item.get("f14", "")
+                    limit_up = item.get("f104", 0)
+                    limit_down = item.get("f105", 0)
+                    change_pct = item.get("f3", 0)
+                    if scode and sname:
+                        sectors[sname] = {
+                            "code": scode,
+                            "stocks": [],
+                            "limit_up": limit_up,
+                            "limit_down": limit_down,
+                            "change_pct": change_pct,
+                        }
+        except Exception as e:
+            print(f"  ⚠ 东方财富板块列表解析失败: {e}")
+            return sectors
+    else:
+        print(f"  ⚠ 东方财富板块列表获取失败(重试3次)")
         return sectors
 
     if not sectors:
@@ -1266,38 +1283,41 @@ def _fetch_sectors_with_stocks() -> dict:
 
     # 第二步：并发获取每个板块的成分股
     def _fetch_sector_stocks(sname, scode):
-        try:
-            r = requests.get(
-                "https://push2test.eastmoney.com/api/qt/clist/get",
-                params={
-                    "cb": "jQuery", "pn": "1", "pz": "1000", "po": "1", "np": "1",
-                    "ut": "bd1d9ddb04089700cf9c27f6f7426281",
-                    "fltt": "2", "invt": "2", "fid": "f3",
-                    "fs": f"b:{scode}",
-                    "fields": "f2,f3,f12,f14",
-                },
-                headers=EM_HEADERS, timeout=15,
-            )
-            m = re.search(r"jQuery\((.+)\);", r.text)
-            if m:
-                data = json.loads(m.group(1))
-                items = data.get("data", {}).get("diff", [])
-                stocks = []
-                for it in items:
-                    code = str(it.get("f12", ""))
-                    name = it.get("f14", "")
-                    price = it.get("f2", 0)
-                    change_pct = it.get("f3", 0)
-                    if code and len(code) == 6 and code[0].isdigit():
-                        stocks.append({
-                            "code": code, "name": name,
-                            "symbol": ("sh" if code.startswith(("6", "9")) else "sz") + code,
-                            "trade": str(price), "settlement": "0",
-                            "changepercent": str(change_pct),
-                        })
-                return sname, stocks
-        except Exception:
-            pass
+        for attempt in range(3):
+            try:
+                r = requests.get(
+                    "https://push2test.eastmoney.com/api/qt/clist/get",
+                    params={
+                        "cb": "jQuery", "pn": "1", "pz": "1000", "po": "1", "np": "1",
+                        "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+                        "fltt": "2", "invt": "2", "fid": "f3",
+                        "fs": f"b:{scode}",
+                        "fields": "f2,f3,f12,f14",
+                    },
+                    headers=EM_HEADERS, timeout=15,
+                )
+                if r.status_code == 200 and r.text:
+                    m = re.search(r"jQuery\((.+)\);", r.text)
+                    if m:
+                        data = json.loads(m.group(1))
+                        items = data.get("data", {}).get("diff", [])
+                        stocks = []
+                        for it in items:
+                            code = str(it.get("f12", ""))
+                            name = it.get("f14", "")
+                            price = it.get("f2", 0)
+                            change_pct = it.get("f3", 0)
+                            if code and len(code) == 6 and code[0].isdigit():
+                                stocks.append({
+                                    "code": code, "name": name,
+                                    "symbol": ("sh" if code.startswith(("6", "9")) else "sz") + code,
+                                    "trade": str(price), "settlement": "0",
+                                    "changepercent": str(change_pct),
+                                })
+                        return sname, stocks
+            except Exception:
+                pass
+            import time; time.sleep(0.8 * (attempt + 1))
         return sname, []
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
