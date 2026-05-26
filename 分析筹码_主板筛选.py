@@ -381,7 +381,7 @@ def fetch_hist(code: str, days: int = 10) -> list[dict]:
         try:
             secid = f"1.{code}" if code.startswith(("6", "9")) else f"0.{code}"
             r = EM_SESSION.get(
-                "https://push2his.eastmoney.com/api/qt/stock/kline/get",
+                "https://push2delay.eastmoney.com/api/qt/stock/kline/get",
                 params={
                     "secid": secid,
                     "fields1": "f1,f2,f3,f4,f5,f6,f7,f8",
@@ -472,7 +472,7 @@ def _fetch_5min_opening_amount(codes: list[str]) -> dict:
             for attempt in range(2):
                 try:
                     r = EM_SESSION.get(
-                        "https://push2his.eastmoney.com/api/qt/stock/kline/get",
+                        "https://push2delay.eastmoney.com/api/qt/stock/kline/get",
                         params={
                             "secid": secid,
                             "fields1": "f1,f2,f3,f4,f5,f6,f7,f8",
@@ -1239,7 +1239,7 @@ def _fetch_em_stock_details(codes: list[str]) -> dict:
         for attempt in range(5):
             try:
                 r = EM_SESSION.get(
-                    "https://push2.eastmoney.com/api/qt/ulist.np/get",
+                    "https://push2delay.eastmoney.com/api/qt/ulist.np/get",
                     params={
                         "cb": "jQuery", "fltt": "2", "invt": "2",
                         "ut": "bd1d9ddb04089700cf9c27f6f7426281",
@@ -1804,7 +1804,7 @@ def _fetch_sectors_with_stocks() -> dict:
     for attempt in range(5):
         try:
             r = EM_SESSION.get(
-                "https://push2.eastmoney.com/api/qt/clist/get",
+                "https://push2delay.eastmoney.com/api/qt/clist/get",
                 params={
                     "cb": "jQuery", "pn": "1", "pz": "50", "po": "1", "np": "1",
                     "ut": "bd1d9ddb04089700cf9c27f6f7426281",
@@ -1859,7 +1859,7 @@ def _fetch_sectors_with_stocks() -> dict:
         for attempt in range(5):
             try:
                 r = EM_SESSION.get(
-                    "https://push2.eastmoney.com/api/qt/clist/get",
+                    "https://push2delay.eastmoney.com/api/qt/clist/get",
                     params={
                         "cb": "jQuery", "pn": "1", "pz": "1000", "po": "1", "np": "1",
                         "ut": "bd1d9ddb04089700cf9c27f6f7426281",
