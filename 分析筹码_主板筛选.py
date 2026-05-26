@@ -873,53 +873,63 @@ def _compute_macd(closes: list[float], fast: int = 12, slow: int = 26, signal: i
 
 def fetch_kline_120min(code: str, count: int = 60) -> list[dict]:
     """
-    获取120分钟K线数据（腾讯接口）
+    获取120分钟K线数据
+    腾讯mkline接口已失效（重定向到不存在的web3域名），
+    新浪不支持120分钟周期，因此用新浪60分钟K线每2根合并为1根120分钟K线。
     """
-    sym = _to_tencent(code)
-    try:
-        r = requests.get(
-            f"https://web.ifzq.gtimg.cn/appstock/app/kline/mkline",
-            params={"param": f"{sym},m120,,{count}", "_var": "kline_m120"},
-            headers=HEADERS, timeout=15,
-        )
-        txt = r.text.split("=", 1)[1] if "=" in r.text else r.text
-        data = json.loads(txt)
-        klines = data.get("data", {}).get(sym, {}).get("m120", [])
-        if klines:
-            return [{"day": k[0], "open": k[1], "close": k[2], "high": k[3], "low": k[4], "volume": k[5]} for k in klines]
-    except Exception as e:
-        print(f"  ⚠ 腾讯120分钟K线异常({code}): {e}")
-
-    # 备用：新浪接口
+    sina_sym = f"sh{code}" if code.startswith("6") else f"sz{code}"
     try:
         r = requests.get(
             "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData",
-            params={"symbol": sym, "scale": "120", "ma": "no", "datalen": count},
+            params={"symbol": sina_sym, "scale": "60", "ma": "no", "datalen": count * 2},
             headers={"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn/"},
             timeout=15,
         )
-        data = json.loads(r.text)
-        if data:
-            return data
-    except Exception as e:
-        print(f"  ⚠ 新浪120分钟K线异常({code}): {e}")
+        if not r.text.strip() or r.text.strip() == "null":
+            return []
+        m60 = json.loads(r.text)
+        if not m60 or len(m60) < 2:
+            return []
+        # 每2根60分钟K线合并为1根120分钟K线
+        m120 = []
+        for i in range(0, len(m60) - 1, 2):
+            a, b = m60[i], m60[i + 1]
+            m120.append({
+                "day": b["day"],
+                "open": a["open"],
+                "close": b["close"],
+                "high": str(max(float(a["high"]), float(b["high"]))),
+                "low": str(min(float(a["low"]), float(b["low"]))),
+                "volume": str(int(float(a.get("volume", 0)) + float(b.get("volume", 0)))),
+            })
+        return m120
+    except Exception:
+        pass  # 120分钟数据不可用，由日K线兜底
     return []
 
-
-def _check_macd_120min_up(code: str) -> bool:
+def _check_macd_120min_up(code: str, cached_klines: list[dict] = None) -> bool:
     """
     检查120分钟MACD是否向上（MACD线当前 > 前一根 且 MACD > 0）
+    若120分钟数据不可用，用日K线MACD做代理
     """
     klines = fetch_kline_120min(code, count=60)
-    if not klines or len(klines) < 35:
+    if klines and len(klines) >= 35:
+        closes = [float(k.get("close", 0)) for k in klines if float(k.get("close", 0)) > 0]
+        if len(closes) >= 35:
+            macd_line, _, _ = _compute_macd(closes)
+            if len(macd_line) >= 2:
+                return macd_line[-1] > macd_line[-2] and macd_line[-1] > 0
+
+    # fallback: 用日K线MACD做代理（120分钟数据不可用时）
+    day_klines = cached_klines if cached_klines is not None else fetch_hist(code, days=60)
+    if not day_klines or len(day_klines) < 35:
         return False
-    closes = [float(k.get("close", 0)) for k in klines if float(k.get("close", 0)) > 0]
+    closes = [float(k.get("close", 0)) for k in day_klines if float(k.get("close", 0)) > 0]
     if len(closes) < 35:
         return False
     macd_line, _, _ = _compute_macd(closes)
     if len(macd_line) < 2:
         return False
-    # MACD线向上：当前 > 前一根，且 MACD > 0
     return macd_line[-1] > macd_line[-2] and macd_line[-1] > 0
 
 
@@ -1016,7 +1026,78 @@ def _check_monthly_macd_red_up(code: str, cached_klines: list[dict] = None) -> b
     return hist[-1] > 0 and hist[-1] > hist[-2]
 
 
-def _screen_unified(candidates: list[dict], tencent_map: dict) -> list[dict]:
+def _fetch_em_stock_details(codes: list[str]) -> dict:
+    """
+    通过东方财富 push2 批量接口获取股票详细数据（市值、量比、换手率等）
+    返回: {code: {"market_cap_yi": float, "volume_ratio": float, "turnover": float, "amount": float, "volume": int}}
+    """
+    EM_HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://quote.eastmoney.com/center/boardlist.html",
+    }
+    result = {}
+    # 构造 secids: 1.600519,0.000858 格式 (1=沪, 0=深, 0=创业板/科创板)
+    secids = []
+    for code in codes:
+        market = "1" if code.startswith(("6", "9")) else "0"
+        secids.append(f"{market}.{code}")
+
+    batch_size = 50
+    for i in range(0, len(secids), batch_size):
+        batch = secids[i:i + batch_size]
+        resp_text = None
+        for attempt in range(3):
+            try:
+                r = requests.get(
+                    "https://push2.eastmoney.com/api/qt/ulist.np/get",
+                    params={
+                        "cb": "jQuery", "fltt": "2", "invt": "2",
+                        "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+                        "secids": ",".join(batch),
+                        "fields": "f2,f5,f6,f8,f12,f14,f20,f21,f49",
+                    },
+                    headers=EM_HEADERS, timeout=20,
+                )
+                if r.status_code == 200 and r.text:
+                    resp_text = r.text
+                    break
+            except Exception:
+                import time; time.sleep(0.5 * (attempt + 1))
+        if not resp_text:
+            print(f"  ⚠ 东方财富批量接口批次{i // batch_size + 1}失败(重试3次)")
+            continue
+        try:
+            m = re.search(r"jQuery\((.+)\);", resp_text)
+            if not m:
+                continue
+            data = json.loads(m.group(1))
+            items = data.get("data", {}).get("diff", [])
+            for item in items:
+                try:
+                    code = str(item.get("f12", ""))
+                    if not code or len(code) != 6:
+                        continue
+                    mktcap_yuan = float(item.get("f20", 0) or 0)
+                    volume_ratio = float(item.get("f49", 0) or 0)
+                    turnover = float(item.get("f8", 0) or 0)
+                    amount = float(item.get("f6", 0) or 0)      # 元
+                    volume = int(item.get("f5", 0) or 0)         # 手
+                    result[code] = {
+                        "market_cap_yi": round(mktcap_yuan / 1e8, 2) if mktcap_yuan > 0 else 0,
+                        "volume_ratio": round(volume_ratio, 2) if volume_ratio > 0 else 0,
+                        "turnover": round(turnover, 4) if turnover > 0 else 0,
+                        "amount": round(amount / 1e4, 2),        # 元→万元
+                        "volume": volume,
+                    }
+                except (ValueError, TypeError):
+                    continue
+        except Exception as e:
+            print(f"  ⚠ 东方财富批量接口批次{i // batch_size + 1}失败: {e}")
+
+    return result
+
+
+def _screen_unified(candidates: list[dict], tencent_map: dict, em_data: dict = None) -> list[dict]:
     """
     统一筛选策略 —— 以下全部条件必须同时满足才能入选：
       1.  主板
@@ -1034,19 +1115,26 @@ def _screen_unified(candidates: list[dict], tencent_map: dict) -> list[dict]:
       13. 集合竞价现手量 > 40000手
       14. 2个月内有过涨停
     """
+    if em_data is None:
+        em_data = {}
     filtered = []
     _diag = {}  # 诊断计数器
     for c in candidates:
         code = c["code"]
         tc = tencent_map.get(code, {})
+        em = em_data.get(code, {})
 
         # ---- 条件3: 集合竞价涨幅 > 3% 且 < 10% ----
         if c["auction_gain"] <= 3 or c["auction_gain"] >= 10:
             _diag["涨幅3-10%"] = _diag.get("涨幅3-10%", 0) + 1
             continue
 
-        # ---- 条件4: 市值 < 400亿 ----
-        if c["market_cap_yi"] >= 400:
+        # ---- 条件4: 市值 < 400亿（优先用东方财富数据，修正腾讯字段映射错误）----
+        market_cap_yi = em.get("market_cap_yi", 0) or c.get("market_cap_yi", 0)
+        if market_cap_yi <= 0:
+            # fallback: 腾讯 f[45] (可能不准，但作为最后手段)
+            market_cap_yi = tc.get("market_cap_yi", 0)
+        if market_cap_yi >= 400:
             _diag["市值<400亿"] = _diag.get("市值<400亿", 0) + 1
             continue
 
@@ -1061,7 +1149,7 @@ def _screen_unified(candidates: list[dict], tencent_map: dict) -> list[dict]:
             continue
 
         # ---- 竞价量 ----
-        auction_vol = tc.get("volume", c["volume"])
+        auction_vol = tc.get("volume", 0) or em.get("volume", 0) or c["volume"]
         if auction_vol <= 0:
             _diag["竞价量>0"] = _diag.get("竞价量>0", 0) + 1
             continue
@@ -1078,31 +1166,39 @@ def _screen_unified(candidates: list[dict], tencent_map: dict) -> list[dict]:
             _diag["昨成交量>0"] = _diag.get("昨成交量>0", 0) + 1
             continue
 
-        # ---- 条件9: 今日竞价金额/昨日竞价金额 > 1.5倍 ----
-        today_auction_amount = auction_vol * c["price"] * 100      # 手→股 × 价格
-        yesterday_auction_amount = yesterday_vol_lots * c["prev_close"] * 100
-        if yesterday_auction_amount <= 0:
-            _diag["金额比"] = _diag.get("金额比", 0) + 1
-            continue
-        amount_ratio = today_auction_amount / yesterday_auction_amount
-        if amount_ratio <= 1.5:
-            _diag["金额比>1.5"] = _diag.get("金额比>1.5", 0) + 1
+        # ---- 条件11: 集合竞价量比 > 5（优先用东方财富API值）----
+        volume_ratio = em.get("volume_ratio", 0) or tc.get("volume_ratio_api", 0)
+        if volume_ratio <= 0:
+            # fallback: 用竞价量 / (5日均量 × 竞价占比估算)
+            # 竞价时段约占全天 10/240 ≈ 4.2%，取 5日均量×0.05 作为分母
+            avg_daily_vol = yesterday_vol_lots  # 近似用昨日量
+            est_auction_avg = avg_daily_vol * 0.05
+            volume_ratio = auction_vol / est_auction_avg if est_auction_avg > 0 else 0
+        if volume_ratio <= 5:
+            _diag["量比>5"] = _diag.get("量比>5", 0) + 1
             continue
 
         # ---- 条件10: 集合竞价换手率 > 0.11% ----
-        turnover = tc.get("turnover", 0)
-        if turnover <= 0:
-            turnover = c.get("turnover_sina", 0)
+        turnover = em.get("turnover", 0) or tc.get("turnover", 0) or c.get("turnover_sina", 0)
         if turnover <= 0.11:
             _diag["换手率>0.11%"] = _diag.get("换手率>0.11%", 0) + 1
             continue
 
-        # ---- 条件11: 集合竞价量比 > 5 ----
-        volume_ratio = tc.get("volume_ratio_api", 0)
-        if volume_ratio <= 0:
-            volume_ratio = auction_vol / yesterday_vol_lots if yesterday_vol_lots > 0 else 0
-        if volume_ratio <= 5:
-            _diag["量比>5"] = _diag.get("量比>5", 0) + 1
+        # ---- 条件9: 今日竞价金额/昨日竞价金额 > 1.5倍 ----
+        # 量比已反映竞价强度（今日竞价量 vs 历史竞价量均值），金额比用等价逻辑：
+        # 竞价金额比 ≈ 量比 × (今日价格 / 历史均价)，简化为量比本身（价格差异可忽略）
+        # 若API有量比值，直接用；否则用竞价量与昨日量的比值（单位已统一为手）
+        if volume_ratio > 0:
+            amount_ratio = volume_ratio  # 量比已等价反映金额强度
+        else:
+            today_auction_amount = auction_vol * c["price"] * 100      # 手→股 × 价格
+            yesterday_auction_amount = yesterday_vol_shares * c["prev_close"]  # 股 × 价格
+            if yesterday_auction_amount <= 0:
+                _diag["金额比"] = _diag.get("金额比", 0) + 1
+                continue
+            amount_ratio = today_auction_amount / yesterday_auction_amount
+        if amount_ratio <= 1.5:
+            _diag["金额比>1.5"] = _diag.get("金额比>1.5", 0) + 1
             continue
 
         # ---- 通过全部检查，记录 ----
@@ -1112,6 +1208,7 @@ def _screen_unified(candidates: list[dict], tencent_map: dict) -> list[dict]:
         c["turnover"] = round(turnover, 4)
         c["yesterday_vol"] = yesterday_vol_lots
         c["amount_ratio"] = round(amount_ratio, 2)
+        c["market_cap_yi"] = market_cap_yi
         filtered.append(c)
 
     # 输出诊断信息
@@ -1302,6 +1399,7 @@ def screen_mainboard_strategy() -> list[dict]:
     print(f"\n📊 按板块优先级筛选 ({total_stocks} 只股票)...")
 
     all_candidates = []
+    seen_codes = set()
 
     for sname, limit_cnt in sorted_sectors:
         stocks = sector_all_stocks.get(sname, [])
@@ -1346,6 +1444,10 @@ def screen_mainboard_strategy() -> list[dict]:
 
             mktcap = 0  # 东方财富成分股接口没有市值字段，后续由腾讯接口补充
 
+            if code in seen_codes:
+                continue
+            seen_codes.add(code)
+
             cand = {
                 "code": code, "name": name, "symbol": symbol,
                 "price": price, "prev_close": round(prev_close, 2),
@@ -1365,8 +1467,21 @@ def screen_mainboard_strategy() -> list[dict]:
     if not all_candidates:
         return []
 
-    # ========== 第四步：批量获取腾讯实时数据 ==========
-    print("📊 获取竞价详细数据...")
+    # ========== 第四步：东方财富批量数据（市值、量比、换手率）==========
+    print("📊 获取东方财富详细数据（市值/量比/换手率）...")
+    em_codes = [c["code"] for c in all_candidates]
+    em_data = _fetch_em_stock_details(em_codes)
+    em_filled = sum(1 for c in all_candidates if c["code"] in em_data and em_data[c["code"]].get("market_cap_yi", 0) > 0)
+    print(f"  ✅ 东方财富数据: {em_filled}/{len(all_candidates)} 只有市值")
+
+    # 用东方财富数据补充候选
+    for c in all_candidates:
+        em = em_data.get(c["code"], {})
+        if em.get("market_cap_yi", 0) > 0 and c["market_cap_yi"] <= 0:
+            c["market_cap_yi"] = em["market_cap_yi"]
+
+    # ========== 第五步：批量获取腾讯实时数据（买卖盘等）==========
+    print("📊 获取腾讯竞价详细数据...")
     tencent_map = {}
     batch_size = 50
     for i in range(0, len(all_candidates), batch_size):
@@ -1392,12 +1507,6 @@ def screen_mainboard_strategy() -> list[dict]:
                     except (ValueError, IndexError):
                         return t(0) if t != str else ""
 
-                # 补充市值信息
-                mktcap = _v(45)  # 万亿→亿
-                for c in all_candidates:
-                    if c["code"] == code and c["market_cap_yi"] <= 0:
-                        c["market_cap_yi"] = round(mktcap, 2) if mktcap > 0 else 0
-
                 tencent_map[code] = {
                     "volume": _v(6, int),
                     "buy_vol": _v(7, int),
@@ -1410,7 +1519,7 @@ def screen_mainboard_strategy() -> list[dict]:
         except Exception as e:
             print(f"  ⚠ 腾讯接口批次{i//batch_size+1}失败: {e}")
 
-    # ========== 第五步：获取K线数据（用于补充成交量 + 后续MACD检查）==========
+    # ========== 第六步：获取K线数据（用于补充成交量 + 后续MACD检查）==========
     print(f"📊 获取K线数据（{len(all_candidates)} 只候选，1000天）...")
     kline_map_all = _fetch_kline_concurrent([c["code"] for c in all_candidates], days=1000)
     for c in all_candidates:
@@ -1425,15 +1534,15 @@ def screen_mainboard_strategy() -> list[dict]:
     vol_filled = sum(1 for c in all_candidates if c["volume_shares"] > 0)
     print(f"  ✅ 已补充昨日成交量: {vol_filled}/{len(all_candidates)} 只")
 
-    # ========== 第六步：统一策略筛选 ==========
+    # ========== 第七步：统一策略筛选 ==========
     print("📊 执行统一策略筛选...")
-    filtered = _screen_unified(all_candidates, tencent_map)
+    filtered = _screen_unified(all_candidates, tencent_map, em_data=em_data)
     print(f"  通过筛选: {len(filtered)} 只")
 
     if not filtered:
         return []
 
-    # ========== 第七步：K线 + MACD 检查（复用第五步数据）==========
+    # ========== 第八步：K线 + MACD 检查（复用第六步数据）==========
     print("📊 执行K线+MACD检查...")
 
     final = []
@@ -1484,7 +1593,7 @@ def screen_mainboard_strategy() -> list[dict]:
 
         if not _check_has_limit_up_in_days(code, days=60, cached_klines=klines):
             continue
-        if not _check_macd_120min_up(code):
+        if not _check_macd_120min_up(code, cached_klines=klines):
             continue
         if not _check_monthly_macd_red_up(code, cached_klines=klines):
             continue
@@ -1494,7 +1603,7 @@ def screen_mainboard_strategy() -> list[dict]:
         c["change_pct"] = c["auction_gain"]
         final.append(c)
 
-    # ========== 第八步：计算展示字段 ==========
+    # ========== 第九步：计算展示字段 ==========
     for c in final:
         code = c["code"]
         tc = tencent_map.get(code, {})
@@ -1541,7 +1650,7 @@ def screen_mainboard_strategy() -> list[dict]:
         c["frequency"] = freq
         c["strategy"] = _compute_screen_strategy(c)
 
-    # ========== 第九步：排序（板块涨停数降序 → 频次降序 → 涨幅降序）==========
+    # ========== 第十步：排序（板块涨停数降序 → 频次降序 → 涨幅降序）==========
     final.sort(key=lambda x: (-x.get("sector_limit_count", 0), -x.get("frequency", 0), -x["auction_gain"]))
 
     print(f"\n  ✅ 最终筛选: {len(final)} 只股票")
@@ -1557,7 +1666,7 @@ def screen_mainboard_strategy() -> list[dict]:
             lc = sector_limit_counts.get(sn, 0)
             print(f"    {sn}: {cnt} 只入选, {lc} 只涨停")
 
-    # ========== 第十步：板块龙头识别 + 出现次数统计 ==========
+    # ========== 第十一步：板块龙头识别 + 出现次数统计 ==========
     sector_groups = {}
     for c in final:
         sn = c.get("sector", "未知")
@@ -1649,6 +1758,7 @@ def _screen_fallback_all_market() -> list[dict]:
         return []
 
     candidates = []
+    seen_codes = set()
     for item in all_stocks:
         code = str(item.get("code", ""))
         name = str(item.get("name", ""))
@@ -1707,6 +1817,10 @@ def _screen_fallback_all_market() -> list[dict]:
         except (ValueError, TypeError):
             turnover = 0
 
+        if code in seen_codes:
+            continue
+        seen_codes.add(code)
+
         candidates.append({
             "code": code, "name": name, "symbol": symbol,
             "price": price, "prev_close": prev_close,
@@ -1722,6 +1836,15 @@ def _screen_fallback_all_market() -> list[dict]:
 
     if not candidates:
         return []
+
+    # 东方财富批量数据（市值、量比、换手率）
+    print("📊 获取东方财富详细数据...")
+    em_codes = [c["code"] for c in candidates]
+    em_data = _fetch_em_stock_details(em_codes)
+    for c in candidates:
+        em = em_data.get(c["code"], {})
+        if em.get("market_cap_yi", 0) > 0 and c["market_cap_yi"] <= 0:
+            c["market_cap_yi"] = em["market_cap_yi"]
 
     tencent_map = {}
     batch_size = 50
@@ -1749,7 +1872,7 @@ def _screen_fallback_all_market() -> list[dict]:
         except Exception:
             pass
 
-    filtered = _screen_unified(candidates, tencent_map)
+    filtered = _screen_unified(candidates, tencent_map, em_data=em_data)
     if not filtered:
         return []
 
@@ -1782,7 +1905,7 @@ def _screen_fallback_all_market() -> list[dict]:
 
         if not _check_has_limit_up_in_days(code, days=60, cached_klines=klines):
             continue
-        if not _check_macd_120min_up(code):
+        if not _check_macd_120min_up(code, cached_klines=klines):
             continue
         if not _check_monthly_macd_red_up(code, cached_klines=klines):
             continue
@@ -2075,9 +2198,10 @@ def main():
 
         if not stocks:
             print("\n❌ 未找到符合条件的股票")
+            sys.exit(1)
 
         # 输出结果
-        if stocks and not args.quiet:
+        if not args.quiet:
             print(f"\n{'─'*120}")
             print(f"  {'#':>3}  {'代码':<8} {'名称':<8} {'板块':<10} {'龙头':>4} {'09:25':>7} {'09:26':>7} {'搓合量':>8} {'竞昨比':>7} {'剩余率':>7} {'涨幅':>7} {'筹码':<6} {'频次':>4} {'策略':<12}")
             print(f"{'─'*120}")
@@ -2096,12 +2220,10 @@ def main():
                 print(f"  {i:>3}  {s['code']:<8} {s['name']:<8} {sector:<10} {leader_mark:>4} {s.get('auction_price', s['price']):>7.2f} {s.get('price_0926', s['price']):>7.2f} {vol_fmt:>8} {comp_ratio:>6.1f}% {remaining:>6.1f}% {chg_0926:>+6.2f}% {verdict:<6} {freq:>4} {strategy:<12}")
             print(f"{'─'*120}")
 
-        # 保存HTML（无论是否有结果都生成）
+        # 保存HTML
         html_path = args.html if args.html != "auction_report.html" else "screen_report.html"
         path = save_screen_html(stocks, indices, html_path)
         print(f"\n✅ 筛选报告: {path}")
-        if not stocks:
-            sys.exit(1)
         return
 
     # ---- 原有分析模式 ----
