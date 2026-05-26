@@ -786,8 +786,8 @@ def fetch_all_ashare_codes() -> list[str]:
 
 
 def _is_mainboard_a(code: str) -> bool:
-    """判断是否为沪深主板A股（排除北交所等）"""
-    return code.startswith(("60", "00", "30", "68"))
+    """判断是否为沪深主板A股（排除创业板、科创板、北交所等）"""
+    return code.startswith(("60", "00"))
 
 
 def _fetch_kline_concurrent(codes: list[str], days: int = 5) -> dict:
@@ -1102,23 +1102,378 @@ def _fetch_em_stock_details(codes: list[str]) -> dict:
     return result
 
 
-def _screen_unified(candidates: list[dict], tencent_map: dict, em_data: dict = None) -> list[dict]:
+# ============================================================
+# 四大策略池
+# ============================================================
+# 每个策略池独立负责一类条件，可单独调用也可组合使用
+# Pool 1 (基础池) → 前置硬性门槛，所有策略共用
+# Pool 2 (量价池) → 集合竞价量价信号
+# Pool 3 (趋势池) → K线趋势与涨停历史
+# Pool 4 (技术池) → 多周期MACD共振
+
+def pool_base(code: str, name: str, price: float, market_cap_yi: float,
+              avg_price: float = 0, yesterday_amount: float = 0,
+              last_limit_amount: float = 0, amount_5min: float = 0) -> tuple[bool, str]:
     """
-    统一筛选策略 —— 以下全部条件必须同时满足才能入选：
-      1.  主板
+    策略池1 · 基础池（前置硬性门槛）
+    ─────────────────────────────────
+    条件（非K线部分）:
+      1.  主板（沪主板60 / 深主板00，排除创业板/科创板/北交所）
+      2.  去除ST
+      3.  流通市值 > 35.99亿
+      4.  流通市值 < 999.99亿
+      5.  股价 < 60元
+      6.  当前股价在均价线之上（price > VWAP）
+      7.  昨日成交金额 > 上次涨停日成交金额（需外部传入）
+      8.  开盘5分钟成交金额 > 3000万（需外部传入）
+    所有策略的前置条件，不通过则直接淘汰
+    """
+    # 1. 主板
+    if not code.startswith(("60", "00")):
+        return False, "非主板"
+    # 2. 去除ST
+    if "ST" in name.upper():
+        return False, "ST"
+    # 3-4. 流通市值 35.99亿 ~ 999.99亿
+    if market_cap_yi <= 35.99:
+        return False, "流通市值≤35.99亿"
+    if market_cap_yi >= 999.99:
+        return False, "流通市值≥999.99亿"
+    # 5. 股价 < 60
+    if price >= 60:
+        return False, "股价≥60"
+    # 6. 当前股价在均价线之上
+    if avg_price > 0 and price <= avg_price:
+        return False, "股价低于均价线"
+    # 7. 昨日成交金额 > 上次涨停日成交金额
+    if last_limit_amount > 0 and yesterday_amount > 0:
+        if yesterday_amount <= last_limit_amount:
+            return False, "昨额≤涨停额"
+    # 8. 开盘5分钟成交金额 > 3000万
+    if amount_5min > 0 and amount_5min <= 30000000:
+        return False, "5分钟额≤3000万"
+    return True, ""
+
+
+def pool_base_post_kline(code: str, price: float, klines: list[dict],
+                         prev_close: float, yesterday_amount: float) -> tuple[bool, str]:
+    """
+    策略池1 · 基础池（K线依赖部分）
+    ─────────────────────────────────
+    条件（需K线数据）:
+      9.  昨日成交金额 > 上次涨停日成交金额
+      10. 7天涨幅 < 34.99%
+      11. 去除昨日连板（前天也涨停则排除）
+      12. 最低价 < 昨日收盘价
+      13. 股价 > 昨日开盘价
+      14. 当前股价 > 昨日收盘价
+    """
+    if not klines or len(klines) < 2:
+        return False, "K线数据不足"
+
+    # 获取昨日前一天的K线（用于判断连板和获取昨日开盘价）
+    yesterday_kline = klines[-2] if len(klines) >= 2 else None
+    dby_kline = klines[-3] if len(klines) >= 3 else None
+
+    if not yesterday_kline:
+        return False, "缺少昨日K线"
+
+    y_open = float(yesterday_kline.get("open", 0))
+    y_close = float(yesterday_kline.get("close", 0))
+    y_low = float(yesterday_kline.get("low", 0))
+    y_high = float(yesterday_kline.get("high", 0))
+    y_amount = float(yesterday_kline.get("amount", 0))  # 昨日成交额
+
+    # 9. 昨日成交金额 > 上次涨停日成交金额
+    # 找最近一次涨停日（排除昨日），比较昨额与涨停额
+    limit_pct = 10  # 主板
+    threshold = limit_pct * 0.95
+    last_limit_amount = 0
+    for i in range(len(klines) - 2, max(0, len(klines) - 62), -1):  # 最近60天内找
+        if i < 1:
+            break
+        prev_c = float(klines[i - 1].get("close", 0))
+        curr_c = float(klines[i].get("close", 0))
+        if prev_c > 0 and (curr_c - prev_c) / prev_c * 100 >= threshold:
+            last_limit_amount = float(klines[i].get("amount", 0))
+            break
+    if last_limit_amount > 0 and y_amount <= last_limit_amount:
+        return False, "昨额≤涨停额"
+
+    # 10. 7天涨幅 < 34.99%
+    if len(klines) >= 8:
+        close_7d_ago = float(klines[-8].get("close", 0))
+        if close_7d_ago > 0:
+            gain_7d = (y_close - close_7d_ago) / close_7d_ago * 100
+            if gain_7d >= 34.99:
+                return False, f"7天涨幅{gain_7d:.1f}%≥35%"
+
+    # 11. 去除昨日连板（前天也涨停则排除）
+    if dby_kline:
+        dby_close = float(dby_kline.get("close", 0))
+        if dby_close > 0:
+            y_chg = (y_close - dby_close) / dby_close * 100
+            if y_chg >= threshold:
+                # 前天收盘→昨日涨停，检查再前一天是否也涨停
+                if len(klines) >= 4:
+                    dby_prev = float(klines[-4].get("close", 0))
+                    if dby_prev > 0:
+                        dby_chg = (dby_close - dby_prev) / dby_prev * 100
+                        if dby_chg >= threshold:
+                            return False, "昨日连板"
+
+    # 12. 最低价 < 昨日收盘价（今日最低价低于昨收，表示有回踩）
+    today_low = float(klines[-1].get("low", 0)) if len(klines) >= 1 else 0
+    if today_low > 0 and prev_close > 0:
+        if today_low >= prev_close:
+            return False, "最低价≥昨收"
+
+    # 13. 股价 > 昨日开盘价
+    if y_open > 0 and price <= y_open:
+        return False, "股价≤昨开"
+
+    # 14. 当前股价 > 昨日收盘价
+    if y_close > 0 and price <= y_close:
+        return False, "股价≤昨收"
+
+    return True, ""
+
+
+def pool_volume_price(c: dict, tc: dict, em: dict, klines: list = None) -> tuple[bool, str]:
+    """
+    策略池2 · 量价池（集合竞价量价信号）
+    ─────────────────────────────────────
+    条件:
+      1.  主板（沪60/深00）
       2.  非ST
-      3.  集合竞价涨幅 > 3% 且 < 10%（K线修正后重新验证）
-      4.  市值 < 400亿（优先腾讯，东方财富为备）
-      5.  价格 < 120元
+      3.  集合竞价涨幅 > 1%
+      4.  市值 < 700亿
+      5.  前一日涨停取反（昨日未涨停）
+      6.  非盘中下跌（竞价价 >= 昨收）
+      7.  今日竞价金额/昨日竞价金额 > 1.5倍
+      8.  集合竞价换手率 > 0.11%
+      9.  集合竞价量比 > 5
+      10. 3日涨幅 < 15%（需K线数据）
+      11. 集合竞价现手量 > 40000手
+    核心逻辑：筛选出竞价阶段资金明显抢筹的标的
+    """
+    code = c["code"]
+    name = c.get("name", "")
+
+    # 1. 主板
+    if not code.startswith(("60", "00")):
+        return False, "非主板"
+    # 2. 非ST
+    if "ST" in name.upper():
+        return False, "ST"
+    # 3. 涨幅 > 1%
+    if c["auction_gain"] <= 1:
+        return False, "涨幅≤1%"
+    # 4. 市值 < 700亿
+    market_cap_yi = tc.get("market_cap_yi", 0) or em.get("market_cap_yi", 0) or c.get("market_cap_yi", 0)
+    if market_cap_yi >= 700:
+        return False, "市值≥700亿"
+    # 5. 前一日涨停取反（昨日未涨停）
+    if klines and len(klines) >= 3:
+        try:
+            dby_close = float(klines[-3].get("close", 0))
+            y_close = float(klines[-2].get("close", 0))
+            if dby_close > 0:
+                y_chg = (y_close - dby_close) / dby_close * 100
+                if y_chg >= 9.5:  # 主板涨停阈值
+                    return False, "前一日涨停"
+        except (ValueError, TypeError):
+            pass
+    # 6. 非盘中下跌（竞价价 >= 昨收）
+    if c["open_price"] < c["prev_close"]:
+        return False, "盘中下跌"
+    # 竞价量（手）
+    auction_vol = tc.get("volume", 0) or em.get("volume", 0) or c.get("volume", 0)
+    if auction_vol <= 0:
+        return False, "竞价量为0"
+    # 昨成交量（股→手）
+    yesterday_vol_shares = c.get("volume_shares", 0)
+    yesterday_vol_lots = yesterday_vol_shares // 100
+    if yesterday_vol_lots <= 0:
+        return False, "昨成交量为0"
+    # 7. 今日竞价金额/昨日竞价金额 > 1.5倍
+    today_amount = auction_vol * c["price"] * 100
+    yesterday_amount = yesterday_vol_shares * c["prev_close"]
+    if yesterday_amount <= 0:
+        return False, "昨金额为0"
+    amount_ratio = today_amount / yesterday_amount
+    if amount_ratio <= 1.5:
+        return False, "金额比≤1.5"
+    # 8. 换手率 > 0.11%
+    turnover = em.get("turnover", 0) or tc.get("turnover", 0) or c.get("turnover_sina", 0)
+    if turnover <= 0.11:
+        return False, "换手率≤0.11%"
+    # 9. 量比 > 5
+    est_auction_avg = yesterday_vol_lots * (10 / 240)
+    volume_ratio = auction_vol / est_auction_avg if est_auction_avg > 0 else 0
+    if volume_ratio <= 5:
+        return False, "量比≤5"
+    # 10. 3日涨幅 < 15%
+    if klines and len(klines) >= 4:
+        try:
+            closes = [float(k.get("close", 0)) for k in klines[-4:]]
+            if closes[0] > 0:
+                change_3d = (closes[-1] - closes[0]) / closes[0] * 100
+                if change_3d >= 15:
+                    return False, f"3日涨幅≥15%"
+        except (ValueError, TypeError):
+            pass
+    # 11. 竞价量 > 40000手
+    if auction_vol <= 40000:
+        return False, "竞价量≤4万手"
+
+    # 写回计算字段
+    c["auction_vol"] = auction_vol
+    c["vol_ratio_yesterday"] = round(auction_vol / yesterday_vol_lots * 100, 2)
+    c["volume_ratio"] = round(volume_ratio, 2)
+    c["turnover"] = round(turnover, 4)
+    c["yesterday_vol"] = yesterday_vol_lots
+    c["amount_ratio"] = round(amount_ratio, 2)
+    if market_cap_yi > 0:
+        c["market_cap_yi"] = market_cap_yi
+
+    return True, ""
+
+
+def pool_trend(c: dict, klines: list[dict], tc: dict = None, em: dict = None) -> tuple[bool, str]:
+    """
+    策略池3 · 趋势池（竞价趋势信号）
+    ─────────────────────────────────
+    条件:
+      1.  主板（沪60/深00）
+      2.  非ST
+      3.  集合竞价涨幅 > 3% 且 < 10%
+      4.  120日内有涨停
+      5.  市值 < 1000亿
       6.  前一日涨停取反（昨日未涨停）
       7.  非盘中下跌（竞价价 >= 昨收）
       8.  开盘跳空高开（open > prev_close）
-      9.  今日竞价金额 / 昨日竞价金额 > 1.5倍（实际金额计算）
-      10. 集合竞价换手率 > 0.11%
-      11. 集合竞价量比 > 5
-      12. 3日涨幅 < 15%
-      13. 集合竞价现手量 > 40000手
-      14. 2个月内有过涨停
+      9.  集合竞价量比 > 3
+      10. 集合竞价换手率 > 0.1%
+    排序：竞价涨幅从大到小（在主流程排序）
+    """
+    code = c["code"]
+    name = c.get("name", "")
+    if tc is None:
+        tc = {}
+    if em is None:
+        em = {}
+
+    # 1. 主板
+    if not code.startswith(("60", "00")):
+        return False, "非主板"
+    # 2. 非ST
+    if "ST" in name.upper():
+        return False, "ST"
+    # 3. 涨幅 > 3% 且 < 10%
+    if c["auction_gain"] <= 3 or c["auction_gain"] >= 10:
+        return False, "涨幅不在3-10%"
+    # 4. 120日内有涨停
+    if not _check_has_limit_up_in_days(code, days=120, cached_klines=klines):
+        return False, "120日内无涨停"
+    # 5. 市值 < 1000亿
+    market_cap_yi = tc.get("market_cap_yi", 0) or em.get("market_cap_yi", 0) or c.get("market_cap_yi", 0)
+    if market_cap_yi >= 1000:
+        return False, "市值≥1000亿"
+    # 6. 前一日涨停取反
+    if klines and len(klines) >= 3:
+        try:
+            dby_close = float(klines[-3].get("close", 0))
+            y_close = float(klines[-2].get("close", 0))
+            if dby_close > 0:
+                y_chg = (y_close - dby_close) / dby_close * 100
+                if y_chg >= 9.5:
+                    return False, "前一日涨停"
+        except (ValueError, TypeError):
+            pass
+    # 7. 非盘中下跌
+    if c["open_price"] < c["prev_close"]:
+        return False, "盘中下跌"
+    # 8. 开盘跳空高开
+    if c["open_price"] <= c["prev_close"]:
+        return False, "未高开"
+    # 9. 集合竞价量比 > 3
+    auction_vol = tc.get("volume", 0) or em.get("volume", 0) or c.get("volume", 0)
+    yesterday_vol_shares = c.get("volume_shares", 0)
+    yesterday_vol_lots = yesterday_vol_shares // 100
+    if yesterday_vol_lots > 0 and auction_vol > 0:
+        est_auction_avg = yesterday_vol_lots * (10 / 240)
+        volume_ratio = auction_vol / est_auction_avg if est_auction_avg > 0 else 0
+        if volume_ratio <= 3:
+            return False, "量比≤3"
+    # 10. 集合竞价换手率 > 0.1%
+    turnover = em.get("turnover", 0) or tc.get("turnover", 0) or c.get("turnover_sina", 0)
+    if turnover <= 0.1:
+        return False, "换手率≤0.1%"
+
+    return True, ""
+
+
+def pool_technical(code: str, klines: list[dict], name: str = "",
+                   price: float = 0, market_cap_yi: float = 0) -> tuple[bool, str]:
+    """
+    策略池4 · 技术池（多周期MACD共振）
+    ─────────────────────────────────
+    条件:
+      1.  主板（沪60/深00）
+      2.  非ST
+      3.  120分钟MACD向上
+      4.  市值 < 400亿
+      5.  价格 < 120元
+      6.  月MACD红柱向上
+      7.  周MACD红柱变大
+      8.  2个月内有过涨停
+    核心逻辑：多周期MACD共振确认趋势向上，排除假突破
+    """
+    # 1. 主板
+    if not code.startswith(("60", "00")):
+        return False, "非主板"
+    # 2. 非ST
+    if "ST" in name.upper():
+        return False, "ST"
+    # 3. 120分钟MACD向上
+    if not _check_macd_120min_up(code, cached_klines=klines):
+        return False, "120分钟MACD未向上"
+    # 4. 市值 < 400亿
+    if market_cap_yi >= 400:
+        return False, "市值≥400亿"
+    # 5. 价格 < 120元
+    if price >= 120:
+        return False, "价格≥120"
+    # 6. 月MACD红柱向上
+    if not _check_monthly_macd_red_up(code, cached_klines=klines):
+        return False, "月MACD红柱未向上"
+    # 7. 周MACD红柱变大
+    if not _check_weekly_macd_red_growing(code, cached_klines=klines):
+        return False, "周MACD红柱未变大"
+    # 8. 2个月内有过涨停
+    if not _check_has_limit_up_in_days(code, days=60, cached_klines=klines):
+        return False, "2个月内无涨停"
+    return True, ""
+
+
+# ============================================================
+# 旧的统一筛选（已重构为调用策略池）
+# ============================================================
+
+def _screen_unified(candidates: list[dict], tencent_map: dict, em_data: dict = None,
+                    kline_map: dict = None) -> list[dict]:
+    """
+    统一筛选策略 —— 调用策略池1(基础) + 策略池2(量价)
+    策略池3(趋势) 和 策略池4(技术) 在后续K线阶段调用
+
+    策略池1 · 基础池：主板 / 去ST / 流通市值35.99~999.99亿 / 股价<60 / 均价线之上
+              / 昨额>涨停额 / 7天涨幅<35% / 去连板 / 最低<昨收 / 股价>昨开 / 股价>昨收 / 5分钟额>3000万
+    策略池2 · 量价池：主板 / 非ST / 涨幅>1% / 市值<700亿 / 前一日未涨停 / 非盘中下跌
+              / 金额比>1.5 / 换手率>0.11% / 量比>5 / 3日涨幅<15% / 竞价量>4万手
+    策略池3 · 趋势池：主板 / 非ST / 涨幅3-10% / 120日内有涨停 / 市值<1000亿 / 前一日未涨停
+              / 非盘中下跌 / 高开 / 量比>3 / 换手率>0.1%（涨幅从大到小排名）
+    策略池4 · 技术池：主板 / 非ST / 120分钟MACD↑ / 市值<400亿 / 价格<120 / 月MACD红柱↑ / 周MACD红柱↑ / 2月内有涨停
     """
     if em_data is None:
         em_data = {}
@@ -1128,83 +1483,49 @@ def _screen_unified(candidates: list[dict], tencent_map: dict, em_data: dict = N
         code = c["code"]
         tc = tencent_map.get(code, {})
         em = em_data.get(code, {})
-
-        # ---- 条件3: 集合竞价涨幅 > 3% 且 < 10% ----
-        if c["auction_gain"] <= 3 or c["auction_gain"] >= 10:
-            _diag["涨幅3-10%"] = _diag.get("涨幅3-10%", 0) + 1
-            continue
-
-        # ---- 条件4: 市值 < 400亿（优先用腾讯数据，东方财富为备）----
+        name = c.get("name", "")
         market_cap_yi = tc.get("market_cap_yi", 0) or em.get("market_cap_yi", 0) or c.get("market_cap_yi", 0)
-        if market_cap_yi >= 400:
-            _diag["市值<400亿"] = _diag.get("市值<400亿", 0) + 1
+
+        # 均价线（VWAP）：腾讯字段32为均价，或用竞价金额/竞价量计算
+        avg_price = 0
+        try:
+            avg_price = float(tc.get("avg_price", 0)) if tc.get("avg_price") else 0
+        except (ValueError, TypeError):
+            pass
+        if avg_price <= 0:
+            auction_vol = tc.get("volume", 0) or c.get("volume", 0)
+            auction_amount = tc.get("amount", 0) or em.get("amount", 0)
+            if auction_vol > 0 and auction_amount > 0:
+                avg_price = auction_amount / auction_vol / 100  # 手→股
+
+        # 昨日成交金额（K线数据在后续阶段补充，此处为0）
+        yesterday_amount = 0
+
+        # 上次涨停日成交金额（K线数据在后续阶段补充，此处为0）
+        last_limit_amount = 0
+
+        # 开盘5分钟成交金额（实时数据，腾讯/东财接口可能提供）
+        amount_5min = 0
+
+        # ---- 策略池1 · 基础池（非K线部分）----
+        ok, reason = pool_base(code, name, c["price"], market_cap_yi,
+                               avg_price=avg_price, yesterday_amount=yesterday_amount,
+                               last_limit_amount=last_limit_amount, amount_5min=amount_5min)
+        if not ok:
+            _diag[f"基础池:{reason}"] = _diag.get(f"基础池:{reason}", 0) + 1
             continue
 
-        # ---- 条件5: 价格 < 120元 ----
-        if c["price"] >= 120:
-            _diag["价格<120"] = _diag.get("价格<120", 0) + 1
+        # ---- 策略池2 · 量价池 ----
+        klines_for_pool2 = (kline_map or {}).get(code, [])
+        ok, reason = pool_volume_price(c, tc, em, klines=klines_for_pool2)
+        if not ok:
+            _diag[f"量价池:{reason}"] = _diag.get(f"量价池:{reason}", 0) + 1
             continue
 
-        # ---- 条件8: 开盘跳空高开 ----
-        if c["open_price"] <= c["prev_close"]:
-            _diag["高开"] = _diag.get("高开", 0) + 1
-            continue
+        # 补充 market_cap_yi
+        if market_cap_yi > 0:
+            c["market_cap_yi"] = market_cap_yi
 
-        # ---- 竞价量 ----
-        auction_vol = tc.get("volume", 0) or em.get("volume", 0) or c["volume"]
-        if auction_vol <= 0:
-            _diag["竞价量>0"] = _diag.get("竞价量>0", 0) + 1
-            continue
-
-        # ---- 条件13: 集合竞价现手量 > 40000手 ----
-        if auction_vol <= 40000:
-            _diag["竞价量>4万手"] = _diag.get("竞价量>4万手", 0) + 1
-            continue
-
-        # ---- 昨成交量（股→手）----
-        yesterday_vol_shares = c["volume_shares"]
-        yesterday_vol_lots = yesterday_vol_shares // 100
-        if yesterday_vol_lots <= 0:
-            _diag["昨成交量>0"] = _diag.get("昨成交量>0", 0) + 1
-            continue
-
-        # ---- 条件11: 集合竞价量比 > 5 ----
-        # 注意：腾讯API的 volume_ratio_api（字段49）是全天量比，不是竞价量比
-        # 集合竞价量比 = 今日竞价量 / 近5日竞价平均量
-        # 竞价时段(09:15-09:25)约占全天 10/240 ≈ 4.17%，用昨日全天量×0.0417 近似竞价均量
-        avg_daily_vol = yesterday_vol_lots  # 近似用昨日量作为5日均量
-        est_auction_avg = avg_daily_vol * (10 / 240)  # 竞价时间占比
-        volume_ratio = auction_vol / est_auction_avg if est_auction_avg > 0 else 0
-        if volume_ratio <= 5:
-            _diag["量比>5"] = _diag.get("量比>5", 0) + 1
-            continue
-
-        # ---- 条件10: 集合竞价换手率 > 0.11% ----
-        turnover = em.get("turnover", 0) or tc.get("turnover", 0) or c.get("turnover_sina", 0)
-        if turnover <= 0.11:
-            _diag["换手率>0.11%"] = _diag.get("换手率>0.11%", 0) + 1
-            continue
-
-        # ---- 条件9: 今日竞价金额/昨日竞价金额 > 1.5倍 ----
-        # 用实际竞价金额计算，不依赖量比近似
-        today_auction_amount = auction_vol * c["price"] * 100      # 手→股 × 价格
-        yesterday_auction_amount = yesterday_vol_shares * c["prev_close"]  # 股 × 价格
-        if yesterday_auction_amount <= 0:
-            _diag["金额比"] = _diag.get("金额比", 0) + 1
-            continue
-        amount_ratio = today_auction_amount / yesterday_auction_amount
-        if amount_ratio <= 1.5:
-            _diag["金额比>1.5"] = _diag.get("金额比>1.5", 0) + 1
-            continue
-
-        # ---- 通过全部检查，记录 ----
-        c["auction_vol"] = auction_vol
-        c["vol_ratio_yesterday"] = round(auction_vol / yesterday_vol_lots * 100, 2)
-        c["volume_ratio"] = round(volume_ratio, 2)
-        c["turnover"] = round(turnover, 4)
-        c["yesterday_vol"] = yesterday_vol_lots
-        c["amount_ratio"] = round(amount_ratio, 2)
-        c["market_cap_yi"] = market_cap_yi
         filtered.append(c)
 
     # 输出诊断信息
@@ -1345,13 +1666,14 @@ def screen_mainboard_strategy() -> list[dict]:
     2. 优先在涨停最多的板块里筛选
     3. 结果按板块涨停数 + 频次排列
 
-    统一筛选条件（全部满足才能入选）：
-      1.  主板  2.  非ST  3.  涨幅>3%且<10%  4.  市值<400亿
-      5.  价格<120元  6.  前一日涨停取反  7.  非盘中下跌
-      8.  开盘跳空高开  9.  竞价金额比>1.5倍  10. 换手率>0.11%
-      11. 量比>5  12. 3日涨幅<15%  13. 现手量>40000手
-      14. 2个月内有涨停  15. 120分钟MACD向上
-      16. 月MACD红柱向上  17. 周MACD红柱变大
+    四大策略池串联筛选：
+      策略池1 · 基础池：主板 / 去ST / 流通市值35.99~999.99亿 / 股价<60 / 均价线之上
+                / 昨额>涨停额 / 7天涨幅<35% / 去连板 / 最低<昨收 / 股价>昨开 / 股价>昨收 / 5分钟额>3000万
+      策略池2 · 量价池：主板 / 非ST / 涨幅>1% / 市值<700亿 / 前一日未涨停 / 非盘中下跌
+                / 金额比>1.5 / 换手率>0.11% / 量比>5 / 3日涨幅<15% / 竞价量>4万手（涨幅从大到小排名）
+      策略池3 · 趋势池：主板 / 非ST / 涨幅3-10% / 120日内有涨停 / 市值<1000亿 / 前一日未涨停
+                / 非盘中下跌 / 高开 / 量比>3 / 换手率>0.1%（涨幅从大到小排名）
+      策略池4 · 技术池：主板 / 非ST / 120分钟MACD↑ / 市值<400亿 / 价格<120 / 月MACD红柱↑ / 周MACD红柱↑ / 2月内有涨停
     """
     # ========== 第一步：获取板块及股票 ==========
     # 检查是否在竞价时段
@@ -1392,7 +1714,7 @@ def screen_mainboard_strategy() -> list[dict]:
                 continue
             if symbol.startswith("bj"):
                 continue
-            if not code.startswith(("60", "00", "30", "68")):
+            if not code.startswith(("60", "00")):
                 continue
             if "ST" in name.upper():
                 continue
@@ -1444,11 +1766,11 @@ def screen_mainboard_strategy() -> list[dict]:
             else:
                 prev_close = price  # fallback
 
-            if prev_close <= 0 or price <= 0 or price >= 120:
+            if prev_close <= 0 or price <= 0 or price >= 60:
                 continue
 
             auction_gain = change_pct if change_pct != 0 else 0
-            if auction_gain <= 3 or auction_gain >= 10:
+            if auction_gain <= 1:
                 continue
 
             if price < prev_close * 0.999:  # 允许0.1%误差
@@ -1549,77 +1871,80 @@ def screen_mainboard_strategy() -> list[dict]:
 
     # ========== 第七步：统一策略筛选 ==========
     print("📊 执行统一策略筛选...")
-    filtered = _screen_unified(all_candidates, tencent_map, em_data=em_data)
+    filtered = _screen_unified(all_candidates, tencent_map, em_data=em_data, kline_map=kline_map_all)
     print(f"  通过筛选: {len(filtered)} 只")
 
     if not filtered:
         return []
 
-    # ========== 第八步：K线 + MACD 检查（复用第六步数据）==========
-    print("📊 执行K线+MACD检查...")
+    # ========== 第八步：策略池3(趋势) + 策略池4(技术) 检查 ==========
+    print("📊 执行策略池3(趋势) + 策略池4(技术) 检查...")
 
     final = []
+    _base_diag = {}
+    _trend_diag = {}
+    _tech_diag = {}
     for c in filtered:
         code = c["code"]
         klines = kline_map_all.get(code, [])
-        if klines and len(klines) >= 4:
-            closes = [float(k.get("close", 0)) for k in klines[-4:]]
-            if closes[0] > 0:
-                change_3d = (closes[-1] - closes[0]) / closes[0] * 100
-                if change_3d >= 15:
-                    continue
-                c["change_3d"] = round(change_3d, 2)
-            else:
-                c["change_3d"] = 0
-                continue  # K线不足4根，无法验证3日涨幅，严格起见跳过
-            if len(klines) >= 2:
-                c["yesterday_vol_hist"] = int(float(klines[-2].get("volume", 0)))
-            else:
-                c["yesterday_vol_hist"] = 0
-                continue  # 无法获取昨日成交量，跳过
 
-            # 用K线数据修正昨收价
-            if len(klines) >= 2:
-                try:
-                    real_prev_close = float(klines[-2].get("close", 0))
-                    if real_prev_close > 0:
-                        c["prev_close"] = real_prev_close
-                        c["auction_gain"] = round((c["price"] - real_prev_close) / real_prev_close * 100, 2)
-                        # 修正后重新验证涨幅范围（3%-10%），不降低策略严格性
-                        if c["auction_gain"] <= 3 or c["auction_gain"] >= 10:
-                            continue
-                except (ValueError, TypeError):
-                    pass
+        # 用K线数据修正昨收价
+        if klines and len(klines) >= 2:
+            try:
+                real_prev_close = float(klines[-2].get("close", 0))
+                if real_prev_close > 0:
+                    c["prev_close"] = real_prev_close
+                    c["auction_gain"] = round((c["price"] - real_prev_close) / real_prev_close * 100, 2)
+                    # 修正后重新验证涨幅范围（3%-10%），不降低策略严格性
+                    if c["auction_gain"] <= 3 or c["auction_gain"] >= 10:
+                        continue
+            except (ValueError, TypeError):
+                pass
 
-            if code.startswith(("30", "68")):
-                limit_pct = 20
-            else:
-                limit_pct = 10
-            if len(klines) >= 3:
-                try:
-                    dby_close = float(klines[-3].get("close", 0))
-                    y_close = float(klines[-2].get("close", 0))
-                    if dby_close > 0:
-                        y_chg = (y_close - dby_close) / dby_close * 100
-                        if y_chg >= limit_pct * 0.95:
-                            continue
-                except (ValueError, TypeError):
-                    pass
-        else:
-            c["change_3d"] = 0
-            c["yesterday_vol_hist"] = 0
+        # ---- 策略池1 · 基础池（K线部分）----
+        ok, reason = pool_base_post_kline(code, c["price"], klines,
+                                          c.get("prev_close", 0),
+                                          c.get("yesterday_amount", 0))
+        if not ok:
+            _base_diag[reason] = _base_diag.get(reason, 0) + 1
+            continue
 
-        if not _check_has_limit_up_in_days(code, days=60, cached_klines=klines):
+        # ---- 策略池3 · 趋势池 ----
+        tc = tencent_map.get(code, {})
+        em = em_data.get(code, {})
+        ok, reason = pool_trend(c, klines, tc=tc, em=em)
+        if not ok:
+            _trend_diag[reason] = _trend_diag.get(reason, 0) + 1
             continue
-        if not _check_macd_120min_up(code, cached_klines=klines):
-            continue
-        if not _check_monthly_macd_red_up(code, cached_klines=klines):
-            continue
-        if not _check_weekly_macd_red_growing(code, cached_klines=klines):
+
+        # ---- 策略池4 · 技术池 ----
+        ok, reason = pool_technical(code, klines, name=c.get("name", ""),
+                                    price=c["price"], market_cap_yi=c.get("market_cap_yi", 0))
+        if not ok:
+            _tech_diag[reason] = _tech_diag.get(reason, 0) + 1
             continue
 
         c["change_pct"] = c["auction_gain"]
         final.append(c)
+
+    # 输出各策略池诊断
+    if _base_diag:
+        total = sum(_base_diag.values())
+        print(f"  📋 基础池(K线)淘汰 ({total} 只):")
+        for reason, cnt in sorted(_base_diag.items(), key=lambda x: -x[1]):
+            print(f"    ❌ {reason}: {cnt} 只")
+
+    # 输出趋势池/技术池诊断
+    if _trend_diag:
+        total = sum(_trend_diag.values())
+        print(f"  📋 趋势池淘汰 ({total} 只):")
+        for reason, cnt in sorted(_trend_diag.items(), key=lambda x: -x[1]):
+            print(f"    ❌ {reason}: {cnt} 只")
+    if _tech_diag:
+        total = sum(_tech_diag.values())
+        print(f"  📋 技术池淘汰 ({total} 只):")
+        for reason, cnt in sorted(_tech_diag.items(), key=lambda x: -x[1]):
+            print(f"    ❌ {reason}: {cnt} 只")
 
     # ========== 第九步：计算展示字段 ==========
     for c in final:
@@ -1668,8 +1993,8 @@ def screen_mainboard_strategy() -> list[dict]:
         c["frequency"] = freq
         c["strategy"] = _compute_screen_strategy(c)
 
-    # ========== 第十步：排序（板块涨停数降序 → 频次降序 → 涨幅降序）==========
-    final.sort(key=lambda x: (-x.get("sector_limit_count", 0), -x.get("frequency", 0), -x["auction_gain"]))
+    # ========== 第十步：排序（涨幅降序 → 板块涨停数降序 → 频次降序）==========
+    final.sort(key=lambda x: (-x["auction_gain"], -x.get("sector_limit_count", 0), -x.get("frequency", 0)))
 
     print(f"\n  ✅ 最终筛选: {len(final)} 只股票")
 
@@ -1783,7 +2108,7 @@ def _screen_fallback_all_market() -> list[dict]:
         symbol = str(item.get("symbol", ""))
         if not code or len(code) != 6:
             continue
-        if symbol.startswith("bj") or not code.startswith(("60", "00", "30", "68")):
+        if symbol.startswith("bj") or not code.startswith(("60", "00")):
             continue
         if "ST" in name.upper():
             continue
@@ -1806,11 +2131,11 @@ def _screen_fallback_all_market() -> list[dict]:
             prev_close = float(settlement) if settlement else 0
         except (ValueError, TypeError):
             continue
-        if prev_close <= 0 or price <= 0 or price >= 120:
+        if prev_close <= 0 or price <= 0 or price >= 60:
             continue
 
         auction_gain = (price - prev_close) / prev_close * 100
-        if auction_gain <= 3 or auction_gain >= 10:
+        if auction_gain <= 1:
             continue
 
         open_price = item.get("open", "0")
@@ -1890,48 +2215,78 @@ def _screen_fallback_all_market() -> list[dict]:
         except Exception:
             pass
 
-    filtered = _screen_unified(candidates, tencent_map, em_data=em_data)
+    # 先获取K线数据（策略池2需要3日涨幅和前一日涨停判断）
+    print("📊 获取K线数据（用于策略池2量价筛选）...")
+    kline_map_for_pool2 = _fetch_kline_concurrent([c["code"] for c in candidates], days=1000)
+
+    filtered = _screen_unified(candidates, tencent_map, em_data=em_data, kline_map=kline_map_for_pool2)
     if not filtered:
         return []
 
-    kline_map = _fetch_kline_concurrent([c["code"] for c in filtered], days=1000)
+    # 复用已获取的K线数据
+    kline_map = {code: kline_map_for_pool2[code] for code in kline_map_for_pool2 if code in {c["code"] for c in filtered}}
     final = []
+    _base_diag = {}
+    _trend_diag = {}
+    _tech_diag = {}
     for c in filtered:
         code = c["code"]
         klines = kline_map.get(code, [])
-        if klines and len(klines) >= 4:
-            closes = [float(k.get("close", 0)) for k in klines[-4:]]
-            if closes[0] > 0 and (closes[-1] - closes[0]) / closes[0] * 100 >= 15:
-                continue
-            c["change_3d"] = round((closes[-1] - closes[0]) / closes[0] * 100, 2) if closes[0] > 0 else 0
-            c["yesterday_vol_hist"] = int(float(klines[-2].get("volume", 0))) if len(klines) >= 2 else 0
-            if code.startswith(("30", "68")):
-                lp = 20
-            else:
-                lp = 10
-            if len(klines) >= 3:
-                try:
-                    dby = float(klines[-3].get("close", 0))
-                    yc = float(klines[-2].get("close", 0))
-                    if dby > 0 and (yc - dby) / dby * 100 >= lp * 0.95:
-                        continue
-                except (ValueError, TypeError):
-                    pass
-        else:
-            c["change_3d"] = 0
-            c["yesterday_vol_hist"] = 0
-            continue  # K线数据不足，无法验证3日涨幅，严格起见跳过
 
-        if not _check_has_limit_up_in_days(code, days=60, cached_klines=klines):
+        # 用K线数据修正昨收价
+        if klines and len(klines) >= 2:
+            try:
+                real_prev_close = float(klines[-2].get("close", 0))
+                if real_prev_close > 0:
+                    c["prev_close"] = real_prev_close
+                    c["auction_gain"] = round((c["price"] - real_prev_close) / real_prev_close * 100, 2)
+                    if c["auction_gain"] <= 3 or c["auction_gain"] >= 10:
+                        continue
+            except (ValueError, TypeError):
+                pass
+
+        # ---- 策略池1 · 基础池（K线部分）----
+        ok, reason = pool_base_post_kline(code, c["price"], klines,
+                                          c.get("prev_close", 0),
+                                          c.get("yesterday_amount", 0))
+        if not ok:
+            _base_diag[reason] = _base_diag.get(reason, 0) + 1
             continue
-        if not _check_macd_120min_up(code, cached_klines=klines):
+
+        # ---- 策略池3 · 趋势池 ----
+        tc = tencent_map.get(code, {})
+        em = em_data.get(code, {})
+        ok, reason = pool_trend(c, klines, tc=tc, em=em)
+        if not ok:
+            _trend_diag[reason] = _trend_diag.get(reason, 0) + 1
             continue
-        if not _check_monthly_macd_red_up(code, cached_klines=klines):
+
+        # ---- 策略池4 · 技术池 ----
+        ok, reason = pool_technical(code, klines, name=c.get("name", ""),
+                                    price=c["price"], market_cap_yi=c.get("market_cap_yi", 0))
+        if not ok:
+            _tech_diag[reason] = _tech_diag.get(reason, 0) + 1
             continue
-        if not _check_weekly_macd_red_growing(code, cached_klines=klines):
-            continue
+
         c["change_pct"] = c["auction_gain"]
         final.append(c)
+
+    if _base_diag:
+        total = sum(_base_diag.values())
+        print(f"  📋 基础池(K线)淘汰 ({total} 只):")
+        for reason, cnt in sorted(_base_diag.items(), key=lambda x: -x[1]):
+            print(f"    ❌ {reason}: {cnt} 只")
+
+    if _trend_diag:
+        total = sum(_trend_diag.values())
+        print(f"  📋 趋势池淘汰 ({total} 只):")
+        for reason, cnt in sorted(_trend_diag.items(), key=lambda x: -x[1]):
+            print(f"    ❌ {reason}: {cnt} 只")
+    if _tech_diag:
+        total = sum(_tech_diag.values())
+        print(f"  📋 技术池淘汰 ({total} 只):")
+        for reason, cnt in sorted(_tech_diag.items(), key=lambda x: -x[1]):
+            print(f"    ❌ {reason}: {cnt} 只")
 
     for c in final:
         tc = tencent_map.get(c["code"], {})
@@ -2014,8 +2369,8 @@ def _screen_fallback_all_market() -> list[dict]:
         c["is_leader"] = code in leader_scores
         c["leader_count"] = leader_freq_history.get(code, {}).get("count", 0)
 
-    final.sort(key=lambda x: (-int(x.get("is_leader", False)), -x.get("leader_count", 0),
-                               -x.get("frequency", 0), -x["auction_gain"]))
+    final.sort(key=lambda x: (-x["auction_gain"], -int(x.get("is_leader", False)), -x.get("leader_count", 0),
+                               -x.get("frequency", 0)))
 
     # 输出龙头统计
     leader_stats = [(c["code"], c["name"], c.get("sector", ""), c.get("leader_count", 0))
