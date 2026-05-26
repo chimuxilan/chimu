@@ -2230,13 +2230,13 @@ def screen_mainboard_strategy() -> list[dict]:
             print(f"    {name}({code}) [{sector}] — 出现 {cnt} 次")
 
     # ========== 最终过滤：去除不符合策略池的股票 ==========
-    # 规则：必须通过至少一个"有效策略池"（趋势池/技术池），仅通过量价池的不算
+    # 规则：趋势池和技术池必须同时通过
     before_count = len(final)
     final = [c for c in final if c.get("passed_pools") and
-             any(p in c["passed_pools"] for p in ("趋势池", "技术池"))]
+             "趋势池" in c["passed_pools"] and "技术池" in c["passed_pools"]]
     removed = before_count - len(final)
     if removed > 0:
-        print(f"\n  🗑  最终过滤: 去除 {removed} 只仅通过量价池的股票，保留 {len(final)} 只")
+        print(f"\n  🗑  最终过滤: 去除 {removed} 只趋势池/技术池未同时通过的股票，保留 {len(final)} 只")
 
     return final
 
@@ -2566,13 +2566,13 @@ def _screen_fallback_all_market() -> list[dict]:
             print(f"    {name}({code}) [{sector}] — 出现 {cnt} 次")
 
     # ========== 最终过滤：去除不符合策略池的股票 ==========
-    # 规则：必须通过至少一个"有效策略池"（趋势池/技术池），仅通过量价池的不算
+    # 规则：趋势池和技术池必须同时通过
     before_count = len(final)
     final = [c for c in final if c.get("passed_pools") and
-             any(p in c["passed_pools"] for p in ("趋势池", "技术池"))]
+             "趋势池" in c["passed_pools"] and "技术池" in c["passed_pools"]]
     removed = before_count - len(final)
     if removed > 0:
-        print(f"\n  🗑  最终过滤: 去除 {removed} 只仅通过量价池的股票，保留 {len(final)} 只")
+        print(f"\n  🗑  最终过滤: 去除 {removed} 只趋势池/技术池未同时通过的股票，保留 {len(final)} 只")
 
     return final
 
