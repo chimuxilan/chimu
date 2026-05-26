@@ -1102,13 +1102,13 @@ def _screen_unified(candidates: list[dict], tencent_map: dict, em_data: dict = N
     统一筛选策略 —— 以下全部条件必须同时满足才能入选：
       1.  主板
       2.  非ST
-      3.  集合竞价涨幅 > 3% 且 < 10%
+      3.  集合竞价涨幅 > 3% 且 < 10%（K线修正后重新验证）
       4.  市值 < 400亿
       5.  价格 < 120元
       6.  前一日涨停取反（昨日未涨停）
       7.  非盘中下跌（竞价价 >= 昨收）
       8.  开盘跳空高开（open > prev_close）
-      9.  今日竞价金额 / 昨日竞价金额 > 1.5倍
+      9.  今日竞价金额 / 昨日竞价金额 > 1.5倍（实际金额计算）
       10. 集合竞价换手率 > 0.11%
       11. 集合竞价量比 > 5
       12. 3日涨幅 < 15%
@@ -1185,18 +1185,13 @@ def _screen_unified(candidates: list[dict], tencent_map: dict, em_data: dict = N
             continue
 
         # ---- 条件9: 今日竞价金额/昨日竞价金额 > 1.5倍 ----
-        # 量比已反映竞价强度（今日竞价量 vs 历史竞价量均值），金额比用等价逻辑：
-        # 竞价金额比 ≈ 量比 × (今日价格 / 历史均价)，简化为量比本身（价格差异可忽略）
-        # 若API有量比值，直接用；否则用竞价量与昨日量的比值（单位已统一为手）
-        if volume_ratio > 0:
-            amount_ratio = volume_ratio  # 量比已等价反映金额强度
-        else:
-            today_auction_amount = auction_vol * c["price"] * 100      # 手→股 × 价格
-            yesterday_auction_amount = yesterday_vol_shares * c["prev_close"]  # 股 × 价格
-            if yesterday_auction_amount <= 0:
-                _diag["金额比"] = _diag.get("金额比", 0) + 1
-                continue
-            amount_ratio = today_auction_amount / yesterday_auction_amount
+        # 用实际竞价金额计算，不依赖量比近似
+        today_auction_amount = auction_vol * c["price"] * 100      # 手→股 × 价格
+        yesterday_auction_amount = yesterday_vol_shares * c["prev_close"]  # 股 × 价格
+        if yesterday_auction_amount <= 0:
+            _diag["金额比"] = _diag.get("金额比", 0) + 1
+            continue
+        amount_ratio = today_auction_amount / yesterday_auction_amount
         if amount_ratio <= 1.5:
             _diag["金额比>1.5"] = _diag.get("金额比>1.5", 0) + 1
             continue
@@ -1558,10 +1553,12 @@ def screen_mainboard_strategy() -> list[dict]:
                 c["change_3d"] = round(change_3d, 2)
             else:
                 c["change_3d"] = 0
+                continue  # K线不足4根，无法验证3日涨幅，严格起见跳过
             if len(klines) >= 2:
                 c["yesterday_vol_hist"] = int(float(klines[-2].get("volume", 0)))
             else:
                 c["yesterday_vol_hist"] = 0
+                continue  # 无法获取昨日成交量，跳过
 
             # 用K线数据修正昨收价
             if len(klines) >= 2:
@@ -1570,6 +1567,9 @@ def screen_mainboard_strategy() -> list[dict]:
                     if real_prev_close > 0:
                         c["prev_close"] = real_prev_close
                         c["auction_gain"] = round((c["price"] - real_prev_close) / real_prev_close * 100, 2)
+                        # 修正后重新验证涨幅范围（3%-10%），不降低策略严格性
+                        if c["auction_gain"] <= 3 or c["auction_gain"] >= 10:
+                            continue
                 except (ValueError, TypeError):
                     pass
 
@@ -1902,6 +1902,7 @@ def _screen_fallback_all_market() -> list[dict]:
         else:
             c["change_3d"] = 0
             c["yesterday_vol_hist"] = 0
+            continue  # K线数据不足，无法验证3日涨幅，严格起见跳过
 
         if not _check_has_limit_up_in_days(code, days=60, cached_klines=klines):
             continue
