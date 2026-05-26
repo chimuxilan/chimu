@@ -2229,6 +2229,13 @@ def screen_mainboard_strategy() -> list[dict]:
         for code, name, sector, cnt in leader_stats:
             print(f"    {name}({code}) [{sector}] — 出现 {cnt} 次")
 
+    # ========== 最终过滤：去除不符合策略池的股票 ==========
+    before_count = len(final)
+    final = [c for c in final if c.get("passed_pools")]
+    removed = before_count - len(final)
+    if removed > 0:
+        print(f"\n  🗑  最终过滤: 去除 {removed} 只不符合策略池的股票，保留 {len(final)} 只")
+
     return final
 
 def _screen_fallback_all_market() -> list[dict]:
@@ -2555,6 +2562,13 @@ def _screen_fallback_all_market() -> list[dict]:
         print(f"\n  🏆 板块龙头出现次数统计:")
         for code, name, sector, cnt in leader_stats:
             print(f"    {name}({code}) [{sector}] — 出现 {cnt} 次")
+
+    # ========== 最终过滤：去除不符合策略池的股票 ==========
+    before_count = len(final)
+    final = [c for c in final if c.get("passed_pools")]
+    removed = before_count - len(final)
+    if removed > 0:
+        print(f"\n  🗑  最终过滤: 去除 {removed} 只不符合策略池的股票，保留 {len(final)} 只")
 
     return final
 
