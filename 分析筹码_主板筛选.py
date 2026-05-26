@@ -847,6 +847,18 @@ def _check_has_limit_up_in_days(code: str, days: int = 120, cached_klines: list[
 # MACD 计算
 # ============================================================
 
+def _ema(data: list, period: int) -> list[float]:
+    """模块级EMA计算（供策略池4深度分析使用）"""
+    if not data:
+        return []
+    ema = [0.0] * len(data)
+    k = 2.0 / (period + 1)
+    ema[0] = data[0]
+    for i in range(1, len(data)):
+        ema[i] = data[i] * k + ema[i - 1] * (1 - k)
+    return ema
+
+
 def _compute_macd(closes: list[float], fast: int = 12, slow: int = 26, signal: int = 9) -> tuple[list[float], list[float], list[float]]:
     """
     计算 MACD
@@ -1464,11 +1476,13 @@ def pool_technical(code: str, klines: list[dict], name: str = "",
 def _screen_unified(candidates: list[dict], tencent_map: dict, em_data: dict = None,
                     kline_map: dict = None) -> list[dict]:
     """
-    统一筛选策略 —— 调用策略池1(基础) + 策略池2(量价)
-    策略池3(趋势) 和 策略池4(技术) 在后续K线阶段调用
+    统一筛选策略 —— 策略池OR逻辑
+    ─────────────────────────────
+    策略池1(基础池) 为硬性前置门槛，不通过直接淘汰。
+    通过基础池后，策略池2(量价)、策略池3(趋势)、策略池4(技术) 任一通过即可入选。
+    （策略池3/4在此阶段仅做非K线预检，完整检查在后续K线阶段补充）
 
     策略池1 · 基础池：主板 / 去ST / 流通市值35.99~999.99亿 / 股价<60 / 均价线之上
-              / 昨额>涨停额 / 7天涨幅<35% / 去连板 / 最低<昨收 / 股价>昨开 / 股价>昨收 / 5分钟额>3000万
     策略池2 · 量价池：主板 / 非ST / 涨幅>1% / 市值<700亿 / 前一日未涨停 / 非盘中下跌
               / 金额比>1.5 / 换手率>0.11% / 量比>5 / 3日涨幅<15% / 竞价量>4万手
     策略池3 · 趋势池：主板 / 非ST / 涨幅3-10% / 120日内有涨停 / 市值<1000亿 / 前一日未涨停
@@ -1507,7 +1521,7 @@ def _screen_unified(candidates: list[dict], tencent_map: dict, em_data: dict = N
         # 开盘5分钟成交金额（实时数据，腾讯/东财接口可能提供）
         amount_5min = 0
 
-        # ---- 策略池1 · 基础池（非K线部分）----
+        # ---- 策略池1 · 基础池（非K线部分）—— 硬性前置门槛 ----
         ok, reason = pool_base(code, name, c["price"], market_cap_yi,
                                avg_price=avg_price, yesterday_amount=yesterday_amount,
                                last_limit_amount=last_limit_amount, amount_5min=amount_5min)
@@ -1517,15 +1531,58 @@ def _screen_unified(candidates: list[dict], tencent_map: dict, em_data: dict = N
 
         # ---- 策略池2 · 量价池 ----
         klines_for_pool2 = (kline_map or {}).get(code, [])
-        ok, reason = pool_volume_price(c, tc, em, klines=klines_for_pool2)
-        if not ok:
-            _diag[f"量价池:{reason}"] = _diag.get(f"量价池:{reason}", 0) + 1
+        ok2, reason2 = pool_volume_price(c, tc, em, klines=klines_for_pool2)
+
+        # ---- 策略池3 · 趋势池（非K线预检部分）----
+        # 完整的趋势池检查需要K线数据，在后续阶段做；此处做基础条件预检
+        ok3_pre = True
+        reason3_pre = ""
+        if not code.startswith(("60", "00")):
+            ok3_pre = False; reason3_pre = "非主板"
+        elif "ST" in name.upper():
+            ok3_pre = False; reason3_pre = "ST"
+        elif c["auction_gain"] <= 3 or c["auction_gain"] >= 10:
+            ok3_pre = False; reason3_pre = "涨幅不在3-10%"
+        elif c["open_price"] < c["prev_close"]:
+            ok3_pre = False; reason3_pre = "盘中下跌"
+        elif c["open_price"] <= c["prev_close"]:
+            ok3_pre = False; reason3_pre = "未高开"
+
+        # ---- 策略池4 · 技术池（非K线预检部分）----
+        # 完整的技术池检查需要K线数据，在后续阶段做；此处做基础条件预检
+        ok4_pre = True
+        reason4_pre = ""
+        if not code.startswith(("60", "00")):
+            ok4_pre = False; reason4_pre = "非主板"
+        elif "ST" in name.upper():
+            ok4_pre = False; reason4_pre = "ST"
+        elif c["price"] >= 120:
+            ok4_pre = False; reason4_pre = "价格≥120"
+        if market_cap_yi >= 400:
+            ok4_pre = False; reason4_pre = "市值≥400亿"
+
+        # ---- OR逻辑：量价池/趋势池/技术池 任一通过即可 ----
+        passed_pools = []
+        if ok2:
+            passed_pools.append("量价池")
+        if ok3_pre:
+            passed_pools.append("趋势池")
+        if ok4_pre:
+            passed_pools.append("技术池")
+
+        if not passed_pools:
+            # 三个策略池都不通过，记录诊断
+            if not ok2:
+                _diag[f"量价池:{reason2}"] = _diag.get(f"量价池:{reason2}", 0) + 1
+            # 趋势池和技术池的完整诊断在K线阶段输出
             continue
 
         # 补充 market_cap_yi
         if market_cap_yi > 0:
             c["market_cap_yi"] = market_cap_yi
 
+        # 记录通过的策略池
+        c["passed_pools"] = passed_pools
         filtered.append(c)
 
     # 输出诊断信息
@@ -1666,14 +1723,16 @@ def screen_mainboard_strategy() -> list[dict]:
     2. 优先在涨停最多的板块里筛选
     3. 结果按板块涨停数 + 频次排列
 
-    四大策略池串联筛选：
-      策略池1 · 基础池：主板 / 去ST / 流通市值35.99~999.99亿 / 股价<60 / 均价线之上
+    四大策略池 OR 逻辑筛选（满足任意一个策略池即可入选）：
+      策略池1 · 基础池（硬性门槛）：主板 / 去ST / 流通市值35.99~999.99亿 / 股价<60 / 均价线之上
                 / 昨额>涨停额 / 7天涨幅<35% / 去连板 / 最低<昨收 / 股价>昨开 / 股价>昨收 / 5分钟额>3000万
       策略池2 · 量价池：主板 / 非ST / 涨幅>1% / 市值<700亿 / 前一日未涨停 / 非盘中下跌
                 / 金额比>1.5 / 换手率>0.11% / 量比>5 / 3日涨幅<15% / 竞价量>4万手（涨幅从大到小排名）
       策略池3 · 趋势池：主板 / 非ST / 涨幅3-10% / 120日内有涨停 / 市值<1000亿 / 前一日未涨停
                 / 非盘中下跌 / 高开 / 量比>3 / 换手率>0.1%（涨幅从大到小排名）
       策略池4 · 技术池：主板 / 非ST / 120分钟MACD↑ / 市值<400亿 / 价格<120 / 月MACD红柱↑ / 周MACD红柱↑ / 2月内有涨停
+
+      通过基础池后，策略池2/3/4 任一通过即可进入股票池。
     """
     # ========== 第一步：获取板块及股票 ==========
     # 检查是否在竞价时段
@@ -1877,8 +1936,9 @@ def screen_mainboard_strategy() -> list[dict]:
     if not filtered:
         return []
 
-    # ========== 第八步：策略池3(趋势) + 策略池4(技术) 检查 ==========
-    print("📊 执行策略池3(趋势) + 策略池4(技术) 检查...")
+    # ========== 第八步：策略池OR逻辑检查 ==========
+    # 基础池(K线部分) 为硬性门槛；通过后 趋势池/技术池 任一通过即可入选
+    print("📊 执行策略池OR逻辑检查（基础池门槛 + 趋势池/技术池 任一通过即可）...")
 
     final = []
     _base_diag = {}
@@ -1895,35 +1955,51 @@ def screen_mainboard_strategy() -> list[dict]:
                 if real_prev_close > 0:
                     c["prev_close"] = real_prev_close
                     c["auction_gain"] = round((c["price"] - real_prev_close) / real_prev_close * 100, 2)
-                    # 修正后重新验证涨幅范围（3%-10%），不降低策略严格性
-                    if c["auction_gain"] <= 3 or c["auction_gain"] >= 10:
-                        continue
             except (ValueError, TypeError):
                 pass
 
-        # ---- 策略池1 · 基础池（K线部分）----
-        ok, reason = pool_base_post_kline(code, c["price"], klines,
-                                          c.get("prev_close", 0),
-                                          c.get("yesterday_amount", 0))
-        if not ok:
-            _base_diag[reason] = _base_diag.get(reason, 0) + 1
+        # ---- 策略池1 · 基础池（K线部分）—— 硬性门槛 ----
+        ok_base_kline, reason_base = pool_base_post_kline(code, c["price"], klines,
+                                                           c.get("prev_close", 0),
+                                                           c.get("yesterday_amount", 0))
+        if not ok_base_kline:
+            _base_diag[reason_base] = _base_diag.get(reason_base, 0) + 1
             continue
 
         # ---- 策略池3 · 趋势池 ----
         tc = tencent_map.get(code, {})
         em = em_data.get(code, {})
-        ok, reason = pool_trend(c, klines, tc=tc, em=em)
-        if not ok:
-            _trend_diag[reason] = _trend_diag.get(reason, 0) + 1
-            continue
+        ok_trend, reason_trend = pool_trend(c, klines, tc=tc, em=em)
 
         # ---- 策略池4 · 技术池 ----
-        ok, reason = pool_technical(code, klines, name=c.get("name", ""),
-                                    price=c["price"], market_cap_yi=c.get("market_cap_yi", 0))
-        if not ok:
-            _tech_diag[reason] = _tech_diag.get(reason, 0) + 1
+        ok_tech, reason_tech = pool_technical(code, klines, name=c.get("name", ""),
+                                              price=c["price"], market_cap_yi=c.get("market_cap_yi", 0))
+
+        # ---- 策略池2 · 量价池（K线补充后重新检查）----
+        ok_vp, reason_vp = pool_volume_price(c, tc, em, klines=klines)
+
+        # ---- OR逻辑：量价池/趋势池/技术池 任一通过即可 ----
+        passed_pools = c.get("passed_pools", [])
+        # 更新策略池通过状态（K线数据补充后更准确）
+        passed_pools_kline = []
+        if ok_vp:
+            passed_pools_kline.append("量价池")
+        if ok_trend:
+            passed_pools_kline.append("趋势池")
+        if ok_tech:
+            passed_pools_kline.append("技术池")
+
+        if not passed_pools_kline:
+            # 三个策略池都不通过
+            if not ok_vp:
+                _trend_diag[f"量价池:{reason_vp}"] = _trend_diag.get(f"量价池:{reason_vp}", 0) + 1
+            if not ok_trend:
+                _trend_diag[f"趋势池:{reason_trend}"] = _trend_diag.get(f"趋势池:{reason_trend}", 0) + 1
+            if not ok_tech:
+                _tech_diag[f"技术池:{reason_tech}"] = _tech_diag.get(f"技术池:{reason_tech}", 0) + 1
             continue
 
+        c["passed_pools"] = passed_pools_kline
         c["change_pct"] = c["auction_gain"]
         final.append(c)
 
@@ -1934,10 +2010,10 @@ def screen_mainboard_strategy() -> list[dict]:
         for reason, cnt in sorted(_base_diag.items(), key=lambda x: -x[1]):
             print(f"    ❌ {reason}: {cnt} 只")
 
-    # 输出趋势池/技术池诊断
+    # 输出趋势池/技术池/量价池诊断
     if _trend_diag:
         total = sum(_trend_diag.values())
-        print(f"  📋 趋势池淘汰 ({total} 只):")
+        print(f"  📋 量价/趋势池淘汰 ({total} 只):")
         for reason, cnt in sorted(_trend_diag.items(), key=lambda x: -x[1]):
             print(f"    ❌ {reason}: {cnt} 只")
     if _tech_diag:
@@ -1997,6 +2073,91 @@ def screen_mainboard_strategy() -> list[dict]:
     final.sort(key=lambda x: (-x["auction_gain"], -x.get("sector_limit_count", 0), -x.get("frequency", 0)))
 
     print(f"\n  ✅ 最终筛选: {len(final)} 只股票")
+
+    # 输出策略池命中分布
+    pool_counts = {}
+    for c in final:
+        for p in c.get("passed_pools", []):
+            pool_counts[p] = pool_counts.get(p, 0) + 1
+    if pool_counts:
+        print("  📊 策略池命中分布:")
+        for p, cnt in sorted(pool_counts.items(), key=lambda x: -x[1]):
+            print(f"    ✅ {p}: {cnt} 只")
+
+    # ========== 第十步半：策略池4(技术池)深度分析 ==========
+    # 对所有最终入选股票再过一遍技术池，标注MACD共振状态
+    print(f"\n📊 执行策略池4(技术池)深度分析（{len(final)} 只）...")
+    _tech_pass = 0
+    _tech_fail = 0
+    for c in final:
+        code = c["code"]
+        klines = kline_map_all.get(code, [])
+        tc = tencent_map.get(code, {})
+        em = em_data.get(code, {})
+
+        ok_tech, reason_tech = pool_technical(code, klines, name=c.get("name", ""),
+                                              price=c["price"], market_cap_yi=c.get("market_cap_yi", 0))
+        c["tech_pool_pass"] = ok_tech
+        c["tech_pool_reason"] = reason_tech if not ok_tech else ""
+
+        # 详细技术指标分析
+        if klines and len(klines) >= 60:
+            try:
+                closes = [float(k.get("close", 0)) for k in klines]
+                # 120分钟MACD（用日线近似：2倍快慢线参数）
+                ema12 = _ema(closes, 12)
+                ema26 = _ema(closes, 26)
+                dif = [a - b for a, b in zip(ema12, ema26)]
+                dea = _ema(dif, 9)
+                macd_bar = [(d - e) * 2 for d, e in zip(dif, dea)]
+                c["macd_dif"] = round(dif[-1], 3) if dif else 0
+                c["macd_dea"] = round(dea[-1], 3) if dea else 0
+                c["macd_bar"] = round(macd_bar[-1], 3) if macd_bar else 0
+                c["macd_trend"] = "↑" if len(macd_bar) >= 2 and macd_bar[-1] > macd_bar[-2] else "↓"
+
+                # 周MACD红柱（用5日周期近似）
+                weekly_closes = closes[-5*12:] if len(closes) >= 60 else closes
+                w_ema12 = _ema(weekly_closes, 12)
+                w_ema26 = _ema(weekly_closes, 26)
+                w_dif = [a - b for a, b in zip(w_ema12, w_ema26)]
+                w_dea = _ema(w_dif, 9)
+                w_bar = [(d - e) * 2 for d, e in zip(w_dif, w_dea)]
+                c["weekly_macd_bar"] = round(w_bar[-1], 3) if w_bar else 0
+                c["weekly_macd_growing"] = len(w_bar) >= 2 and w_bar[-1] > w_bar[-2]
+
+                # 月MACD红柱（用20日周期近似）
+                month_closes = closes[-20*12:] if len(closes) >= 240 else closes
+                m_ema12 = _ema(month_closes, 12)
+                m_ema26 = _ema(month_closes, 26)
+                m_dif = [a - b for a, b in zip(m_ema12, m_ema26)]
+                m_dea = _ema(m_dif, 9)
+                m_bar = [(d - e) * 2 for d, e in zip(m_dif, m_dea)]
+                c["monthly_macd_bar"] = round(m_bar[-1], 3) if m_bar else 0
+                c["monthly_macd_up"] = len(m_bar) >= 2 and m_bar[-1] > m_bar[-2]
+
+                # 2个月内涨停次数
+                limit_up_count = 0
+                limit_pct = 9.5
+                for i in range(max(0, len(klines) - 42), len(klines)):
+                    if i < 1:
+                        continue
+                    pc = float(klines[i-1].get("close", 0))
+                    cc = float(klines[i].get("close", 0))
+                    if pc > 0 and (cc - pc) / pc * 100 >= limit_pct:
+                        limit_up_count += 1
+                c["limit_up_60d"] = limit_up_count
+
+            except Exception:
+                pass
+
+        if ok_tech:
+            _tech_pass += 1
+        else:
+            _tech_fail += 1
+
+    print(f"  ✅ 技术池通过: {_tech_pass} 只")
+    if _tech_fail > 0:
+        print(f"  ⚠  技术池未通过: {_tech_fail} 只（已标注，可参考但不淘汰）")
 
     # 输出板块分布统计
     sector_result = {}
@@ -2240,34 +2401,48 @@ def _screen_fallback_all_market() -> list[dict]:
                 if real_prev_close > 0:
                     c["prev_close"] = real_prev_close
                     c["auction_gain"] = round((c["price"] - real_prev_close) / real_prev_close * 100, 2)
-                    if c["auction_gain"] <= 3 or c["auction_gain"] >= 10:
-                        continue
             except (ValueError, TypeError):
                 pass
 
-        # ---- 策略池1 · 基础池（K线部分）----
-        ok, reason = pool_base_post_kline(code, c["price"], klines,
-                                          c.get("prev_close", 0),
-                                          c.get("yesterday_amount", 0))
-        if not ok:
-            _base_diag[reason] = _base_diag.get(reason, 0) + 1
+        # ---- 策略池1 · 基础池（K线部分）—— 硬性门槛 ----
+        ok_base_kline, reason_base = pool_base_post_kline(code, c["price"], klines,
+                                                           c.get("prev_close", 0),
+                                                           c.get("yesterday_amount", 0))
+        if not ok_base_kline:
+            _base_diag[reason_base] = _base_diag.get(reason_base, 0) + 1
             continue
 
         # ---- 策略池3 · 趋势池 ----
         tc = tencent_map.get(code, {})
         em = em_data.get(code, {})
-        ok, reason = pool_trend(c, klines, tc=tc, em=em)
-        if not ok:
-            _trend_diag[reason] = _trend_diag.get(reason, 0) + 1
-            continue
+        ok_trend, reason_trend = pool_trend(c, klines, tc=tc, em=em)
 
         # ---- 策略池4 · 技术池 ----
-        ok, reason = pool_technical(code, klines, name=c.get("name", ""),
-                                    price=c["price"], market_cap_yi=c.get("market_cap_yi", 0))
-        if not ok:
-            _tech_diag[reason] = _tech_diag.get(reason, 0) + 1
+        ok_tech, reason_tech = pool_technical(code, klines, name=c.get("name", ""),
+                                              price=c["price"], market_cap_yi=c.get("market_cap_yi", 0))
+
+        # ---- 策略池2 · 量价池（K线补充后重新检查）----
+        ok_vp, reason_vp = pool_volume_price(c, tc, em, klines=klines)
+
+        # ---- OR逻辑：量价池/趋势池/技术池 任一通过即可 ----
+        passed_pools_kline = []
+        if ok_vp:
+            passed_pools_kline.append("量价池")
+        if ok_trend:
+            passed_pools_kline.append("趋势池")
+        if ok_tech:
+            passed_pools_kline.append("技术池")
+
+        if not passed_pools_kline:
+            if not ok_vp:
+                _trend_diag[f"量价池:{reason_vp}"] = _trend_diag.get(f"量价池:{reason_vp}", 0) + 1
+            if not ok_trend:
+                _trend_diag[f"趋势池:{reason_trend}"] = _trend_diag.get(f"趋势池:{reason_trend}", 0) + 1
+            if not ok_tech:
+                _tech_diag[f"技术池:{reason_tech}"] = _tech_diag.get(f"技术池:{reason_tech}", 0) + 1
             continue
 
+        c["passed_pools"] = passed_pools_kline
         c["change_pct"] = c["auction_gain"]
         final.append(c)
 
@@ -2279,7 +2454,7 @@ def _screen_fallback_all_market() -> list[dict]:
 
     if _trend_diag:
         total = sum(_trend_diag.values())
-        print(f"  📋 趋势池淘汰 ({total} 只):")
+        print(f"  📋 量价/趋势池淘汰 ({total} 只):")
         for reason, cnt in sorted(_trend_diag.items(), key=lambda x: -x[1]):
             print(f"    ❌ {reason}: {cnt} 只")
     if _tech_diag:
@@ -2389,20 +2564,29 @@ def _compute_screen_strategy(s: dict) -> str:
     chg = s.get("auction_gain", 0)
     vr = s.get("volume_ratio", 0)
     rr = s.get("remaining_rate", 50)
+    pools = s.get("passed_pools", [])
 
+    # 基础策略标签
     if chg >= 9.5:
-        return "一字板/涨停"
-    if chg >= 7 and vr >= 5:
-        return "5w首板、新首板"
-    if chg >= 5 and vr >= 5 and rr >= 55:
-        return "5w首板、新首板"
-    if chg >= 5:
-        return "新首板"
-    if chg >= 3 and vr >= 5 and rr >= 55:
-        return "新首板"
-    if chg >= 3:
-        return "四万首板"
-    return "三万首板"
+        base = "一字板/涨停"
+    elif chg >= 7 and vr >= 5:
+        base = "5w首板、新首板"
+    elif chg >= 5 and vr >= 5 and rr >= 55:
+        base = "5w首板、新首板"
+    elif chg >= 5:
+        base = "新首板"
+    elif chg >= 3 and vr >= 5 and rr >= 55:
+        base = "新首板"
+    elif chg >= 3:
+        base = "四万首板"
+    else:
+        base = "三万首板"
+
+    # 追加策略池来源标记
+    if pools:
+        pool_tags = "/".join(pools)
+        return f"{base} [{pool_tags}]"
+    return base
 
 
 def save_screen_html(stocks: list[dict], indices: list[dict], path: str) -> str:
@@ -2471,6 +2655,12 @@ def save_screen_html(stocks: list[dict], indices: list[dict], path: str) -> str:
 <td style="color:{v_color};background:{v_bg};border-radius:4px;font-weight:600;padding:4px 8px">{verdict}</td>
 <td>{freq}</td>
 <td style="text-align:left;font-size:12px">{strategy}</td>
+<td>{'✅' if s.get("tech_pool_pass") else '❌'}</td>
+<td style="font-size:11px">{s.get("macd_dif", 0):.3f}</td>
+<td style="font-size:11px">{s.get("macd_dea", 0):.3f}</td>
+<td style="font-size:11px;color:{'#f85149' if s.get('macd_bar', 0) > 0 else '#3fb950'}">{s.get("macd_bar", 0):.3f}</td>
+<td>{s.get("macd_trend", "-")}</td>
+<td>{s.get("limit_up_60d", 0)}</td>
 </tr>"""
 
     # 板块分布统计
@@ -2523,6 +2713,7 @@ tr:hover{{background:#161b22}}
 <th>代码</th><th>名称</th><th>板块(涨停数)</th><th>龙头次数</th><th>09:25</th><th>09:26</th><th>搓合量</th>
 <th>竞昨比</th><th>剩余率</th><th>09:26涨幅</th>
 <th>筹码判断</th><th>频次</th><th>策略</th>
+<th>技术池</th><th>DIF</th><th>DEA</th><th>BAR</th><th>趋势</th><th>60日涨停</th>
 </tr></thead>
 <tbody>{rows}</tbody>
 </table></div>
@@ -2576,10 +2767,16 @@ def main():
 
         # 输出结果
         if not args.quiet:
-            print(f"\n{'─'*120}")
-            print(f"  {'#':>3}  {'代码':<8} {'名称':<8} {'板块':<10} {'龙头':>4} {'09:25':>7} {'09:26':>7} {'搓合量':>8} {'竞昨比':>7} {'剩余率':>7} {'涨幅':>7} {'筹码':<6} {'频次':>4} {'策略':<12}")
-            print(f"{'─'*120}")
-            for i, s in enumerate(stocks, 1):
+            # 分离技术池通过和未通过的股票
+            tech_pass_stocks = [s for s in stocks if s.get("tech_pool_pass")]
+            tech_fail_stocks = [s for s in stocks if not s.get("tech_pool_pass")]
+
+            print(f"\n{'─'*140}")
+            print(f"  {'#':>3}  {'代码':<8} {'名称':<8} {'板块':<10} {'龙头':>4} {'09:25':>7} {'09:26':>7} {'搓合量':>8} {'竞昨比':>7} {'剩余率':>7} {'涨幅':>7} {'筹码':<6} {'频次':>4} {'策略':<16} {'技术池':<6} {'DIF':>7} {'DEA':>7} {'BAR':>7} {'趋势':>4} {'60日涨停':>6}")
+            print(f"{'─'*140}")
+
+            print(f"  ── 技术池通过 ({len(tech_pass_stocks)} 只) ──")
+            for i, s in enumerate(tech_pass_stocks, 1):
                 vol_fmt = _format_volume(s.get("auction_vol", s.get("volume", 0)))
                 chg_0926 = s.get("chg_0926", 0)
                 comp_ratio = s.get("comp_ratio", 0)
@@ -2591,8 +2788,36 @@ def main():
                 is_leader = s.get("is_leader", False)
                 leader_count = s.get("leader_count", 0)
                 leader_mark = f"🏆{leader_count}" if is_leader else f"  {leader_count}"
-                print(f"  {i:>3}  {s['code']:<8} {s['name']:<8} {sector:<10} {leader_mark:>4} {s.get('auction_price', s['price']):>7.2f} {s.get('price_0926', s['price']):>7.2f} {vol_fmt:>8} {comp_ratio:>6.1f}% {remaining:>6.1f}% {chg_0926:>+6.2f}% {verdict:<6} {freq:>4} {strategy:<12}")
-            print(f"{'─'*120}")
+                dif = s.get("macd_dif", 0)
+                dea = s.get("macd_dea", 0)
+                bar = s.get("macd_bar", 0)
+                trend = s.get("macd_trend", "-")
+                limit_cnt = s.get("limit_up_60d", 0)
+                print(f"  {i:>3}  {s['code']:<8} {s['name']:<8} {sector:<10} {leader_mark:>4} {s.get('auction_price', s['price']):>7.2f} {s.get('price_0926', s['price']):>7.2f} {vol_fmt:>8} {comp_ratio:>6.1f}% {remaining:>6.1f}% {chg_0926:>+6.2f}% {verdict:<6} {freq:>4} {strategy:<16} {'✅':<6} {dif:>7.3f} {dea:>7.3f} {bar:>7.3f} {trend:>4} {limit_cnt:>6}")
+
+            if tech_fail_stocks:
+                print(f"\n  ── 技术池未通过 ({len(tech_fail_stocks)} 只，仅供参考) ──")
+                for i, s in enumerate(tech_fail_stocks, len(tech_pass_stocks) + 1):
+                    vol_fmt = _format_volume(s.get("auction_vol", s.get("volume", 0)))
+                    chg_0926 = s.get("chg_0926", 0)
+                    comp_ratio = s.get("comp_ratio", 0)
+                    remaining = s.get("remaining_rate", 50)
+                    verdict = s.get("verdict", "正常")
+                    freq = s.get("frequency", 0)
+                    strategy = s.get("strategy", "观望")
+                    sector = s.get("sector", "-")[:8]
+                    is_leader = s.get("is_leader", False)
+                    leader_count = s.get("leader_count", 0)
+                    leader_mark = f"🏆{leader_count}" if is_leader else f"  {leader_count}"
+                    dif = s.get("macd_dif", 0)
+                    dea = s.get("macd_dea", 0)
+                    bar = s.get("macd_bar", 0)
+                    trend = s.get("macd_trend", "-")
+                    limit_cnt = s.get("limit_up_60d", 0)
+                    tech_reason = s.get("tech_pool_reason", "")
+                    print(f"  {i:>3}  {s['code']:<8} {s['name']:<8} {sector:<10} {leader_mark:>4} {s.get('auction_price', s['price']):>7.2f} {s.get('price_0926', s['price']):>7.2f} {vol_fmt:>8} {comp_ratio:>6.1f}% {remaining:>6.1f}% {chg_0926:>+6.2f}% {verdict:<6} {freq:>4} {strategy:<16} {'❌':<6} {dif:>7.3f} {dea:>7.3f} {bar:>7.3f} {trend:>4} {limit_cnt:>6}  {tech_reason}")
+
+            print(f"{'─'*140}")
 
         # 保存HTML
         html_path = args.html if args.html != "auction_report.html" else "screen_report.html"
