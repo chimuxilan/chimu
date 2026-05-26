@@ -1168,14 +1168,13 @@ def _screen_unified(candidates: list[dict], tencent_map: dict, em_data: dict = N
             _diag["昨成交量>0"] = _diag.get("昨成交量>0", 0) + 1
             continue
 
-        # ---- 条件11: 集合竞价量比 > 5（优先用腾讯API值）----
-        volume_ratio = tc.get("volume_ratio_api", 0) or em.get("volume_ratio", 0)
-        if volume_ratio <= 0:
-            # fallback: 用竞价量 / (5日均量 × 竞价占比估算)
-            # 竞价时段约占全天 10/240 ≈ 4.2%，取 5日均量×0.05 作为分母
-            avg_daily_vol = yesterday_vol_lots  # 近似用昨日量
-            est_auction_avg = avg_daily_vol * 0.05
-            volume_ratio = auction_vol / est_auction_avg if est_auction_avg > 0 else 0
+        # ---- 条件11: 集合竞价量比 > 5 ----
+        # 注意：腾讯API的 volume_ratio_api（字段49）是全天量比，不是竞价量比
+        # 集合竞价量比 = 今日竞价量 / 近5日竞价平均量
+        # 竞价时段(09:15-09:25)约占全天 10/240 ≈ 4.17%，用昨日全天量×0.0417 近似竞价均量
+        avg_daily_vol = yesterday_vol_lots  # 近似用昨日量作为5日均量
+        est_auction_avg = avg_daily_vol * (10 / 240)  # 竞价时间占比
+        volume_ratio = auction_vol / est_auction_avg if est_auction_avg > 0 else 0
         if volume_ratio <= 5:
             _diag["量比>5"] = _diag.get("量比>5", 0) + 1
             continue
