@@ -21,12 +21,100 @@ import argparse
 import html as html_module
 import os
 import sys
+import time
+import random
 import concurrent.futures
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     "Referer": "https://quote.eastmoney.com/",
+    "Accept": "*/*",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "Connection": "keep-alive",
 }
+
+# 东方财富接口专用：显式禁用代理（防止透明代理干扰HTTPS连接）
+NO_PROXY = {"http": None, "https": None}
+
+
+# ============================================================
+# 全局 Session（连接池 + 自动重试）
+# ============================================================
+def _create_session() -> requests.Session:
+    """
+    创建带连接池和自动重试的 Session。
+    - 连接池复用 TCP 连接，避免每次请求都新建连接
+    - 自动重试应对临时性的连接中断和 429/503 响应
+    """
+    s = requests.Session()
+    s.headers.update(HEADERS)
+    s.trust_env = False
+
+    retry = Retry(
+        total=4,
+        backoff_factor=1.5,
+        backoff_jitter=0.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "POST"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(
+        max_retries=retry,
+        pool_connections=20,
+        pool_maxsize=30,
+        pool_block=True,
+    )
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
+
+
+SESSION = _create_session()
+
+
+def _em_session() -> requests.Session:
+    """
+    东方财富专用 Session（独立连接池）。
+    """
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "Referer": "https://quote.eastmoney.com/center/boardlist.html",
+        "Accept": "*/*",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Connection": "keep-alive",
+    })
+    s.trust_env = False
+
+    retry = Retry(
+        total=4,
+        backoff_factor=1.5,
+        backoff_jitter=0.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "POST"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(
+        max_retries=retry,
+        pool_connections=20,
+        pool_maxsize=30,
+        pool_block=True,
+    )
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
+
+
+EM_SESSION = _em_session()
+
+
+def _sleep_backoff(attempt: int, base: float = 2.0, jitter: float = 1.0):
+    """指数退避 + 随机抖动"""
+    delay = base * (2 ** attempt) + random.uniform(0, jitter)
+    time.sleep(delay)
 
 
 # ============================================================
@@ -40,10 +128,10 @@ def search_stock_code(keyword: str) -> Optional[dict]:
     # 腾讯智能提示接口
     # 格式: v_hint="sh~600519~\\u8d35\\u5dde\\u8305\\u53f0~gzmt~GP-A"
     try:
-        r = requests.get(
+        r = SESSION.get(
             "https://smartbox.gtimg.cn/s3/",
             params={"v": "2", "q": keyword, "t": "gp"},
-            headers=HEADERS, timeout=10,
+            timeout=10,
         )
         text = r.content.decode("gbk", errors="replace")
         for line in text.strip().split("\n"):
@@ -69,7 +157,7 @@ def search_stock_code(keyword: str) -> Optional[dict]:
 
     # 新浪搜索接口（备用）
     try:
-        r = requests.get(
+        r = SESSION.get(
             "https://suggest3.sinajs.cn/suggest/key=" + keyword,
             headers={"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn/"},
             timeout=10,
@@ -174,7 +262,7 @@ def _ocr_via_mimo(image_path: str, api_key: str) -> list[str]:
             ]}],
             "max_tokens": 4096,
         }
-        resp = requests.post(api_url, headers={"api-key": api_key, "Content-Type": "application/json"},
+        resp = SESSION.post(api_url, headers={"api-key": api_key, "Content-Type": "application/json"},
                              json=body, timeout=120)
         if resp.status_code == 200:
             text = resp.json().get("choices", [{}])[0].get("message", {}).get("content", "")
@@ -246,7 +334,7 @@ def fetch_quotes(codes: list[str]) -> dict:
     """批量获取腾讯实时行情"""
     symbols = ",".join(_to_tencent(c) for c in codes)
     try:
-        r = requests.get(f"https://qt.gtimg.cn/q={symbols}", headers=HEADERS, timeout=15)
+        r = SESSION.get(f"https://qt.gtimg.cn/q={symbols}", timeout=15)
         r.encoding = "gbk"
     except Exception as e:
         print(f"  ⚠ 行情请求失败: {e}")
@@ -283,11 +371,58 @@ def fetch_quotes(codes: list[str]) -> dict:
 
 
 def fetch_hist(code: str, days: int = 10) -> list[dict]:
-    """获取近期日K线（带重试）"""
-    # 尝试新浪接口（带重试）
+    """
+    获取近期日K线（带重试）
+    优先使用东方财富接口（含成交额amount和换手率turnover），
+    失败时回退到新浪/腾讯接口（不含amount，由调用方自行补充）
+    """
+    # 第一选择：东方财富日K线（含成交额）
     for attempt in range(2):
         try:
-            r = requests.get(
+            secid = f"1.{code}" if code.startswith(("6", "9")) else f"0.{code}"
+            r = EM_SESSION.get(
+                "https://push2his.eastmoney.com/api/qt/stock/kline/get",
+                params={
+                    "secid": secid,
+                    "fields1": "f1,f2,f3,f4,f5,f6,f7,f8",
+                    "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+                    "klt": "101",      # 日K
+                    "fqt": "1",        # 前复权
+                    "lmt": str(days),
+                    "end": "20500101",
+                    "ut": "fa5fd1943c7b386f172d6893dbbd4dc0",
+                },
+                timeout=15,
+            )
+            if r.status_code == 200 and r.text:
+                data = r.json()
+                klines_raw = data.get("data", {}).get("klines", [])
+                if klines_raw:
+                    result = []
+                    for line in klines_raw:
+                        parts = line.split(",")
+                        if len(parts) >= 7:
+                            result.append({
+                                "day": parts[0],
+                                "open": parts[1],
+                                "close": parts[2],
+                                "high": parts[3],
+                                "low": parts[4],
+                                "volume": parts[5],       # 手
+                                "amount": parts[6],       # 元（成交额）
+                                "turnover": parts[10] if len(parts) >= 11 else "0",  # 换手率(%)
+                            })
+                    if result:
+                        return result
+        except Exception:
+            pass
+        if attempt == 0:
+            time.sleep(0.3)
+
+    # 第二选择：新浪接口（不含amount，向后兼容）
+    for attempt in range(2):
+        try:
+            r = SESSION.get(
                 "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData",
                 params={"symbol": _to_tencent(code), "scale": "240", "ma": "no", "datalen": days},
                 headers={"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn/"},
@@ -300,17 +435,17 @@ def fetch_hist(code: str, days: int = 10) -> list[dict]:
         except Exception:
             pass
         if attempt == 0:
-            import time; time.sleep(0.3)
+            time.sleep(0.3)
 
-    # 备用：腾讯接口
+    # 第三选择：腾讯接口（不含amount，兜底）
     try:
         sym = _to_tencent(code)
         end = datetime.now().strftime("%Y-%m-%d")
         start = (datetime.now() - timedelta(days=days * 2)).strftime("%Y-%m-%d")
-        r = requests.get(
+        r = SESSION.get(
             "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
             params={"param": f"{sym},day,{start},{end},{days},qfq", "_var": "kline_dayqfq"},
-            headers=HEADERS, timeout=15,
+            timeout=15,
         )
         txt = r.text.split("=", 1)[1] if "=" in r.text else r.text
         data = json.loads(txt)
@@ -320,6 +455,52 @@ def fetch_hist(code: str, days: int = 10) -> list[dict]:
     except Exception as e:
         print(f"  ⚠ 腾讯K线接口异常({code}): {e}")
     return []
+
+
+def _fetch_5min_opening_amount(codes: list[str]) -> dict:
+    """
+    批量获取开盘5分钟成交金额（东方财富5分钟K线接口）
+    返回: {code: amount_in_yuan}  未获取到的不包含在结果中
+    仅在09:30之后有数据，竞价时段返回空
+    """
+    result = {}
+    batch_size = 30
+    for i in range(0, len(codes), batch_size):
+        batch = codes[i:i + batch_size]
+        for code in batch:
+            secid = f"1.{code}" if code.startswith(("6", "9")) else f"0.{code}"
+            for attempt in range(2):
+                try:
+                    r = EM_SESSION.get(
+                        "https://push2his.eastmoney.com/api/qt/stock/kline/get",
+                        params={
+                            "secid": secid,
+                            "fields1": "f1,f2,f3,f4,f5,f6,f7,f8",
+                            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+                            "klt": "5",         # 5分钟K
+                            "fqt": "1",
+                            "lmt": "48",        # 最近48根（覆盖开盘时段）
+                            "end": "20500101",
+                            "ut": "fa5fd1943c7b386f172d6893dbbd4dc0",
+                        },
+                        timeout=10,
+                    )
+                    if r.status_code == 200 and r.text:
+                        data = r.json()
+                        klines_raw = data.get("data", {}).get("klines", [])
+                        if klines_raw:
+                            # 取第一根5分钟K线的成交额（即开盘5分钟）
+                            parts = klines_raw[0].split(",")
+                            if len(parts) >= 7:
+                                amount = float(parts[6])  # 元
+                                if amount > 0:
+                                    result[code] = amount
+                        break
+                except Exception:
+                    pass
+                _sleep_backoff(attempt, base=0.5, jitter=0.3)
+        time.sleep(0.5)  # 批次间间隔
+    return result
 
 
 # ============================================================
@@ -718,9 +899,9 @@ def fetch_market_indices() -> list[dict]:
     results = []
     for name, symbol in index_map:
         try:
-            r = requests.get(
+            r = SESSION.get(
                 f"https://qt.gtimg.cn/q={symbol}",
-                headers=HEADERS, timeout=10,
+                timeout=10,
             )
             r.encoding = "gbk"
             m = re.search(r'v_\w+="(.+)"', r.text)
@@ -751,7 +932,7 @@ def fetch_all_ashare_codes() -> list[str]:
     page = 1
     while True:
         try:
-            r = requests.get(
+            r = SESSION.get(
                 "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData",
                 params={
                     "page": str(page), "num": "1000", "sort": "symbol",
@@ -803,7 +984,7 @@ def _fetch_kline_concurrent(codes: list[str], days: int = 5) -> dict:
         except Exception:
             return code, []
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
         futures = [executor.submit(_fetch_one, c) for c in codes]
         for future in concurrent.futures.as_completed(futures):
             code, hist = future.result()
@@ -891,7 +1072,7 @@ def fetch_kline_120min(code: str, count: int = 60) -> list[dict]:
     """
     sina_sym = f"sh{code}" if code.startswith("6") else f"sz{code}"
     try:
-        r = requests.get(
+        r = SESSION.get(
             "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData",
             params={"symbol": sina_sym, "scale": "60", "ma": "no", "datalen": count * 2},
             headers={"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn/"},
@@ -1043,10 +1224,6 @@ def _fetch_em_stock_details(codes: list[str]) -> dict:
     通过东方财富 push2 批量接口获取股票详细数据（市值、量比、换手率等）
     返回: {code: {"market_cap_yi": float, "volume_ratio": float, "turnover": float, "amount": float, "volume": int}}
     """
-    EM_HEADERS = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Referer": "https://quote.eastmoney.com/center/boardlist.html",
-    }
     result = {}
     # 构造 secids: 1.600519,0.000858 格式 (1=沪, 0=深, 0=创业板/科创板)
     secids = []
@@ -1059,17 +1236,17 @@ def _fetch_em_stock_details(codes: list[str]) -> dict:
         batch = secids[i:i + batch_size]
         resp_text = None
         last_err = ""
-        for attempt in range(3):
+        for attempt in range(5):
             try:
-                r = requests.get(
-                    "https://push2test.eastmoney.com/api/qt/ulist.np/get",
+                r = EM_SESSION.get(
+                    "https://push2.eastmoney.com/api/qt/ulist.np/get",
                     params={
                         "cb": "jQuery", "fltt": "2", "invt": "2",
                         "ut": "bd1d9ddb04089700cf9c27f6f7426281",
                         "secids": ",".join(batch),
                         "fields": "f2,f5,f6,f8,f12,f14,f20,f21,f49",
                     },
-                    headers=EM_HEADERS, timeout=20,
+                    timeout=20,
                 )
                 if r.status_code == 200 and r.text:
                     resp_text = r.text
@@ -1078,9 +1255,9 @@ def _fetch_em_stock_details(codes: list[str]) -> dict:
                     last_err = f"HTTP {r.status_code}"
             except Exception as e:
                 last_err = str(e)
-            import time; time.sleep(1.5 * (attempt + 1))
+            _sleep_backoff(attempt)
         if not resp_text:
-            print(f"  ⚠ 东方财富批量接口批次{i // batch_size + 1}失败(重试3次): {last_err}")
+            print(f"  ⚠ 东方财富批量接口批次{i // batch_size + 1}失败(重试5次): {last_err}")
             continue
         try:
             m = re.search(r"jQuery\((.+)\);", resp_text)
@@ -1109,7 +1286,7 @@ def _fetch_em_stock_details(codes: list[str]) -> dict:
                     continue
         except Exception as e:
             print(f"  ⚠ 东方财富批量接口批次{i // batch_size + 1}失败: {e}")
-        import time; time.sleep(2)  # 批次间间隔，避免限流
+        time.sleep(2)  # 批次间间隔，避免限流
 
     return result
 
@@ -1512,14 +1689,34 @@ def _screen_unified(candidates: list[dict], tencent_map: dict, em_data: dict = N
             if auction_vol > 0 and auction_amount > 0:
                 avg_price = auction_amount / auction_vol / 100  # 手→股
 
-        # 昨日成交金额（K线数据在后续阶段补充，此处为0）
+        # 昨日成交金额（从K线数据提取）
         yesterday_amount = 0
-
-        # 上次涨停日成交金额（K线数据在后续阶段补充，此处为0）
         last_limit_amount = 0
+        klines_for_base = (kline_map or {}).get(code, [])
+        if klines_for_base and len(klines_for_base) >= 2:
+            try:
+                y_amt = float(klines_for_base[-2].get("amount", 0))
+                if y_amt > 0:
+                    yesterday_amount = y_amt
+            except (ValueError, TypeError):
+                pass
+            # 上次涨停日成交金额
+            limit_pct = 10
+            threshold = limit_pct * 0.95
+            for i in range(len(klines_for_base) - 2, max(0, len(klines_for_base) - 62), -1):
+                if i < 1:
+                    break
+                try:
+                    prev_c = float(klines_for_base[i - 1].get("close", 0))
+                    curr_c = float(klines_for_base[i].get("close", 0))
+                    if prev_c > 0 and (curr_c - prev_c) / prev_c * 100 >= threshold:
+                        last_limit_amount = float(klines_for_base[i].get("amount", 0))
+                        break
+                except (ValueError, TypeError):
+                    continue
 
-        # 开盘5分钟成交金额（实时数据，腾讯/东财接口可能提供）
-        amount_5min = 0
+        # 开盘5分钟成交金额（由调用方从东方财富5分钟K线获取后写入候选数据）
+        amount_5min = c.get("amount_5min", 0)
 
         # ---- 策略池1 · 基础池（非K线部分）—— 硬性前置门槛 ----
         ok, reason = pool_base(code, name, c["price"], market_cap_yi,
@@ -1596,21 +1793,18 @@ def _screen_unified(candidates: list[dict], tencent_map: dict, em_data: dict = N
 
 def _fetch_sectors_with_stocks() -> dict:
     """
-    通过东方财富 push2test 接口获取行业板块列表及各板块下的股票
+    通过东方财富 push2 接口获取行业板块列表及各板块下的股票
     返回: {sector_name: {"code": sector_code, "stocks": [stock_items]}}
     """
-    EM_HEADERS = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Referer": "https://quote.eastmoney.com/center/boardlist.html",
-    }
     sectors = {}
 
     # 第一步：获取行业板块列表（涨停数倒序，取前50个板块）
     resp_text = None
-    for attempt in range(3):
+    last_err = ""
+    for attempt in range(5):
         try:
-            r = requests.get(
-                "https://push2test.eastmoney.com/api/qt/clist/get",
+            r = EM_SESSION.get(
+                "https://push2.eastmoney.com/api/qt/clist/get",
                 params={
                     "cb": "jQuery", "pn": "1", "pz": "50", "po": "1", "np": "1",
                     "ut": "bd1d9ddb04089700cf9c27f6f7426281",
@@ -1618,14 +1812,18 @@ def _fetch_sectors_with_stocks() -> dict:
                     "fs": "m:90+t:2+f:!50",
                     "fields": "f2,f3,f12,f14,f104,f105",
                 },
-                headers=EM_HEADERS, timeout=15,
+                timeout=15,
             )
             if r.status_code == 200 and r.text:
                 resp_text = r.text
                 break
-        except Exception:
-            pass
-        import time; time.sleep(1.0 * (attempt + 1))
+            else:
+                last_err = f"HTTP {r.status_code}"
+        except Exception as e:
+            last_err = str(e)
+        _sleep_backoff(attempt)
+    if not resp_text:
+        print(f"  ⚠ 东方财富板块列表获取失败(重试5次): {last_err}")
     if resp_text:
         try:
             m = re.search(r"jQuery\((.+)\);", resp_text)
@@ -1649,8 +1847,7 @@ def _fetch_sectors_with_stocks() -> dict:
         except Exception as e:
             print(f"  ⚠ 东方财富板块列表解析失败: {e}")
             return sectors
-    else:
-        print(f"  ⚠ 东方财富板块列表获取失败(重试3次)")
+    if not sectors:
         return sectors
 
     if not sectors:
@@ -1658,18 +1855,19 @@ def _fetch_sectors_with_stocks() -> dict:
 
     # 第二步：并发获取每个板块的成分股
     def _fetch_sector_stocks(sname, scode):
-        for attempt in range(3):
+        time.sleep(random.uniform(0.1, 0.5))  # 随机延迟，避免并发突发
+        for attempt in range(5):
             try:
-                r = requests.get(
-                    "https://push2test.eastmoney.com/api/qt/clist/get",
+                r = EM_SESSION.get(
+                    "https://push2.eastmoney.com/api/qt/clist/get",
                     params={
                         "cb": "jQuery", "pn": "1", "pz": "1000", "po": "1", "np": "1",
                         "ut": "bd1d9ddb04089700cf9c27f6f7426281",
                         "fltt": "2", "invt": "2", "fid": "f3",
                         "fs": f"b:{scode}",
-                        "fields": "f2,f3,f12,f14",
+                        "fields": "f2,f3,f5,f6,f8,f12,f14,f21",
                     },
-                    headers=EM_HEADERS, timeout=15,
+                    timeout=15,
                 )
                 if r.status_code == 200 and r.text:
                     m = re.search(r"jQuery\((.+)\);", r.text)
@@ -1682,20 +1880,28 @@ def _fetch_sectors_with_stocks() -> dict:
                             name = it.get("f14", "")
                             price = it.get("f2", 0)
                             change_pct = it.get("f3", 0)
+                            volume = it.get("f5", 0)       # 成交量（手）
+                            amount = it.get("f6", 0)        # 成交额（元）
+                            turnover = it.get("f8", 0)      # 换手率(%)
+                            circ_mktcap = it.get("f21", 0)  # 流通市值（元）
                             if code and len(code) == 6 and code[0].isdigit():
                                 stocks.append({
                                     "code": code, "name": name,
                                     "symbol": ("sh" if code.startswith(("6", "9")) else "sz") + code,
                                     "trade": str(price), "settlement": "0",
                                     "changepercent": str(change_pct),
+                                    "volume": volume,
+                                    "amount": amount,
+                                    "turnoverratio": turnover,
+                                    "mktcap": circ_mktcap,
                                 })
                         return sname, stocks
             except Exception:
                 pass
-            import time; time.sleep(0.8 * (attempt + 1))
+            _sleep_backoff(attempt)
         return sname, []
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
         futures = [executor.submit(_fetch_sector_stocks, sn, sectors[sn]["code"]) for sn in sectors]
         for future in concurrent.futures.as_completed(futures):
             sname, stocks = future.result()
@@ -1718,7 +1924,7 @@ def _get_board_type(code: str) -> str:
 
 def screen_mainboard_strategy() -> list[dict]:
     """
-    板块优先统一筛选策略（东方财富 push2test 接口）：
+    板块优先统一筛选策略（东方财富 push2 接口）：
     1. 实时分析大盘哪个板块涨停最多
     2. 优先在涨停最多的板块里筛选
     3. 结果按板块涨停数 + 频次排列
@@ -1835,7 +2041,25 @@ def screen_mainboard_strategy() -> list[dict]:
             if price < prev_close * 0.999:  # 允许0.1%误差
                 continue
 
-            mktcap = 0  # 东方财富成分股接口没有市值字段，后续由腾讯接口补充
+            # 从板块成分股接口获取的字段
+            circ_mktcap_yuan = 0
+            try:
+                circ_mktcap_yuan = float(item.get("mktcap", 0) or 0)
+            except (ValueError, TypeError):
+                pass
+            mktcap = round(circ_mktcap_yuan / 1e8, 2) if circ_mktcap_yuan > 0 else 0
+
+            turnover_from_sector = 0
+            try:
+                turnover_from_sector = float(item.get("turnoverratio", 0) or 0)
+            except (ValueError, TypeError):
+                pass
+
+            volume_from_sector = 0
+            try:
+                volume_from_sector = int(float(item.get("volume", 0) or 0))
+            except (ValueError, TypeError):
+                pass
 
             if code in seen_codes:
                 continue
@@ -1847,9 +2071,9 @@ def screen_mainboard_strategy() -> list[dict]:
                 "auction_gain": round(auction_gain, 2),
                 "open_price": price,
                 "volume_shares": 0,
-                "volume": 0,
-                "market_cap_yi": mktcap,
-                "turnover_sina": 0,
+                "volume": volume_from_sector,      # 板块接口返回的成交量(手)
+                "market_cap_yi": mktcap,            # 板块接口返回的流通市值(亿)
+                "turnover_sina": turnover_from_sector,  # 板块接口返回的换手率(%)
                 "sector": sname,
                 "sector_limit_count": limit_cnt,
             }
@@ -1872,6 +2096,9 @@ def screen_mainboard_strategy() -> list[dict]:
         em = em_data.get(c["code"], {})
         if em.get("market_cap_yi", 0) > 0 and c["market_cap_yi"] <= 0:
             c["market_cap_yi"] = em["market_cap_yi"]
+        # 补充换手率：优先用东方财富详细数据，板块接口数据作为fallback
+        if em.get("turnover", 0) > 0 and c.get("turnover_sina", 0) <= 0:
+            c["turnover_sina"] = em["turnover"]
 
     # ========== 第五步：批量获取腾讯实时数据（买卖盘等）==========
     print("📊 获取腾讯竞价详细数据...")
@@ -1881,9 +2108,9 @@ def screen_mainboard_strategy() -> list[dict]:
         batch = all_candidates[i:i + batch_size]
         symbols = ",".join(c["symbol"] for c in batch)
         try:
-            r = requests.get(
+            r = SESSION.get(
                 f"https://qt.gtimg.cn/q={symbols}",
-                headers=HEADERS, timeout=15,
+                timeout=15,
             )
             r.encoding = "gbk"
             for line in r.text.strip().split("\n"):
@@ -1913,7 +2140,24 @@ def screen_mainboard_strategy() -> list[dict]:
         except Exception as e:
             print(f"  ⚠ 腾讯接口批次{i//batch_size+1}失败: {e}")
 
-    # ========== 第六步：获取K线数据（用于补充成交量 + 后续MACD检查）==========
+    # 腾讯数据兜底：东方财富不可用时，用腾讯字段补充市值/换手率
+    em_failed = sum(1 for c in all_candidates if c["market_cap_yi"] <= 0)
+    if em_failed > 0:
+        tencent_filled = 0
+        for c in all_candidates:
+            if c["market_cap_yi"] <= 0:
+                tc = tencent_map.get(c["code"], {})
+                if tc.get("market_cap_yi", 0) > 0:
+                    c["market_cap_yi"] = tc["market_cap_yi"]
+                    tencent_filled += 1
+            if c.get("turnover_sina", 0) <= 0:
+                tc = tencent_map.get(c["code"], {})
+                if tc.get("turnover", 0) > 0:
+                    c["turnover_sina"] = tc["turnover"]
+        if tencent_filled > 0:
+            print(f"  ✅ 腾讯兜底补充市值: {tencent_filled} 只")
+
+    # ========== 第六步：获取K线数据（用于补充成交量 + 成交额 + 后续MACD检查）==========
     print(f"📊 获取K线数据（{len(all_candidates)} 只候选，1000天）...")
     kline_map_all = _fetch_kline_concurrent([c["code"] for c in all_candidates], days=1000)
     for c in all_candidates:
@@ -1927,6 +2171,30 @@ def screen_mainboard_strategy() -> list[dict]:
                 pass
     vol_filled = sum(1 for c in all_candidates if c["volume_shares"] > 0)
     print(f"  ✅ 已补充昨日成交量: {vol_filled}/{len(all_candidates)} 只")
+
+    # 检查K线数据是否包含成交额（amount）
+    kline_has_amount = 0
+    for c in all_candidates:
+        klines = kline_map_all.get(c["code"], [])
+        if klines and len(klines) >= 2:
+            try:
+                if float(klines[-2].get("amount", 0)) > 0:
+                    kline_has_amount += 1
+            except (ValueError, TypeError):
+                pass
+    print(f"  ✅ K线含成交额: {kline_has_amount}/{len(all_candidates)} 只")
+
+    # ========== 第六步半：获取开盘5分钟成交金额 ==========
+    print("📊 获取开盘5分钟成交金额...")
+    opening_5min_amounts = _fetch_5min_opening_amount([c["code"] for c in all_candidates])
+    if opening_5min_amounts:
+        print(f"  ✅ 获取到 {len(opening_5min_amounts)} 只股票的5分钟成交额")
+        # 将5分钟成交额写入候选数据
+        for c in all_candidates:
+            if c["code"] in opening_5min_amounts:
+                c["amount_5min"] = opening_5min_amounts[c["code"]]
+    else:
+        print("  ℹ️  非交易时段或无5分钟数据，基础池5分钟条件将跳过")
 
     # ========== 第七步：统一策略筛选 ==========
     print("📊 执行统一策略筛选...")
@@ -2249,7 +2517,7 @@ def _screen_fallback_all_market() -> list[dict]:
     page = 1
     while True:
         try:
-            r = requests.get(
+            r = SESSION.get(
                 "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData",
                 params={"page": str(page), "num": "80", "sort": "symbol",
                          "asc": "1", "node": "hs_a", "symbol": "", "_s_r_a": "page"},
@@ -2365,7 +2633,7 @@ def _screen_fallback_all_market() -> list[dict]:
         batch = candidates[i:i + batch_size]
         symbols = ",".join(c["symbol"] for c in batch)
         try:
-            r = requests.get(f"https://qt.gtimg.cn/q={symbols}", headers=HEADERS, timeout=15)
+            r = SESSION.get(f"https://qt.gtimg.cn/q={symbols}", timeout=15)
             r.encoding = "gbk"
             for line in r.text.strip().split("\n"):
                 m = re.search(r'v_(\w+)="(.+)"', line)
@@ -2381,9 +2649,18 @@ def _screen_fallback_all_market() -> list[dict]:
                     except (ValueError, IndexError):
                         return t(0) if t != str else ""
                 tencent_map[code] = {"volume": _v(6, int), "buy_vol": _v(7, int), "sell_vol": _v(8, int),
-                                      "amount": _v(37), "turnover": _v(38), "amplitude": _v(43), "volume_ratio_api": _v(49)}
+                                      "amount": _v(37), "turnover": _v(38), "amplitude": _v(43),
+                                      "market_cap_yi": _v(45), "volume_ratio_api": _v(49)}
         except Exception:
             pass
+
+    # 腾讯数据兜底：东方财富不可用时，用腾讯字段补充市值/换手率
+    for c in candidates:
+        tc = tencent_map.get(c["code"], {})
+        if c["market_cap_yi"] <= 0 and tc.get("market_cap_yi", 0) > 0:
+            c["market_cap_yi"] = tc["market_cap_yi"]
+        if c.get("turnover_sina", 0) <= 0 and tc.get("turnover", 0) > 0:
+            c["turnover_sina"] = tc["turnover"]
 
     # 先获取K线数据（策略池2需要3日涨幅和前一日涨停判断）
     print("📊 获取K线数据（用于策略池2量价筛选）...")
