@@ -1097,6 +1097,7 @@ def _fetch_em_stock_details(codes: list[str]) -> dict:
                     continue
         except Exception as e:
             print(f"  ⚠ 东方财富批量接口批次{i // batch_size + 1}失败: {e}")
+        import time; time.sleep(2)  # 批次间间隔，避免限流
 
     return result
 
@@ -1107,7 +1108,7 @@ def _screen_unified(candidates: list[dict], tencent_map: dict, em_data: dict = N
       1.  主板
       2.  非ST
       3.  集合竞价涨幅 > 3% 且 < 10%（K线修正后重新验证）
-      4.  市值 < 400亿
+      4.  市值 < 400亿（优先腾讯，东方财富为备）
       5.  价格 < 120元
       6.  前一日涨停取反（昨日未涨停）
       7.  非盘中下跌（竞价价 >= 昨收）
@@ -1133,11 +1134,8 @@ def _screen_unified(candidates: list[dict], tencent_map: dict, em_data: dict = N
             _diag["涨幅3-10%"] = _diag.get("涨幅3-10%", 0) + 1
             continue
 
-        # ---- 条件4: 市值 < 400亿（优先用东方财富数据，修正腾讯字段映射错误）----
-        market_cap_yi = em.get("market_cap_yi", 0) or c.get("market_cap_yi", 0)
-        if market_cap_yi <= 0:
-            # fallback: 腾讯 f[45] (可能不准，但作为最后手段)
-            market_cap_yi = tc.get("market_cap_yi", 0)
+        # ---- 条件4: 市值 < 400亿（优先用腾讯数据，东方财富为备）----
+        market_cap_yi = tc.get("market_cap_yi", 0) or em.get("market_cap_yi", 0) or c.get("market_cap_yi", 0)
         if market_cap_yi >= 400:
             _diag["市值<400亿"] = _diag.get("市值<400亿", 0) + 1
             continue
@@ -1170,8 +1168,8 @@ def _screen_unified(candidates: list[dict], tencent_map: dict, em_data: dict = N
             _diag["昨成交量>0"] = _diag.get("昨成交量>0", 0) + 1
             continue
 
-        # ---- 条件11: 集合竞价量比 > 5（优先用东方财富API值）----
-        volume_ratio = em.get("volume_ratio", 0) or tc.get("volume_ratio_api", 0)
+        # ---- 条件11: 集合竞价量比 > 5（优先用腾讯API值）----
+        volume_ratio = tc.get("volume_ratio_api", 0) or em.get("volume_ratio", 0)
         if volume_ratio <= 0:
             # fallback: 用竞价量 / (5日均量 × 竞价占比估算)
             # 竞价时段约占全天 10/240 ≈ 4.2%，取 5日均量×0.05 作为分母
@@ -1529,6 +1527,7 @@ def screen_mainboard_strategy() -> list[dict]:
                     "amount": _v(37),
                     "turnover": _v(38),
                     "amplitude": _v(43),
+                    "market_cap_yi": _v(45),       # 腾讯市值(亿)
                     "volume_ratio_api": _v(49),
                 }
         except Exception as e:
