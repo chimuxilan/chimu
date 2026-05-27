@@ -245,7 +245,7 @@ def _to_tencent(code: str) -> str:
 def _wait_for_auction_data(max_wait_sec: int = 30, poll_interval: int = 5) -> bool:
     """
     等待撮合数据就绪（9:25后API数据刷新延迟问题）
-    用贵州茅台(600519)作为探针，检测成交量是否已更新。
+    用贵州茅台(600519)作为探针，检查行情时间戳是否已更新到9:25之后。
     返回 True 表示数据已就绪，False 表示超时。
     """
     now = datetime.now()
@@ -263,18 +263,18 @@ def _wait_for_auction_data(max_wait_sec: int = 30, poll_interval: int = 5) -> bo
             m = re.search(r'v_\w+="(.+)"', r.text)
             if m:
                 f = m.group(1).split("~")
-                if len(f) > 50:
+                if len(f) > 31:
                     vol = int(f[6]) if f[6] else 0
                     price = float(f[3]) if f[3] else 0
-                    prev_close = float(f[4]) if f[4] else 0
-                    # 数据就绪判断：成交量>0 且 价格有效
-                    if vol > 0 and price > 0 and prev_close > 0:
-                        gap = (price - prev_close) / prev_close * 100
-                        print(f"  ✅ 撮合数据已就绪（茅台: {price:.2f}, 涨跌: {gap:+.2f}%, 量: {vol}手）")
+                    # f[31] = 行情时间戳 HHMMSS
+                    quote_time = f[31].strip() if f[31] else ""
+                    # 判断时间戳是否已更新到 9:25 之后
+                    if quote_time and quote_time >= "092500" and price > 0:
+                        gap = (price - float(f[4])) / float(f[4]) * 100 if float(f[4]) else 0
+                        print(f"  ✅ 撮合数据已就绪（行情时间: {quote_time[:2]}:{quote_time[2:4]}:{quote_time[4:6]}, 茅台: {price:.2f}, 涨跌: {gap:+.2f}%）")
                         return True
                     else:
-                        cur_time = f[30] if len(f) > 30 else "?"
-                        print(f"  ⏳ 数据未更新（成交量={vol}, 价格={price}），等待... ({elapsed}s)")
+                        print(f"  ⏳ 行情时间 {quote_time} 尚未更新到 09:25，等待... ({elapsed}s)")
         except Exception as e:
             print(f"  ⚠ 探针请求异常: {e}")
         import time
