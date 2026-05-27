@@ -32,6 +32,7 @@ HEADERS = {
 # 全局请求限速器（防封IP）
 # ============================================================
 import time as _time
+import random as _random
 import threading as _threading
 
 class _RateLimiter:
@@ -69,12 +70,12 @@ def _rate_limited_request(url: str, limiter: _RateLimiter, method: str = "GET",
             r = requests.request(method, url, **kwargs)
             if r.status_code == 429:
                 # 被限流，指数退避
-                wait = (2 ** attempt) + _time.uniform(0.5, 1.5)
+                wait = (2 ** attempt) + _random.uniform(0.5, 1.5)
                 _time.sleep(wait)
                 last_err = f"HTTP 429 (rate limited)"
                 continue
             if r.status_code >= 500:
-                wait = (2 ** attempt) + _time.uniform(0.3, 0.8)
+                wait = (2 ** attempt) + _random.uniform(0.3, 0.8)
                 _time.sleep(wait)
                 last_err = f"HTTP {r.status_code}"
                 continue
@@ -82,11 +83,11 @@ def _rate_limited_request(url: str, limiter: _RateLimiter, method: str = "GET",
         except requests.exceptions.Timeout:
             last_err = "timeout"
             if attempt < max_retries - 1:
-                _time.sleep((2 ** attempt) + _time.uniform(0.3, 0.8))
+                _time.sleep((2 ** attempt) + _random.uniform(0.3, 0.8))
         except requests.exceptions.ConnectionError:
             last_err = "connection error"
             if attempt < max_retries - 1:
-                _time.sleep((2 ** attempt) + _time.uniform(0.5, 1.5))
+                _time.sleep((2 ** attempt) + _random.uniform(0.5, 1.5))
         except Exception as e:
             last_err = str(e)
             if attempt < max_retries - 1:
@@ -412,7 +413,7 @@ def fetch_hist(code: str, days: int = 10) -> list[dict]:
         except Exception:
             pass
         if attempt < 2:
-            _time.sleep((2 ** attempt) + _time.uniform(0.2, 0.6))
+            _time.sleep((2 ** attempt) + _random.uniform(0.2, 0.6))
 
     # 备用：腾讯接口（限速+重试）
     for attempt in range(2):
@@ -435,7 +436,7 @@ def fetch_hist(code: str, days: int = 10) -> list[dict]:
         except Exception:
             pass
         if attempt < 1:
-            _time.sleep(1.0 + _time.uniform(0.2, 0.5))
+            _time.sleep(1.0 + _random.uniform(0.2, 0.5))
 
     return []
 
@@ -1290,7 +1291,7 @@ def _fetch_em_stock_details(codes: list[str]) -> dict:
                     last_err = f"HTTP {r.status_code}"
             except Exception as e:
                 last_err = str(e)
-            _time.sleep((2 ** attempt) + _time.uniform(0.3, 0.8))
+            _time.sleep((2 ** attempt) + _random.uniform(0.3, 0.8))
         if not resp_text:
             print(f"  ⚠ 东方财富批量接口批次{i // batch_size + 1}失败(重试3次): {last_err}")
             continue
@@ -1892,7 +1893,7 @@ def _fetch_sectors_with_stocks() -> dict:
                 break
         except Exception:
             pass
-        _time.sleep((2 ** attempt) + _time.uniform(0.3, 0.8))
+        _time.sleep((2 ** attempt) + _random.uniform(0.3, 0.8))
     if resp_text:
         try:
             m = re.search(r"jQuery\((.+)\);", resp_text)
@@ -1960,7 +1961,7 @@ def _fetch_sectors_with_stocks() -> dict:
                         return sname, stocks
             except Exception:
                 pass
-            _time.sleep((2 ** attempt) + _time.uniform(0.3, 0.8))
+            _time.sleep((2 ** attempt) + _random.uniform(0.3, 0.8))
         return sname, []
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
