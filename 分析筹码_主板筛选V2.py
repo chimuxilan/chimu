@@ -993,7 +993,7 @@ def _check_weekly_macd_red_growing(code: str, cached_klines: list[dict] = None) 
     检查周MACD红柱变大
     用日K线按真实日历周聚合为周K线，计算MACD，检查最近一根红柱 > 前一根
     """
-    klines = cached_klines if cached_klines is not None else fetch_hist(code, days=300)
+    klines = cached_klines if cached_klines is not None else fetch_hist(code, days=1000)
     if not klines or len(klines) < 60:
         return False
 
@@ -1041,7 +1041,7 @@ def _check_monthly_macd_red_up(code: str, cached_klines: list[dict] = None) -> b
     检查月MACD红柱向上
     用日K线按真实日历月聚合为月K线，计算MACD，检查最近红柱 > 0 且向上
     """
-    klines = cached_klines if cached_klines is not None else fetch_hist(code, days=300)
+    klines = cached_klines if cached_klines is not None else fetch_hist(code, days=1000)
     if not klines or len(klines) < 60:
         return False
 
@@ -1969,8 +1969,8 @@ def screen_mainboard_strategy() -> list[dict]:
             print(f"  ⚠ 腾讯接口批次{i//batch_size+1}失败: {e}")
 
     # ========== 第六步：获取K线数据（用于补充成交量 + 后续MACD检查）==========
-    print(f"📊 获取K线数据（{len(all_candidates)} 只候选，300天）...")
-    kline_map_all = _fetch_kline_concurrent([c["code"] for c in all_candidates], days=300)
+    print(f"📊 获取K线数据（{len(all_candidates)} 只候选，1000天）...")
+    kline_map_all = _fetch_kline_concurrent([c["code"] for c in all_candidates], days=1000)
     for c in all_candidates:
         klines = kline_map_all.get(c["code"], [])
         if klines and len(klines) >= 2:
@@ -2442,7 +2442,7 @@ def _screen_fallback_all_market() -> list[dict]:
 
     # 先获取K线数据（策略池2需要3日涨幅和前一日涨停判断）
     print("📊 获取K线数据（用于策略池2量价筛选）...")
-    kline_map_for_pool2 = _fetch_kline_concurrent([c["code"] for c in candidates], days=300)
+    kline_map_for_pool2 = _fetch_kline_concurrent([c["code"] for c in candidates], days=1000)
 
     filtered = _screen_unified(candidates, tencent_map, em_data=em_data, kline_map=kline_map_for_pool2)
     if not filtered:
