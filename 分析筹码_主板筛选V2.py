@@ -242,7 +242,7 @@ def _to_tencent(code: str) -> str:
     return f"sh{code}" if code.startswith(("6", "9")) else f"sz{code}"
 
 
-def _wait_for_auction_data(max_wait_sec: int = 30, poll_interval: int = 3) -> bool:
+def _wait_for_auction_data(max_wait_sec: int = 30, poll_interval: int = 5) -> bool:
     """
     等待撮合数据就绪（9:25后API数据刷新延迟问题）
     用贵州茅台(600519)作为探针，检测成交量是否已更新。
@@ -1797,7 +1797,7 @@ def screen_mainboard_strategy() -> list[dict]:
         print("   建议 9:26 后再运行以获取最终撮合数据\n")
 
     # 等待撮合数据就绪（9:25后API有延迟）
-    _wait_for_auction_data(max_wait_sec=30, poll_interval=3)
+    _wait_for_auction_data(max_wait_sec=30, poll_interval=5)
 
     print("\n📊 获取行业板块数据（东方财富）...")
     sectors = _fetch_sectors_with_stocks()
