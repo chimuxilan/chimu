@@ -950,7 +950,7 @@ def _check_weekly_macd_red_growing(code: str, cached_klines: list[dict] = None) 
     检查周MACD红柱变大
     用日K线按真实日历周聚合为周K线，计算MACD，检查最近一根红柱 > 前一根
     """
-    klines = cached_klines if cached_klines is not None else fetch_hist(code, days=1000)
+    klines = cached_klines if cached_klines is not None else fetch_hist(code, days=300)
     if not klines or len(klines) < 60:
         return False
 
@@ -998,7 +998,7 @@ def _check_monthly_macd_red_up(code: str, cached_klines: list[dict] = None) -> b
     检查月MACD红柱向上
     用日K线按真实日历月聚合为月K线，计算MACD，检查最近红柱 > 0 且向上
     """
-    klines = cached_klines if cached_klines is not None else fetch_hist(code, days=1000)
+    klines = cached_klines if cached_klines is not None else fetch_hist(code, days=300)
     if not klines or len(klines) < 60:
         return False
 
@@ -1744,10 +1744,14 @@ def screen_mainboard_strategy() -> list[dict]:
     now = datetime.now()
     h, m = now.hour, now.minute
     is_auction = (h == 9 and 15 <= m <= 25)
-    if not is_auction:
+    is_post_auction = (h == 9 and 25 < m <= 30)
+    if not is_auction and not is_post_auction:
         print(f"\n⚠️  当前 {h:02d}:{m:02d} 非集合竞价时段 (09:15-09:25)")
         print("   腾讯接口返回的是全天数据而非竞价数据，量比/换手率可能不符合竞价条件")
-        print("   建议在 09:15-09:25 运行以获得准确的竞价筛选结果\n")
+        print("   建议在 09:26-09:30 运行（撮合价已发布，数据更准确）\n")
+    elif is_auction:
+        print(f"\n⚠️  当前 {h:02d}:{m:02d} 竞价进行中，撮合价尚未最终确定")
+        print("   建议 9:26 后再运行以获取最终撮合数据\n")
 
     print("\n📊 获取行业板块数据（东方财富）...")
     sectors = _fetch_sectors_with_stocks()
@@ -1919,8 +1923,8 @@ def screen_mainboard_strategy() -> list[dict]:
             print(f"  ⚠ 腾讯接口批次{i//batch_size+1}失败: {e}")
 
     # ========== 第六步：获取K线数据（用于补充成交量 + 后续MACD检查）==========
-    print(f"📊 获取K线数据（{len(all_candidates)} 只候选，1000天）...")
-    kline_map_all = _fetch_kline_concurrent([c["code"] for c in all_candidates], days=1000)
+    print(f"📊 获取K线数据（{len(all_candidates)} 只候选，300天）...")
+    kline_map_all = _fetch_kline_concurrent([c["code"] for c in all_candidates], days=300)
     for c in all_candidates:
         klines = kline_map_all.get(c["code"], [])
         if klines and len(klines) >= 2:
@@ -2392,7 +2396,7 @@ def _screen_fallback_all_market() -> list[dict]:
 
     # 先获取K线数据（策略池2需要3日涨幅和前一日涨停判断）
     print("📊 获取K线数据（用于策略池2量价筛选）...")
-    kline_map_for_pool2 = _fetch_kline_concurrent([c["code"] for c in candidates], days=1000)
+    kline_map_for_pool2 = _fetch_kline_concurrent([c["code"] for c in candidates], days=300)
 
     filtered = _screen_unified(candidates, tencent_map, em_data=em_data, kline_map=kline_map_for_pool2)
     if not filtered:
