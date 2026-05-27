@@ -242,6 +242,49 @@ def _to_tencent(code: str) -> str:
     return f"sh{code}" if code.startswith(("6", "9")) else f"sz{code}"
 
 
+def _wait_for_auction_data(max_wait_sec: int = 30, poll_interval: int = 3) -> bool:
+    """
+    等待撮合数据就绪（9:25后API数据刷新延迟问题）
+    用贵州茅台(600519)作为探针，检测成交量是否已更新。
+    返回 True 表示数据已就绪，False 表示超时。
+    """
+    now = datetime.now()
+    # 只在 9:24 ~ 9:30 之间才需要等待
+    if not (now.hour == 9 and 24 <= now.minute <= 30):
+        return True
+
+    print(f"⏳ 检测撮合数据是否就绪（最多等待 {max_wait_sec} 秒）...")
+    probe = "sh600519"  # 贵州茅台作为探针
+    elapsed = 0
+    while elapsed < max_wait_sec:
+        try:
+            r = requests.get(f"https://qt.gtimg.cn/q={probe}", headers=HEADERS, timeout=10)
+            r.encoding = "gbk"
+            m = re.search(r'v_\w+="(.+)"', r.text)
+            if m:
+                f = m.group(1).split("~")
+                if len(f) > 50:
+                    vol = int(f[6]) if f[6] else 0
+                    price = float(f[3]) if f[3] else 0
+                    prev_close = float(f[4]) if f[4] else 0
+                    # 数据就绪判断：成交量>0 且 价格有效
+                    if vol > 0 and price > 0 and prev_close > 0:
+                        gap = (price - prev_close) / prev_close * 100
+                        print(f"  ✅ 撮合数据已就绪（茅台: {price:.2f}, 涨跌: {gap:+.2f}%, 量: {vol}手）")
+                        return True
+                    else:
+                        cur_time = f[30] if len(f) > 30 else "?"
+                        print(f"  ⏳ 数据未更新（成交量={vol}, 价格={price}），等待... ({elapsed}s)")
+        except Exception as e:
+            print(f"  ⚠ 探针请求异常: {e}")
+        import time
+        time.sleep(poll_interval)
+        elapsed += poll_interval
+
+    print(f"  ⚠ 等待超时（{max_wait_sec}秒），继续运行但数据可能不准确")
+    return False
+
+
 def fetch_quotes(codes: list[str]) -> dict:
     """批量获取腾讯实时行情"""
     symbols = ",".join(_to_tencent(c) for c in codes)
@@ -1752,6 +1795,9 @@ def screen_mainboard_strategy() -> list[dict]:
     elif is_auction:
         print(f"\n⚠️  当前 {h:02d}:{m:02d} 竞价进行中，撮合价尚未最终确定")
         print("   建议 9:26 后再运行以获取最终撮合数据\n")
+
+    # 等待撮合数据就绪（9:25后API有延迟）
+    _wait_for_auction_data(max_wait_sec=30, poll_interval=3)
 
     print("\n📊 获取行业板块数据（东方财富）...")
     sectors = _fetch_sectors_with_stocks()
