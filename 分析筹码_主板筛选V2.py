@@ -28,6 +28,71 @@ HEADERS = {
     "Referer": "https://quote.eastmoney.com/",
 }
 
+# ============================================================
+# 全局请求限速器（防封IP）
+# ============================================================
+import time as _time
+import threading as _threading
+
+class _RateLimiter:
+    """全局请求限速器：确保两次请求之间有最小间隔"""
+    def __init__(self, min_interval: float = 0.2):
+        self._min_interval = min_interval
+        self._lock = _threading.Lock()
+        self._last_time = 0.0
+
+    def wait(self):
+        with self._lock:
+            now = _time.monotonic()
+            elapsed = now - self._last_time
+            if elapsed < self._min_interval:
+                _time.sleep(self._min_interval - elapsed)
+            self._last_time = _time.monotonic()
+
+# 不同域名用不同限速器，互不影响
+_rate_sina = _RateLimiter(min_interval=0.25)    # 新浪接口：每秒最多4次
+_rate_tencent = _RateLimiter(min_interval=0.15)  # 腾讯接口：每秒最多6次
+_rate_eastmoney = _RateLimiter(min_interval=0.2) # 东财接口：每秒最多5次
+
+
+def _rate_limited_request(url: str, limiter: _RateLimiter, method: str = "GET",
+                          max_retries: int = 3, **kwargs) -> requests.Response:
+    """
+    带限速和指数退避重试的请求封装。
+    指数退避: 1s → 2s → 4s（加随机抖动防惊群）
+    """
+    kwargs.setdefault("timeout", 15)
+    last_err = None
+    for attempt in range(max_retries):
+        limiter.wait()
+        try:
+            r = requests.request(method, url, **kwargs)
+            if r.status_code == 429:
+                # 被限流，指数退避
+                wait = (2 ** attempt) + _time.uniform(0.5, 1.5)
+                _time.sleep(wait)
+                last_err = f"HTTP 429 (rate limited)"
+                continue
+            if r.status_code >= 500:
+                wait = (2 ** attempt) + _time.uniform(0.3, 0.8)
+                _time.sleep(wait)
+                last_err = f"HTTP {r.status_code}"
+                continue
+            return r
+        except requests.exceptions.Timeout:
+            last_err = "timeout"
+            if attempt < max_retries - 1:
+                _time.sleep((2 ** attempt) + _time.uniform(0.3, 0.8))
+        except requests.exceptions.ConnectionError:
+            last_err = "connection error"
+            if attempt < max_retries - 1:
+                _time.sleep((2 ** attempt) + _time.uniform(0.5, 1.5))
+        except Exception as e:
+            last_err = str(e)
+            if attempt < max_retries - 1:
+                _time.sleep(1.0)
+    raise requests.exceptions.RequestException(f"请求失败({max_retries}次重试): {last_err}")
+
 
 # ============================================================
 # 股票名称 → 代码 查询
@@ -40,8 +105,9 @@ def search_stock_code(keyword: str) -> Optional[dict]:
     # 腾讯智能提示接口
     # 格式: v_hint="sh~600519~\\u8d35\\u5dde\\u8305\\u53f0~gzmt~GP-A"
     try:
-        r = requests.get(
+        r = _rate_limited_request(
             "https://smartbox.gtimg.cn/s3/",
+            _rate_tencent,
             params={"v": "2", "q": keyword, "t": "gp"},
             headers=HEADERS, timeout=10,
         )
@@ -69,8 +135,9 @@ def search_stock_code(keyword: str) -> Optional[dict]:
 
     # 新浪搜索接口（备用）
     try:
-        r = requests.get(
+        r = _rate_limited_request(
             "https://suggest3.sinajs.cn/suggest/key=" + keyword,
+            _rate_sina,
             headers={"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn/"},
             timeout=10,
         )
@@ -258,7 +325,7 @@ def _wait_for_auction_data(max_wait_sec: int = 30, poll_interval: int = 5) -> bo
     elapsed = 0
     while elapsed < max_wait_sec:
         try:
-            r = requests.get(f"https://qt.gtimg.cn/q={probe}", headers=HEADERS, timeout=10)
+            r = _rate_limited_request(f"https://qt.gtimg.cn/q={probe}", _rate_tencent, headers=HEADERS, timeout=10)
             r.encoding = "gbk"
             m = re.search(r'v_\w+="(.+)"', r.text)
             if m:
@@ -277,8 +344,7 @@ def _wait_for_auction_data(max_wait_sec: int = 30, poll_interval: int = 5) -> bo
                         print(f"  ⏳ 行情时间 {quote_time} 尚未更新到 09:25，等待... ({elapsed}s)")
         except Exception as e:
             print(f"  ⚠ 探针请求异常: {e}")
-        import time
-        time.sleep(poll_interval)
+        _time.sleep(poll_interval)
         elapsed += poll_interval
 
     print(f"  ⚠ 等待超时（{max_wait_sec}秒），继续运行但数据可能不准确")
@@ -289,7 +355,7 @@ def fetch_quotes(codes: list[str]) -> dict:
     """批量获取腾讯实时行情"""
     symbols = ",".join(_to_tencent(c) for c in codes)
     try:
-        r = requests.get(f"https://qt.gtimg.cn/q={symbols}", headers=HEADERS, timeout=15)
+        r = _rate_limited_request(f"https://qt.gtimg.cn/q={symbols}", _rate_tencent, headers=HEADERS, timeout=15)
         r.encoding = "gbk"
     except Exception as e:
         print(f"  ⚠ 行情请求失败: {e}")
@@ -326,42 +392,51 @@ def fetch_quotes(codes: list[str]) -> dict:
 
 
 def fetch_hist(code: str, days: int = 10) -> list[dict]:
-    """获取近期日K线（带重试）"""
-    # 尝试新浪接口（带重试）
-    for attempt in range(2):
+    """获取近期日K线（带限速+指数退避重试）"""
+    sina_sym = _to_tencent(code)
+
+    # 尝试新浪接口（带限速+重试）
+    for attempt in range(3):
         try:
-            r = requests.get(
+            r = _rate_limited_request(
                 "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData",
-                params={"symbol": _to_tencent(code), "scale": "240", "ma": "no", "datalen": days},
+                _rate_sina,
+                params={"symbol": sina_sym, "scale": "240", "ma": "no", "datalen": days},
                 headers={"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn/"},
-                timeout=15,
+                timeout=15, max_retries=2,
             )
-            if r.text and r.text.strip():
+            if r.text and r.text.strip() and r.text.strip() != "null":
                 data = json.loads(r.text)
                 if data:
                     return data
         except Exception:
             pass
-        if attempt == 0:
-            import time; time.sleep(0.3)
+        if attempt < 2:
+            _time.sleep((2 ** attempt) + _time.uniform(0.2, 0.6))
 
-    # 备用：腾讯接口
-    try:
-        sym = _to_tencent(code)
-        end = datetime.now().strftime("%Y-%m-%d")
-        start = (datetime.now() - timedelta(days=days * 2)).strftime("%Y-%m-%d")
-        r = requests.get(
-            "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
-            params={"param": f"{sym},day,{start},{end},{days},qfq", "_var": "kline_dayqfq"},
-            headers=HEADERS, timeout=15,
-        )
-        txt = r.text.split("=", 1)[1] if "=" in r.text else r.text
-        data = json.loads(txt)
-        klines = data.get("data", {}).get(sym, {})
-        klines = klines.get("day") or klines.get("qfqday") or []
-        return [{"day": k[0], "open": k[1], "close": k[2], "high": k[3], "low": k[4], "volume": k[5]} for k in klines]
-    except Exception as e:
-        print(f"  ⚠ 腾讯K线接口异常({code}): {e}")
+    # 备用：腾讯接口（限速+重试）
+    for attempt in range(2):
+        try:
+            sym = sina_sym
+            end = datetime.now().strftime("%Y-%m-%d")
+            start = (datetime.now() - timedelta(days=days * 2)).strftime("%Y-%m-%d")
+            r = _rate_limited_request(
+                "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
+                _rate_tencent,
+                params={"param": f"{sym},day,{start},{end},{days},qfq", "_var": "kline_dayqfq"},
+                headers=HEADERS, timeout=15, max_retries=2,
+            )
+            txt = r.text.split("=", 1)[1] if "=" in r.text else r.text
+            data = json.loads(txt)
+            klines = data.get("data", {}).get(sym, {})
+            klines = klines.get("day") or klines.get("qfqday") or []
+            if klines:
+                return [{"day": k[0], "open": k[1], "close": k[2], "high": k[3], "low": k[4], "volume": k[5]} for k in klines]
+        except Exception:
+            pass
+        if attempt < 1:
+            _time.sleep(1.0 + _time.uniform(0.2, 0.5))
+
     return []
 
 
@@ -750,7 +825,7 @@ def run_by_image(image_path: str, html_path: str = None) -> list[AuctionResult]:
 
 def fetch_market_indices() -> list[dict]:
     """
-    获取大盘指数实时行情
+    获取大盘指数实时行情（3个指数合并为1次请求）
     返回: [{name, code, price, change_pct, amount, volume, amplitude}, ...]
     """
     index_map = [
@@ -758,44 +833,48 @@ def fetch_market_indices() -> list[dict]:
         ("深证成指", "sz399001"),
         ("创业板指", "sz399006"),
     ]
+    symbols = ",".join(sym for _, sym in index_map)
+    name_lookup = {sym: name for name, sym in index_map}
     results = []
-    for name, symbol in index_map:
-        try:
-            r = requests.get(
-                f"https://qt.gtimg.cn/q={symbol}",
-                headers=HEADERS, timeout=10,
-            )
-            r.encoding = "gbk"
-            m = re.search(r'v_\w+="(.+)"', r.text)
-            if m:
-                f = m.group(1).split("~")
-                if len(f) > 38:
-                    results.append({
-                        "name": name,
-                        "code": symbol,
-                        "price": float(f[3]) if f[3] else 0,
-                        "prev_close": float(f[4]) if f[4] else 0,
-                        "change_pct": float(f[32]) if f[32] else 0,
-                        "amount": float(f[37]) if f[37] else 0,       # 万元
-                        "volume": int(f[36]) if f[36] else 0,         # 手
-                        "amplitude": float(f[43]) if f[43] else 0,
-                    })
-        except Exception as e:
-            print(f"  ⚠ 获取{name}失败: {e}")
+    try:
+        r = _rate_limited_request(f"https://qt.gtimg.cn/q={symbols}", _rate_tencent, headers=HEADERS, timeout=10)
+        r.encoding = "gbk"
+        for line in r.text.strip().split("\n"):
+            m = re.search(r'v_(\w+)="(.+)"', line)
+            if not m:
+                continue
+            symbol = m.group(1)
+            fields = m.group(2).split("~")
+            if len(fields) < 44:
+                continue
+            name = name_lookup.get(symbol, fields[1])
+            results.append({
+                "name": name,
+                "code": symbol,
+                "price": float(fields[3]) if fields[3] else 0,
+                "prev_close": float(fields[4]) if fields[4] else 0,
+                "change_pct": float(fields[32]) if fields[32] else 0,
+                "amount": float(fields[37]) if fields[37] else 0,
+                "volume": int(fields[36]) if fields[36] else 0,
+                "amplitude": float(fields[43]) if fields[43] else 0,
+            })
+    except Exception as e:
+        print(f"  ⚠ 获取大盘指数失败: {e}")
     return results
 
 
 def fetch_all_ashare_codes() -> list[str]:
     """
     获取全部A股代码列表（沪深主板+创业板+科创板）
-    使用新浪接口分页获取
+    使用新浪接口分页获取（带限速）
     """
     codes = []
     page = 1
     while True:
         try:
-            r = requests.get(
+            r = _rate_limited_request(
                 "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData",
+                _rate_sina,
                 params={
                     "page": str(page), "num": "1000", "sort": "symbol",
                     "asc": "1", "node": "hs_a", "symbol": "", "_s_r_a": "page",
@@ -804,7 +883,7 @@ def fetch_all_ashare_codes() -> list[str]:
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                     "Referer": "https://finance.sina.com.cn/",
                 },
-                timeout=20,
+                timeout=20, max_retries=3,
             )
             data = json.loads(r.text)
             if not data:
@@ -815,7 +894,6 @@ def fetch_all_ashare_codes() -> list[str]:
                 if code and len(code) == 6 and code.isdigit():
                     codes.append(code)
                 elif symbol:
-                    # symbol格式: sh600519 或 sz000001
                     c = symbol[2:] if len(symbol) > 2 else ""
                     if c and len(c) == 6 and c.isdigit():
                         codes.append(c)
@@ -833,24 +911,99 @@ def _is_mainboard_a(code: str) -> bool:
     return code.startswith(("60", "00"))
 
 
+def _fetch_em_kline_batch(codes: list[str], days: int = 1000) -> dict:
+    """
+    通过东方财富 push2 批量接口获取日K线（单次请求可覆盖数百只股票，大幅减少请求次数）
+    返回: {code: [kline_data]} 格式与 fetch_hist 一致
+    """
+    EM_HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://quote.eastmoney.com/center/boardlist.html",
+    }
+    result = {}
+    # 东方财富 kline 接口支持 secids 批量，但返回数据是单只的，需要用 fl=secid 分组请求
+    # 改用 stock 分批，每批50只，利用并发减少总耗时
+    batch_size = 50
+    batches = [codes[i:i + batch_size] for i in range(0, len(codes), batch_size)]
+
+    def _fetch_batch(batch_codes):
+        batch_result = {}
+        for code in batch_codes:
+            secid = f"1.{code}" if code.startswith(("6", "9")) else f"0.{code}"
+            try:
+                r = _rate_limited_request(
+                    "https://push2his.eastmoney.com/api/qt/stock/kline/get",
+                    _rate_eastmoney,
+                    params={
+                        "secid": secid,
+                        "fields1": "f1,f2,f3,f4,f5,f6",
+                        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+                        "klt": "101",       # 日K
+                        "fqt": "1",         # 前复权
+                        "lmt": str(days),
+                        "end": "20500101",
+                        "ut": "fa5fd1943c7b386f172d6893dbbd4dc0",
+                    },
+                    headers=EM_HEADERS, timeout=15, max_retries=2,
+                )
+                data = r.json().get("data", {})
+                klines_raw = data.get("klines", [])
+                if klines_raw:
+                    klines = []
+                    for line in klines_raw:
+                        parts = line.split(",")
+                        if len(parts) >= 6:
+                            # 东财K线成交量单位与新浪一致，都是"手"，无需转换
+                            klines.append({
+                                "day": parts[0],
+                                "open": parts[1],
+                                "close": parts[2],
+                                "high": parts[3],
+                                "low": parts[4],
+                                "volume": parts[5],
+                            })
+                    batch_result[code] = klines
+            except Exception:
+                pass
+        return batch_result
+
+    # 并发获取，4线程（避免打满连接）
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(_fetch_batch, b) for b in batches]
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                batch_result = future.result()
+                result.update(batch_result)
+            except Exception:
+                pass
+    return result
+
+
 def _fetch_kline_concurrent(codes: list[str], days: int = 5) -> dict:
     """
-    并发获取多只股票的日K线
+    获取多只股票的日K线。
+    优先用东方财富批量接口（单次请求可覆盖数百只），失败的股票再用新浪逐只补救。
     返回: {code: [kline_data]}
     """
-    result = {}
+    # 东方财富批量获取
+    result = _fetch_em_kline_batch(codes, days=days)
 
-    def _fetch_one(code):
-        try:
-            return code, fetch_hist(code, days=days)
-        except Exception:
-            return code, []
+    # 未获取到的股票，用新浪逐只补救（限速+低并发）
+    missing = [c for c in codes if c not in result]
+    if missing:
+        print(f"  ⚠ 东方财富K线缺失 {len(missing)} 只，新浪补救中...")
+        def _fetch_one(code):
+            try:
+                return code, fetch_hist(code, days=days)
+            except Exception:
+                return code, []
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        futures = [executor.submit(_fetch_one, c) for c in codes]
-        for future in concurrent.futures.as_completed(futures):
-            code, hist = future.result()
-            result[code] = hist
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            futures = [executor.submit(_fetch_one, c) for c in missing]
+            for future in concurrent.futures.as_completed(futures):
+                code, hist = future.result()
+                if hist:
+                    result[code] = hist
     return result
 
 
@@ -928,24 +1081,23 @@ def _compute_macd(closes: list[float], fast: int = 12, slow: int = 26, signal: i
 
 def fetch_kline_120min(code: str, count: int = 60) -> list[dict]:
     """
-    获取120分钟K线数据
-    腾讯mkline接口已失效（重定向到不存在的web3域名），
-    新浪不支持120分钟周期，因此用新浪60分钟K线每2根合并为1根120分钟K线。
+    获取120分钟K线数据（带限速）
+    用新浪60分钟K线每2根合并为1根120分钟K线。
     """
     sina_sym = f"sh{code}" if code.startswith("6") else f"sz{code}"
     try:
-        r = requests.get(
+        r = _rate_limited_request(
             "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData",
+            _rate_sina,
             params={"symbol": sina_sym, "scale": "60", "ma": "no", "datalen": count * 2},
             headers={"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn/"},
-            timeout=15,
+            timeout=15, max_retries=2,
         )
         if not r.text.strip() or r.text.strip() == "null":
             return []
         m60 = json.loads(r.text)
         if not m60 or len(m60) < 2:
             return []
-        # 每2根60分钟K线合并为1根120分钟K线
         m120 = []
         for i in range(0, len(m60) - 1, 2):
             a, b = m60[i], m60[i + 1]
@@ -959,33 +1111,48 @@ def fetch_kline_120min(code: str, count: int = 60) -> list[dict]:
             })
         return m120
     except Exception:
-        pass  # 120分钟数据不可用，由日K线兜底
+        pass
     return []
+
+# 120分钟MACD缓存（避免同一只股票重复请求）
+_macd_120min_cache: dict = {}
 
 def _check_macd_120min_up(code: str, cached_klines: list[dict] = None) -> bool:
     """
     检查120分钟MACD是否向上（MACD线当前 > 前一根 且 MACD > 0）
+    结果缓存：同一code不会重复请求。
     若120分钟数据不可用，用日K线MACD做代理
     """
+    # 检查缓存
+    if code in _macd_120min_cache:
+        return _macd_120min_cache[code]
+
     klines = fetch_kline_120min(code, count=60)
     if klines and len(klines) >= 35:
         closes = [float(k.get("close", 0)) for k in klines if float(k.get("close", 0)) > 0]
         if len(closes) >= 35:
             macd_line, _, _ = _compute_macd(closes)
             if len(macd_line) >= 2:
-                return macd_line[-1] > macd_line[-2] and macd_line[-1] > 0
+                result = macd_line[-1] > macd_line[-2] and macd_line[-1] > 0
+                _macd_120min_cache[code] = result
+                return result
 
     # fallback: 用日K线MACD做代理（120分钟数据不可用时）
     day_klines = cached_klines if cached_klines is not None else fetch_hist(code, days=60)
     if not day_klines or len(day_klines) < 35:
+        _macd_120min_cache[code] = False
         return False
     closes = [float(k.get("close", 0)) for k in day_klines if float(k.get("close", 0)) > 0]
     if len(closes) < 35:
+        _macd_120min_cache[code] = False
         return False
     macd_line, _, _ = _compute_macd(closes)
     if len(macd_line) < 2:
+        _macd_120min_cache[code] = False
         return False
-    return macd_line[-1] > macd_line[-2] and macd_line[-1] > 0
+    result = macd_line[-1] > macd_line[-2] and macd_line[-1] > 0
+    _macd_120min_cache[code] = result
+    return result
 
 
 def _check_weekly_macd_red_growing(code: str, cached_klines: list[dict] = None) -> bool:
@@ -1091,7 +1258,6 @@ def _fetch_em_stock_details(codes: list[str]) -> dict:
         "Referer": "https://quote.eastmoney.com/center/boardlist.html",
     }
     result = {}
-    # 构造 secids: 1.600519,0.000858 格式 (1=沪, 0=深, 0=创业板/科创板)
     secids = []
     for code in codes:
         market = "1" if code.startswith(("6", "9")) else "0"
@@ -1104,15 +1270,16 @@ def _fetch_em_stock_details(codes: list[str]) -> dict:
         last_err = ""
         for attempt in range(3):
             try:
-                r = requests.get(
+                r = _rate_limited_request(
                     "https://push2test.eastmoney.com/api/qt/ulist.np/get",
+                    _rate_eastmoney,
                     params={
                         "cb": "jQuery", "fltt": "2", "invt": "2",
                         "ut": "bd1d9ddb04089700cf9c27f6f7426281",
                         "secids": ",".join(batch),
                         "fields": "f2,f5,f6,f8,f12,f14,f20,f21,f49",
                     },
-                    headers=EM_HEADERS, timeout=20,
+                    headers=EM_HEADERS, timeout=20, max_retries=2,
                 )
                 if r.status_code == 200 and r.text:
                     resp_text = r.text
@@ -1121,7 +1288,7 @@ def _fetch_em_stock_details(codes: list[str]) -> dict:
                     last_err = f"HTTP {r.status_code}"
             except Exception as e:
                 last_err = str(e)
-            import time; time.sleep(1.5 * (attempt + 1))
+            _time.sleep((2 ** attempt) + _time.uniform(0.3, 0.8))
         if not resp_text:
             print(f"  ⚠ 东方财富批量接口批次{i // batch_size + 1}失败(重试3次): {last_err}")
             continue
@@ -1151,8 +1318,7 @@ def _fetch_em_stock_details(codes: list[str]) -> dict:
                 except (ValueError, TypeError):
                     continue
         except Exception as e:
-            print(f"  ⚠ 东方财富批量接口批次{i // batch_size + 1}失败: {e}")
-        import time; time.sleep(2)  # 批次间间隔，避免限流
+            print(f"  ⚠ 东方财富批量接口批次{i // batch_size + 1}解析失败: {e}")
 
     return result
 
@@ -1644,7 +1810,7 @@ def _screen_unified(candidates: list[dict], tencent_map: dict, em_data: dict = N
 
 def _fetch_sectors_with_stocks() -> dict:
     """
-    通过东方财富 push2test 接口获取行业板块列表及各板块下的股票
+    通过东方财富 push2test 接口获取行业板块列表及各板块下的股票（带限速）
     返回: {sector_name: {"code": sector_code, "stocks": [stock_items]}}
     """
     EM_HEADERS = {
@@ -1657,8 +1823,9 @@ def _fetch_sectors_with_stocks() -> dict:
     resp_text = None
     for attempt in range(3):
         try:
-            r = requests.get(
+            r = _rate_limited_request(
                 "https://push2test.eastmoney.com/api/qt/clist/get",
+                _rate_eastmoney,
                 params={
                     "cb": "jQuery", "pn": "1", "pz": "50", "po": "1", "np": "1",
                     "ut": "bd1d9ddb04089700cf9c27f6f7426281",
@@ -1666,14 +1833,14 @@ def _fetch_sectors_with_stocks() -> dict:
                     "fs": "m:90+t:2+f:!50",
                     "fields": "f2,f3,f12,f14,f104,f105",
                 },
-                headers=EM_HEADERS, timeout=15,
+                headers=EM_HEADERS, timeout=15, max_retries=2,
             )
             if r.status_code == 200 and r.text:
                 resp_text = r.text
                 break
         except Exception:
             pass
-        import time; time.sleep(1.0 * (attempt + 1))
+        _time.sleep((2 ** attempt) + _time.uniform(0.3, 0.8))
     if resp_text:
         try:
             m = re.search(r"jQuery\((.+)\);", resp_text)
@@ -1704,12 +1871,13 @@ def _fetch_sectors_with_stocks() -> dict:
     if not sectors:
         return sectors
 
-    # 第二步：并发获取每个板块的成分股
+    # 第二步：并发获取每个板块的成分股（5线程，带限速）
     def _fetch_sector_stocks(sname, scode):
         for attempt in range(3):
             try:
-                r = requests.get(
+                r = _rate_limited_request(
                     "https://push2test.eastmoney.com/api/qt/clist/get",
+                    _rate_eastmoney,
                     params={
                         "cb": "jQuery", "pn": "1", "pz": "1000", "po": "1", "np": "1",
                         "ut": "bd1d9ddb04089700cf9c27f6f7426281",
@@ -1717,7 +1885,7 @@ def _fetch_sectors_with_stocks() -> dict:
                         "fs": f"b:{scode}",
                         "fields": "f2,f3,f12,f14",
                     },
-                    headers=EM_HEADERS, timeout=15,
+                    headers=EM_HEADERS, timeout=15, max_retries=2,
                 )
                 if r.status_code == 200 and r.text:
                     m = re.search(r"jQuery\((.+)\);", r.text)
@@ -1740,10 +1908,10 @@ def _fetch_sectors_with_stocks() -> dict:
                         return sname, stocks
             except Exception:
                 pass
-            import time; time.sleep(0.8 * (attempt + 1))
+            _time.sleep((2 ** attempt) + _time.uniform(0.3, 0.8))
         return sname, []
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         futures = [executor.submit(_fetch_sector_stocks, sn, sectors[sn]["code"]) for sn in sectors]
         for future in concurrent.futures.as_completed(futures):
             sname, stocks = future.result()
@@ -1931,14 +2099,14 @@ def screen_mainboard_strategy() -> list[dict]:
     # ========== 第五步：批量获取腾讯实时数据（买卖盘等）==========
     print("📊 获取腾讯竞价详细数据...")
     tencent_map = {}
-    batch_size = 50
+    batch_size = 80  # 腾讯接口支持大批量，80只一次请求
     for i in range(0, len(all_candidates), batch_size):
         batch = all_candidates[i:i + batch_size]
         symbols = ",".join(c["symbol"] for c in batch)
         try:
-            r = requests.get(
+            r = _rate_limited_request(
                 f"https://qt.gtimg.cn/q={symbols}",
-                headers=HEADERS, timeout=15,
+                _rate_tencent, headers=HEADERS, timeout=15,
             )
             r.encoding = "gbk"
             for line in r.text.strip().split("\n"):
@@ -2304,12 +2472,13 @@ def _screen_fallback_all_market() -> list[dict]:
     page = 1
     while True:
         try:
-            r = requests.get(
+            r = _rate_limited_request(
                 "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData",
+                _rate_sina,
                 params={"page": str(page), "num": "80", "sort": "symbol",
                          "asc": "1", "node": "hs_a", "symbol": "", "_s_r_a": "page"},
                 headers={"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn/"},
-                timeout=20,
+                timeout=20, max_retries=3,
             )
             data = json.loads(r.text)
             if not data:
@@ -2415,12 +2584,12 @@ def _screen_fallback_all_market() -> list[dict]:
             c["market_cap_yi"] = em["market_cap_yi"]
 
     tencent_map = {}
-    batch_size = 50
+    batch_size = 80
     for i in range(0, len(candidates), batch_size):
         batch = candidates[i:i + batch_size]
         symbols = ",".join(c["symbol"] for c in batch)
         try:
-            r = requests.get(f"https://qt.gtimg.cn/q={symbols}", headers=HEADERS, timeout=15)
+            r = _rate_limited_request(f"https://qt.gtimg.cn/q={symbols}", _rate_tencent, headers=HEADERS, timeout=15)
             r.encoding = "gbk"
             for line in r.text.strip().split("\n"):
                 m = re.search(r'v_(\w+)="(.+)"', line)
