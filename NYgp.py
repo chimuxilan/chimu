@@ -1141,15 +1141,19 @@ def _check_macd_120min_up(code: str, cached_klines: list[dict] = None) -> bool:
                 return result
 
     # fallback: 用日K线MACD做代理（120分钟数据不可用时）
-    day_klines = cached_klines if cached_klines is not None else fetch_hist(code, days=60)
-    if not day_klines or len(day_klines) < 35:
+    # 120分钟EMA(12,26,9) ≈ 3/6.5/2.25个交易日，对应日线需放大4倍：EMA(48,104,36)
+    # 但数据量要求太大(需140+根日K)，改用折中参数 EMA(26,52,18) 平衡灵敏度和数据量
+    _FALLBACK_FAST, _FALLBACK_SLOW, _FALLBACK_SIG = 26, 52, 18
+    _min_len = _FALLBACK_SLOW + _FALLBACK_SIG  # 70
+    day_klines = cached_klines if cached_klines is not None else fetch_hist(code, days=120)
+    if not day_klines or len(day_klines) < _min_len:
         _macd_120min_cache[code] = False
         return False
     closes = [float(k.get("close", 0)) for k in day_klines if float(k.get("close", 0)) > 0]
-    if len(closes) < 35:
+    if len(closes) < _min_len:
         _macd_120min_cache[code] = False
         return False
-    macd_line, _, _ = _compute_macd(closes)
+    macd_line, _, _ = _compute_macd(closes, fast=_FALLBACK_FAST, slow=_FALLBACK_SLOW, signal=_FALLBACK_SIG)
     if len(macd_line) < 2:
         _macd_120min_cache[code] = False
         return False
@@ -1191,10 +1195,16 @@ def _check_weekly_macd_red_growing(code: str, cached_klines: list[dict] = None) 
             weekly_closes.append(last_close_in_week)
         last_week = week_key
         last_close_in_week = c
-    # 追加最后一周的收盘价
+    # 追加最后一周的收盘价（仅当最后一周是完整周时才纳入MACD计算）
+    # 判断最后一周是否完整：如果最后一周的 week_key 等于当前日期的 week_key，
+    # 说明是当前正在进行的周，数据不完整，不应纳入MACD计算
+    _now_week_key = datetime.now().isocalendar()[0] * 100 + datetime.now().isocalendar()[1]
     if last_close_in_week > 0:
-        if not weekly_closes or weekly_closes[-1] != last_close_in_week:
-            weekly_closes.append(last_close_in_week)
+        if last_week != _now_week_key:
+            # 最后一周不是本周 → 是完整的历史周，追加
+            if not weekly_closes or weekly_closes[-1] != last_close_in_week:
+                weekly_closes.append(last_close_in_week)
+        # 如果 last_week == _now_week_key，说明是本周（不完整），跳过
 
     if len(weekly_closes) < 35:
         return False
@@ -1236,10 +1246,14 @@ def _check_monthly_macd_red_up(code: str, cached_klines: list[dict] = None) -> b
             monthly_closes.append(last_close_in_month)
         last_month = month_key
         last_close_in_month = c
-    # 追加最后一个月的收盘价
+    # 追加最后一个月的收盘价（仅当最后一个月是完整月时才纳入MACD计算）
+    _now_month_key = datetime.now().year * 100 + datetime.now().month
     if last_close_in_month > 0:
-        if not monthly_closes or monthly_closes[-1] != last_close_in_month:
-            monthly_closes.append(last_close_in_month)
+        if last_month != _now_month_key:
+            # 最后一个月不是本月 → 是完整的历史月，追加
+            if not monthly_closes or monthly_closes[-1] != last_close_in_month:
+                monthly_closes.append(last_close_in_month)
+        # 如果 last_month == _now_month_key，说明是本月（不完整），跳过
 
     if len(monthly_closes) < 35:
         return False
@@ -2513,8 +2527,7 @@ def screen_mainboard_strategy() -> list[dict]:
         for code, name, sector, cnt in leader_stats:
             print(f"    {name}({code}) [{sector}] — 出现 {cnt} 次")
 
-    # ========== 最终过滤：去除不符合策略池的股票 ==========
-    # 规则：趋势池和技术池必须同时通过
+    # ========== 最终过滤：趋势池和技术池必须同时通过 ==========
     before_count = len(final)
     final = [c for c in final if c.get("passed_pools") and
              "趋势池" in c["passed_pools"] and "技术池" in c["passed_pools"]]
@@ -2854,8 +2867,7 @@ def _screen_fallback_all_market() -> list[dict]:
         for code, name, sector, cnt in leader_stats:
             print(f"    {name}({code}) [{sector}] — 出现 {cnt} 次")
 
-    # ========== 最终过滤：去除不符合策略池的股票 ==========
-    # 规则：趋势池和技术池必须同时通过
+    # ========== 最终过滤：趋势池和技术池必须同时通过 ==========
     before_count = len(final)
     final = [c for c in final if c.get("passed_pools") and
              "趋势池" in c["passed_pools"] and "技术池" in c["passed_pools"]]
