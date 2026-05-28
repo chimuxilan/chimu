@@ -2523,18 +2523,21 @@ def screen_mainboard_strategy() -> list[dict]:
         for code, name, sector, cnt in leader_stats:
             print(f"    {name}({code}) [{sector}] — 出现 {cnt} 次")
 
-    # ========== 最终过滤：去除不符合策略池的股票 ==========
-    # 规则：趋势池和技术池必须同时通过
+    # ========== 最终过滤：保留通过任意策略池的股票 ==========
     before_count = len(final)
-    final = [c for c in final if c.get("passed_pools") and
-             "趋势池" in c["passed_pools"] and "技术池" in c["passed_pools"]]
+    final = [c for c in final if c.get("passed_pools")]
     removed = before_count - len(final)
     if removed > 0:
-        print(f"\n  🗑  最终过滤: 去除 {removed} 只趋势池/技术池未同时通过的股票，保留 {len(final)} 只")
+        print(f"\n  🗑  最终过滤: 去除 {removed} 只未通过任何策略池的股票，保留 {len(final)} 只")
+
+    # ========== 频次排序：只留频次最高的前10只 ==========
+    final.sort(key=lambda x: (-x.get("frequency", 0), -x.get("leader_count", 0),
+                               -x.get("sector_limit_count", 0), -x.get("auction_gain", 0)))
+    if len(final) > 10:
+        print(f"\n  🏅 频次筛选: {len(final)} 只 → 保留频次最高的前10只")
+        final = final[:10]
 
     return final
-
-def _screen_fallback_all_market() -> list[dict]:
     """
     板块API不可用时的回退方案：全市场筛选（保留兼容性）
     """
@@ -2861,14 +2864,19 @@ def _screen_fallback_all_market() -> list[dict]:
         for code, name, sector, cnt in leader_stats:
             print(f"    {name}({code}) [{sector}] — 出现 {cnt} 次")
 
-    # ========== 最终过滤：去除不符合策略池的股票 ==========
-    # 规则：趋势池和技术池必须同时通过
+    # ========== 最终过滤：保留通过任意策略池的股票 ==========
     before_count = len(final)
-    final = [c for c in final if c.get("passed_pools") and
-             "趋势池" in c["passed_pools"] and "技术池" in c["passed_pools"]]
+    final = [c for c in final if c.get("passed_pools")]
     removed = before_count - len(final)
     if removed > 0:
-        print(f"\n  🗑  最终过滤: 去除 {removed} 只趋势池/技术池未同时通过的股票，保留 {len(final)} 只")
+        print(f"\n  🗑  最终过滤: 去除 {removed} 只未通过任何策略池的股票，保留 {len(final)} 只")
+
+    # ========== 频次排序：只留频次最高的前10只 ==========
+    final.sort(key=lambda x: (-x.get("frequency", 0), -x.get("leader_count", 0),
+                               -x.get("sector_limit_count", 0), -x.get("auction_gain", 0)))
+    if len(final) > 10:
+        print(f"\n  🏅 频次筛选: {len(final)} 只 → 保留频次最高的前10只")
+        final = final[:10]
 
     return final
 
