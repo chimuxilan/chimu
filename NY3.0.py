@@ -2772,16 +2772,18 @@ def main():
         return
 
     # ---- 纯抓取模式（--codes 或 全市场）----
-    scrape_all(output_dir=args.output, target_codes=args.codes)
+    try:
+        scrape_all(output_dir=args.output, target_codes=args.codes)
+    except Exception as e:
+        print(f"\n⚠ 抓取出错: {e}")
+        print("  继续尝试分析已有数据...\n")
 
-    # 全市场模式（无参数）默认自动运行分析；--codes 模式需显式 --analyze
-    should_analyze = args.analyze or (not args.codes and not args.inputs)
-    if should_analyze:
-        html_out = args.html or os.path.join(args.output, "screen_report.html")
-        print(f"\n{'═'*60}")
-        print(f"  🚀 自动运行分析...")
-        print(f"{'═'*60}\n")
-        run_from_data_dir(args.output, html_path=html_out)
+    # 无论抓取是否完全成功，都尝试分析已有数据
+    html_out = args.html or os.path.join(args.output, "screen_report.html")
+    print(f"\n{'═'*60}")
+    print(f"  🚀 自动运行分析...")
+    print(f"{'═'*60}\n")
+    run_from_data_dir(args.output, html_path=html_out)
 
 
 if __name__ == "__main__":
