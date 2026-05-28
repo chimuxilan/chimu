@@ -804,7 +804,7 @@ def test_connectivity():
 
 def scrape_all(output_dir: str = "stock_data", target_codes: list[str] = None):
     """
-    完整抓取流程：
+    完整抓取流程（同花顺 Selenium 爬虫）：
     1. 获取全A代码列表（或使用指定代码）
     2. 批量获取实时行情
     3. 批量获取K线历史
@@ -812,121 +812,126 @@ def scrape_all(output_dir: str = "stock_data", target_codes: list[str] = None):
     5. 获取股票详情
     6. 全部保存为JSON
     """
+    import ths_scraper
+
     os.makedirs(output_dir, exist_ok=True)
-    session = _build_session()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     print(f"\n{'═' * 60}")
-    print(f"  🕷️  NYLO — A股数据爬虫 · 开始抓取")
+    print(f"  🕷️  NYLO — 同花顺 Selenium 爬虫 · 开始抓取")
     print(f"  时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  输出目录: {output_dir}/")
     print(f"{'═' * 60}\n")
 
-    # ── 0. 大盘指数 ──
-    print("📊 [1/6] 抓取大盘指数...")
-    indices = fetch_indices(session)
-    for idx in indices:
-        sign = "+" if idx["change_pct"] > 0 else ""
-        print(f"    {idx['name']}: {idx['price']:.2f} ({sign}{idx['change_pct']:.2f}%)")
-    _save_json(indices, f"{output_dir}/indices_{timestamp}.json")
+    # 初始化 Selenium 浏览器
+    print("🌐 启动 Selenium 浏览器...")
+    driver = ths_scraper.init_driver()
+    print("  ✅ 浏览器就绪\n")
 
-    # ── 1. 全A代码列表 ──
-    if target_codes:
-        all_codes = target_codes
-        print(f"\n📋 [2/6] 使用指定代码: {len(all_codes)} 只")
-    else:
-        print(f"\n📋 [2/6] 抓取全A股代码列表...")
-        all_codes = fetch_all_stock_codes(session)
-        print(f"    ✅ 共 {len(all_codes)} 只A股")
-    _save_json(all_codes, f"{output_dir}/all_codes_{timestamp}.json")
+    try:
+        # ── 0. 大盘指数 ──
+        print("📊 [1/6] 抓取大盘指数...")
+        indices = ths_scraper.fetch_indices(driver)
+        for idx in indices:
+            sign = "+" if idx["change_pct"] > 0 else ""
+            print(f"    {idx['name']}: {idx['price']:.2f} ({sign}{idx['change_pct']:.2f}%)")
+        _save_json(indices, f"{output_dir}/indices_{timestamp}.json")
 
-    # ── 2. 批量实时行情 ──
-    print(f"\n📊 [3/6] 抓取实时行情 ({len(all_codes)} 只)...")
-    quotes = fetch_quotes_batch(all_codes, session)
-    print(f"    ✅ 获取到 {len(quotes)} 只行情数据")
-    _save_json(quotes, f"{output_dir}/quotes_{timestamp}.json")
+        # ── 1. 全A代码列表 ──
+        if target_codes:
+            all_codes = target_codes
+            print(f"\n📋 [2/6] 使用指定代码: {len(all_codes)} 只")
+        else:
+            print(f"\n📋 [2/6] 抓取全A股代码列表（同花顺）...")
+            all_codes = ths_scraper.fetch_all_stock_codes(driver)
+            print(f"    ✅ 共 {len(all_codes)} 只主板A股")
+        _save_json(all_codes, f"{output_dir}/all_codes_{timestamp}.json")
 
-    # ── 3. 东财股票详情（市值/量比/换手率）──
-    print(f"\n📊 [4/6] 抓取股票详情（市值/量比/换手率）...")
-    details = fetch_stock_details(all_codes, session)
-    print(f"    ✅ 获取到 {len(details)} 只详情数据")
-    _save_json(details, f"{output_dir}/details_{timestamp}.json")
+        # ── 2. 批量实时行情 ──
+        print(f"\n📊 [3/6] 抓取实时行情 ({len(all_codes)} 只)...")
+        quotes = ths_scraper.fetch_quotes_batch(driver, all_codes)
+        print(f"    ✅ 获取到 {len(quotes)} 只行情数据")
+        _save_json(quotes, f"{output_dir}/quotes_{timestamp}.json")
 
-    # ── 4. 行业板块 + 成分股 ──
-    print(f"\n📊 [5/6] 抓取行业板块 + 成分股...")
-    sectors = fetch_sectors(session)
-    # 序列化时去除不可JSON化的字段
-    sectors_save = {}
-    for sn, sd in sectors.items():
-        sectors_save[sn] = {
-            "code": sd["code"],
-            "limit_up": sd.get("limit_up", 0),
-            "limit_down": sd.get("limit_down", 0),
-            "change_pct": sd.get("change_pct", 0),
-            "stocks": sd.get("stocks", []),
+        # ── 3. 股票详情（市值/量比/换手率）──
+        print(f"\n📊 [4/6] 抓取股票详情（市值/量比/换手率）...")
+        details = ths_scraper.fetch_stock_details(driver, all_codes)
+        print(f"    ✅ 获取到 {len(details)} 只详情数据")
+        _save_json(details, f"{output_dir}/details_{timestamp}.json")
+
+        # ── 4. 行业板块 + 成分股 ──
+        print(f"\n📊 [5/6] 抓取行业板块 + 成分股...")
+        sectors = ths_scraper.fetch_sectors(driver)
+        sectors_save = {}
+        for sn, sd in sectors.items():
+            sectors_save[sn] = {
+                "code": sd.get("code", ""),
+                "limit_up": sd.get("limit_up", 0),
+                "limit_down": sd.get("limit_down", 0),
+                "change_pct": sd.get("change_pct", 0),
+                "stocks": sd.get("stocks", []),
+            }
+        _save_json(sectors_save, f"{output_dir}/sectors_{timestamp}.json")
+
+        # ── 5. K线历史 ──
+        kline_codes = [c for c in all_codes if c.startswith(("60", "00")) and c in quotes]
+        if target_codes:
+            kline_codes = target_codes
+
+        print(f"\n📊 [6/6] 抓取K线历史 ({len(kline_codes)} 只主板, 1000天)...")
+        klines = ths_scraper.fetch_kline_batch(driver, kline_codes, days=1000)
+        klines = supplement_kline_amount(klines, quotes)
+
+        kline_dir = f"{output_dir}/klines"
+        os.makedirs(kline_dir, exist_ok=True)
+        for code, data in klines.items():
+            _save_json(data, f"{kline_dir}/{code}.json")
+        print(f"    ✅ K线已保存到 {kline_dir}/ ({len(klines)} 个文件)")
+
+        # 120分钟K线
+        kline120_dir = f"{output_dir}/klines_120min"
+        os.makedirs(kline120_dir, exist_ok=True)
+        print(f"\n📊 [补充] 抓取120分钟K线 ({len(kline_codes)} 只)...")
+        kline120_count = 0
+        for i, code in enumerate(kline_codes):
+            k120 = ths_scraper.fetch_kline_120min(driver, code, count=60)
+            if k120:
+                _save_json(k120, f"{kline120_dir}/{code}.json")
+                kline120_count += 1
+            if (i + 1) % 100 == 0:
+                print(f"    进度: {i+1}/{len(kline_codes)} ({kline120_count} 有数据)")
+        print(f"    ✅ 120分钟K线已保存到 {kline120_dir}/ ({kline120_count} 个文件)")
+
+        # ── 汇总 ──
+        summary = {
+            "timestamp": datetime.now().isoformat(),
+            "total_codes": len(all_codes),
+            "quotes_count": len(quotes),
+            "details_count": len(details),
+            "sectors_count": len(sectors),
+            "klines_count": len(klines),
+            "klines_120min_count": kline120_count,
+            "files": {
+                "indices": f"indices_{timestamp}.json",
+                "codes": f"all_codes_{timestamp}.json",
+                "quotes": f"quotes_{timestamp}.json",
+                "details": f"details_{timestamp}.json",
+                "sectors": f"sectors_{timestamp}.json",
+                "klines_dir": "klines/",
+                "klines_120min_dir": "klines_120min/",
+            },
         }
-    _save_json(sectors_save, f"{output_dir}/sectors_{timestamp}.json")
+        _save_json(summary, f"{output_dir}/summary.json")
 
-    # ── 5. K线历史（分批，避免请求过多）──
-    # 只对主板股票（60/00开头）且有行情数据的抓K线
-    kline_codes = [c for c in all_codes if c.startswith(("60", "00")) and c in quotes]
-    if target_codes:
-        kline_codes = target_codes  # 指定代码全量抓
+        print(f"\n{'═' * 60}")
+        print(f"  ✅ 全部抓取完成!")
+        print(f"  📂 数据目录: {os.path.abspath(output_dir)}/")
+        print(f"  📊 汇总: {len(quotes)} 只行情 | {len(sectors)} 个板块 | {len(klines)} 只K线 | {kline120_count} 只120分钟K线")
+        print(f"{'═' * 60}\n")
 
-    print(f"\n📊 [6/6] 抓取K线历史 ({len(kline_codes)} 只主板, 1000天)...")
-    klines = fetch_kline_batch(kline_codes, days=1000, max_workers=4, session=session)
-
-    # 补充K线amount字段（新浪K线不含amount，用volume*close估算）
-    print(f"    🔧 补充K线成交额(amount)字段...")
-    klines = supplement_kline_amount(klines, quotes)
-
-    # K线数据量大，按股票分文件保存
-    kline_dir = f"{output_dir}/klines"
-    os.makedirs(kline_dir, exist_ok=True)
-    for code, data in klines.items():
-        _save_json(data, f"{kline_dir}/{code}.json")
-    print(f"    ✅ K线已保存到 {kline_dir}/ ({len(klines)} 个文件)")
-
-    # 抓取120分钟K线（用于技术池MACD检查）
-    kline120_dir = f"{output_dir}/klines_120min"
-    os.makedirs(kline120_dir, exist_ok=True)
-    print(f"\n📊 [补充] 抓取120分钟K线 ({len(kline_codes)} 只)...")
-    kline120_count = 0
-    for i, code in enumerate(kline_codes):
-        k120 = fetch_kline_120min(code, count=60, session=session)
-        if k120:
-            _save_json(k120, f"{kline120_dir}/{code}.json")
-            kline120_count += 1
-        if (i + 1) % 100 == 0:
-            print(f"    进度: {i+1}/{len(kline_codes)} ({kline120_count} 有数据)")
-    print(f"    ✅ 120分钟K线已保存到 {kline120_dir}/ ({kline120_count} 个文件)")
-
-    # ── 汇总 ──
-    summary = {
-        "timestamp": datetime.now().isoformat(),
-        "total_codes": len(all_codes),
-        "quotes_count": len(quotes),
-        "details_count": len(details),
-        "sectors_count": len(sectors),
-        "klines_count": len(klines),
-        "klines_120min_count": kline120_count,
-        "files": {
-            "indices": f"indices_{timestamp}.json",
-            "codes": f"all_codes_{timestamp}.json",
-            "quotes": f"quotes_{timestamp}.json",
-            "details": f"details_{timestamp}.json",
-            "sectors": f"sectors_{timestamp}.json",
-            "klines_dir": "klines/",
-            "klines_120min_dir": "klines_120min/",
-        },
-    }
-    _save_json(summary, f"{output_dir}/summary.json")
-
-    print(f"\n{'═' * 60}")
-    print(f"  ✅ 全部抓取完成!")
-    print(f"  📂 数据目录: {os.path.abspath(output_dir)}/")
-    print(f"  📊 汇总: {len(quotes)} 只行情 | {len(sectors)} 个板块 | {len(klines)} 只K线 | {kline120_count} 只120分钟K线")
-    print(f"{'═' * 60}\n")
+    finally:
+        ths_scraper.close_driver(driver)
+        print("🌐 浏览器已关闭")
 
     return summary
 
@@ -2589,23 +2594,20 @@ def run_from_data_dir(data_dir: str, html_path: str = None, quiet: bool = False)
 # ════════════════════════════════════════════════════
 
 def run_oneclick():
+    import ths_scraper
+
     inputs = sys.argv[1:]
 
     # ---- 解析输入：代码或名称 ----
     codes = []
     if inputs:
-        session = _build_session()
         for inp in inputs:
             inp = inp.strip()
             if inp.isdigit() and len(inp) == 6:
                 codes.append(inp)
             else:
-                result = search_stock(inp, session)
-                if result:
-                    codes.append(result["code"])
-                    print(f"  ✓ {inp} → {result['code']} ({result['name']})")
-                else:
-                    print(f"  ✗ {inp} → 未找到")
+                # 简单名称匹配（不调API）
+                print(f"  ⚠ 名称搜索需要联网，请直接输入股票代码")
         if not codes:
             print("❌ 没有有效股票代码")
             return
@@ -2613,91 +2615,98 @@ def run_oneclick():
     # ---- 临时目录存放抓取数据 ----
     data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_nylo_cache")
     os.makedirs(data_dir, exist_ok=True)
-
-    session = _build_session()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     print(f"\n{'═'*50}")
-    print(f"  NYLO — 抓取 + 分析")
+    print(f"  NYLO — 同花顺 Selenium 抓取 + 分析")
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'═'*50}\n")
 
-    # ---- 1. 大盘指数 ----
-    print("📊 获取大盘...")
-    indices = fetch_indices(session)
-    for idx in indices:
-        sign = "+" if idx["change_pct"] > 0 else ""
-        print(f"  {idx['name']}: {idx['price']:.2f} ({sign}{idx['change_pct']:.2f}%)")
-    _save_json(indices, f"{data_dir}/indices_{timestamp}.json")
+    # 初始化 Selenium
+    print("🌐 启动 Selenium 浏览器...")
+    driver = ths_scraper.init_driver()
+    print("  ✅ 浏览器就绪\n")
 
-    # ---- 2. 行情 ----
-    if codes:
-        print(f"\n📊 获取行情 ({len(codes)} 只)...")
-        quotes = fetch_quotes_batch(codes, session)
-    else:
-        # 全市场：先拿板块，再从板块中提取代码
-        print("\n📊 获取板块数据...")
-        sectors = fetch_sectors(session)
-        _save_json(sectors, f"{data_dir}/sectors_{timestamp}.json")
+    try:
+        # ---- 1. 大盘指数 ----
+        print("📊 获取大盘...")
+        indices = ths_scraper.fetch_indices(driver)
+        for idx in indices:
+            sign = "+" if idx["change_pct"] > 0 else ""
+            print(f"  {idx['name']}: {idx['price']:.2f} ({sign}{idx['change_pct']:.2f}%)")
+        _save_json(indices, f"{data_dir}/indices_{timestamp}.json")
 
-        all_codes = set()
-        for sdata in sectors.values():
-            for item in sdata.get("stocks", []):
-                c = str(item.get("code", ""))
-                if c and len(c) == 6 and c.startswith(("60", "00")):
-                    all_codes.add(c)
-        codes = list(all_codes)
-        print(f"  共 {len(codes)} 只主板股票")
+        # ---- 2. 行情 ----
+        if codes:
+            print(f"\n📊 获取行情 ({len(codes)} 只)...")
+            quotes = ths_scraper.fetch_quotes_batch(driver, codes)
+        else:
+            print("\n📊 获取板块数据...")
+            sectors = ths_scraper.fetch_sectors(driver)
+            _save_json(sectors, f"{data_dir}/sectors_{timestamp}.json")
 
-        print(f"\n📊 获取行情 ({len(codes)} 只)...")
-        quotes = fetch_quotes_batch(codes, session)
+            all_codes = set()
+            for sdata in sectors.values():
+                for item in sdata.get("stocks", []):
+                    c = str(item.get("code", ""))
+                    if c and len(c) == 6 and c.startswith(("60", "00")):
+                        all_codes.add(c)
+            codes = list(all_codes)
+            print(f"  共 {len(codes)} 只主板股票")
 
-    print(f"  ✅ 行情: {len(quotes)} 只")
-    _save_json(quotes, f"{data_dir}/quotes_{timestamp}.json")
+            print(f"\n📊 获取行情 ({len(codes)} 只)...")
+            quotes = ths_scraper.fetch_quotes_batch(driver, codes)
 
-    # ---- 3. 详情 ----
-    print(f"\n📊 获取详情...")
-    details = fetch_stock_details(codes, session)
-    print(f"  ✅ 详情: {len(details)} 只")
-    _save_json(details, f"{data_dir}/details_{timestamp}.json")
+        print(f"  ✅ 行情: {len(quotes)} 只")
+        _save_json(quotes, f"{data_dir}/quotes_{timestamp}.json")
 
-    # ---- 4. 板块（如果还没拿）----
-    sector_files = [f for f in os.listdir(data_dir) if f.startswith("sectors_")]
-    if not sector_files:
-        print(f"\n📊 获取板块...")
-        sectors = fetch_sectors(session)
-        _save_json(sectors, f"{data_dir}/sectors_{timestamp}.json")
+        # ---- 3. 详情 ----
+        print(f"\n📊 获取详情...")
+        details = ths_scraper.fetch_stock_details(driver, codes)
+        print(f"  ✅ 详情: {len(details)} 只")
+        _save_json(details, f"{data_dir}/details_{timestamp}.json")
 
-    # ---- 5. K线 ----
-    print(f"\n📊 获取K线 ({len(codes)} 只)...")
-    klines = fetch_kline_batch(codes, days=1000, max_workers=4, session=session)
-    klines = supplement_kline_amount(klines, quotes)
-    kline_dir = f"{data_dir}/klines"
-    os.makedirs(kline_dir, exist_ok=True)
-    for code, data in klines.items():
-        _save_json(data, f"{kline_dir}/{code}.json")
-    print(f"  ✅ K线: {len(klines)} 只")
+        # ---- 4. 板块（如果还没拿）----
+        sector_files = [f for f in os.listdir(data_dir) if f.startswith("sectors_")]
+        if not sector_files:
+            print(f"\n📊 获取板块...")
+            sectors = ths_scraper.fetch_sectors(driver)
+            _save_json(sectors, f"{data_dir}/sectors_{timestamp}.json")
 
-    # ---- 6. 120分钟K线 ----
-    kline120_dir = f"{data_dir}/klines_120min"
-    os.makedirs(kline120_dir, exist_ok=True)
-    k120_count = 0
-    for code in codes:
-        k120 = fetch_kline_120min(code, count=60, session=session)
-        if k120:
-            _save_json(k120, f"{kline120_dir}/{code}.json")
-            k120_count += 1
-    print(f"  ✅ 120分钟K线: {k120_count} 只")
+        # ---- 5. K线 ----
+        print(f"\n📊 获取K线 ({len(codes)} 只)...")
+        klines = ths_scraper.fetch_kline_batch(driver, codes, days=1000)
+        klines = supplement_kline_amount(klines, quotes)
+        kline_dir = f"{data_dir}/klines"
+        os.makedirs(kline_dir, exist_ok=True)
+        for code, data in klines.items():
+            _save_json(data, f"{kline_dir}/{code}.json")
+        print(f"  ✅ K线: {len(klines)} 只")
 
-    # ---- 7. 运行分析 ----
-    html_out = f"{data_dir}/report.html"
-    print(f"\n{'═'*50}")
-    print(f"  🚀 开始分析...")
-    print(f"{'═'*50}\n")
+        # ---- 6. 120分钟K线 ----
+        kline120_dir = f"{data_dir}/klines_120min"
+        os.makedirs(kline120_dir, exist_ok=True)
+        k120_count = 0
+        for code in codes:
+            k120 = ths_scraper.fetch_kline_120min(driver, code, count=60)
+            if k120:
+                _save_json(k120, f"{kline120_dir}/{code}.json")
+                k120_count += 1
+        print(f"  ✅ 120分钟K线: {k120_count} 只")
 
-    run_from_data_dir(data_dir, html_path=html_out)
+        # ---- 7. 运行分析 ----
+        html_out = f"{data_dir}/report.html"
+        print(f"\n{'═'*50}")
+        print(f"  🚀 开始分析...")
+        print(f"{'═'*50}\n")
 
-    print(f"\n📄 报告: {html_out}")
+        run_from_data_dir(data_dir, html_path=html_out)
+
+        print(f"\n📄 报告: {html_out}")
+
+    finally:
+        ths_scraper.close_driver(driver)
+        print("🌐 浏览器已关闭")
 
 
 # ════════════════════════════════════════════════════
