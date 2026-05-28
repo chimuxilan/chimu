@@ -27,8 +27,123 @@ _UAS = [
 
 
 def init_driver():
-    """初始化 Selenium Chrome 无头浏览器"""
-    opts = Options()
+    """初始化 Selenium 浏览器（自动检测 Chrome/Edge，自动下载 driver）"""
+    import shutil, os, subprocess
+
+    # 检测可用的浏览器
+    chrome_paths = [
+        "C:/Program Files/Google/Chrome/Application/chrome.exe",
+        "C:/Program Files (x86)/Google/Chrome/Application/chrome.exe",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/google-chrome",
+    ]
+    edge_paths = [
+        "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe",
+        "C:/Program Files/Microsoft/Edge/Application/msedge.exe",
+        "/usr/bin/microsoft-edge",
+        "/usr/bin/microsoft-edge-stable",
+    ]
+
+    browser = None
+    browser_path = None
+
+    # 优先 Chrome，其次 Edge
+    for p in chrome_paths:
+        if os.path.exists(p):
+            browser = "chrome"
+            browser_path = p
+            break
+    if not browser:
+        for p in edge_paths:
+            if os.path.exists(p):
+                browser = "edge"
+                browser_path = p
+                break
+
+    if not browser:
+        # 都找不到，用 which 查找
+        if shutil.which("chrome") or shutil.which("google-chrome"):
+            browser = "chrome"
+        elif shutil.which("msedge") or shutil.which("microsoft-edge"):
+            browser = "edge"
+        else:
+            raise RuntimeError(
+                "未找到 Chrome 或 Edge 浏览器！\n"
+                "请安装: https://www.google.com/chrome/ 或使用系统自带的 Edge"
+            )
+
+    print(f"    检测到: {browser.upper()} ({browser_path or 'PATH'})")
+
+    # 尝试用 webdriver_manager 自动下载 driver
+    driver = None
+    try:
+        from webdriver_manager.chrome import ChromeDriverManager
+        from webdriver_manager.microsoft import EdgeChromiumManager
+        from selenium.webdriver.chrome.service import Service as ChromeService
+        from selenium.webdriver.edge.service import Service as EdgeService
+
+        if browser == "chrome":
+            opts = Options()
+            if browser_path:
+                opts.binary_location = browser_path
+            _set_common_opts(opts)
+            service = ChromeService(ChromeDriverManager().install())
+            driver = webdriver.Chrome(service=service, options=opts)
+        else:
+            from selenium.webdriver import EdgeOptions
+            opts = EdgeOptions()
+            if browser_path:
+                opts.binary_location = browser_path
+            _set_common_opts(opts)
+            service = EdgeService(EdgeChromiumManager().install())
+            driver = webdriver.Edge(service=service, options=opts)
+
+        print("    ✅ webdriver_manager 自动配置成功")
+
+    except ImportError:
+        # webdriver_manager 未安装，尝试直接启动
+        print("    ⚠ webdriver_manager 未安装，尝试直接启动...")
+        if browser == "chrome":
+            opts = Options()
+            if browser_path:
+                opts.binary_location = browser_path
+            _set_common_opts(opts)
+            driver = webdriver.Chrome(options=opts)
+        else:
+            from selenium.webdriver import EdgeOptions
+            opts = EdgeOptions()
+            if browser_path:
+                opts.binary_location = browser_path
+            _set_common_opts(opts)
+            driver = webdriver.Edge(options=opts)
+
+    except Exception as e:
+        # driver 不匹配，尝试直接启动（Selenium 4 自带 driver 管理）
+        print(f"    ⚠ 自动下载失败({e})，尝试 Selenium 自带 driver...")
+        if browser == "chrome":
+            opts = Options()
+            if browser_path:
+                opts.binary_location = browser_path
+            _set_common_opts(opts)
+            driver = webdriver.Chrome(options=opts)
+        else:
+            from selenium.webdriver import EdgeOptions
+            opts = EdgeOptions()
+            if browser_path:
+                opts.binary_location = browser_path
+            _set_common_opts(opts)
+            driver = webdriver.Edge(options=opts)
+
+    driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+        "source": "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
+    })
+    driver.set_page_load_timeout(20)
+    return driver
+
+
+def _set_common_opts(opts):
+    """设置通用浏览器选项"""
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
@@ -36,23 +151,10 @@ def init_driver():
     opts.add_argument("--disable-gpu")
     opts.add_argument("--window-size=1920,1080")
     opts.add_argument(f"--user-agent={random.choice(_UAS)}")
+    opts.add_argument("--log-level=3")
+    opts.add_argument("--silent")
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option("useAutomationExtension", False)
-
-    import shutil, os
-    for p in ["/usr/bin/chromium", "/usr/bin/chromium-browser", "/usr/bin/google-chrome",
-              "C:/Program Files/Google/Chrome/Application/chrome.exe",
-              "C:/Program Files (x86)/Google/Chrome/Application/chrome.exe"]:
-        if shutil.which(p) or os.path.exists(p):
-            opts.binary_location = p
-            break
-
-    driver = webdriver.Chrome(options=opts)
-    driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-        "source": "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
-    })
-    driver.set_page_load_timeout(20)
-    return driver
 
 
 def _build_session(driver=None):
