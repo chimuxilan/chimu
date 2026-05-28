@@ -456,7 +456,7 @@ def supplement_kline_amount(kline_map: dict, quotes: dict) -> dict:
 # ════════════════════════════════════════════════════
 
 def fetch_all_stock_codes(session: requests.Session = None) -> list[str]:
-    """获取全部A股代码列表（分页请求）"""
+    """获取全部A股代码列表（分页请求，每页100条）"""
     if session is None:
         session = _build_session()
 
@@ -479,10 +479,15 @@ def fetch_all_stock_codes(session: requests.Session = None) -> list[str]:
             if not data:
                 break
             for item in data:
+                symbol = str(item.get("symbol", ""))
                 code = str(item.get("code", ""))
+                # 只要沪深主板（sh/sz开头），跳过北交所(bj)、创业板(300)、科创板(688)等
+                if not symbol.startswith(("sh", "sz")):
+                    continue
                 if code and len(code) == 6 and code.isdigit():
                     codes.append(code)
-            if len(data) < 1000:
+            # API实际每页返回100条，不足100说明已到最后一页
+            if len(data) < 100:
                 break
             page += 1
         except json.JSONDecodeError:
