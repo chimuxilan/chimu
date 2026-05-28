@@ -428,37 +428,6 @@ def fetch_kline_120min(code: str, count: int = 60, session: requests.Session = N
         return []
 
 
-def fetch_kline_intraday(code: str, scale: int = 60, count: int = 60,
-                         session: requests.Session = None) -> list[dict]:
-    """
-    获取分钟级K线数据（新浪接口）
-    scale: 5/15/30/60 分钟
-    返回: [{"day", "open", "close", "high", "low", "volume"}, ...]
-    """
-    if session is None:
-        session = _build_session()
-
-    sym = f"sh{code}" if code.startswith("6") else f"sz{code}"
-    r = safe_request(
-        "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData",
-        _limiter_sina, session,
-        params={"symbol": sym, "scale": str(scale), "ma": "no", "datalen": str(count)},
-        headers={"Referer": "https://finance.sina.com.cn/"},
-    )
-    if not r or not r.text.strip() or r.text.strip() == "null":
-        return []
-
-    try:
-        data = json.loads(r.text)
-        if not data:
-            return []
-        return [{"day": k.get("day", ""), "open": k.get("open", "0"), "close": k.get("close", "0"),
-                 "high": k.get("high", "0"), "low": k.get("low", "0"),
-                 "volume": k.get("volume", "0")} for k in data]
-    except Exception:
-        return []
-
-
 def supplement_kline_amount(kline_map: dict, quotes: dict) -> dict:
     """
     补充K线数据中缺失的amount(成交额)字段。
@@ -927,25 +896,6 @@ def scrape_all(output_dir: str = "stock_data", target_codes: list[str] = None):
             print(f"    进度: {i+1}/{len(kline_codes)} ({kline120_count} 有数据)")
     print(f"    ✅ 120分钟K线已保存到 {kline120_dir}/ ({kline120_count} 个文件)")
 
-    # 抓取60/30/15分钟K线（多周期MACD共振检查）
-    intraday_counts = {}
-    for tf_scale, tf_name, tf_dir in [(60, "60分钟", "klines_60min"),
-                                       (30, "30分钟", "klines_30min"),
-                                       (15, "15分钟", "klines_15min")]:
-        tf_path = f"{output_dir}/{tf_dir}"
-        os.makedirs(tf_path, exist_ok=True)
-        print(f"\n📊 [补充] 抓取{tf_name}K线 ({len(kline_codes)} 只)...")
-        tf_count = 0
-        for i, code in enumerate(kline_codes):
-            kdata = fetch_kline_intraday(code, scale=tf_scale, count=80, session=session)
-            if kdata:
-                _save_json(kdata, f"{tf_path}/{code}.json")
-                tf_count += 1
-            if (i + 1) % 100 == 0:
-                print(f"    进度: {i+1}/{len(kline_codes)} ({tf_count} 有数据)")
-        intraday_counts[tf_name] = tf_count
-        print(f"    ✅ {tf_name}K线已保存到 {tf_path}/ ({tf_count} 个文件)")
-
     # ── 汇总 ──
     summary = {
         "timestamp": datetime.now().isoformat(),
@@ -955,9 +905,6 @@ def scrape_all(output_dir: str = "stock_data", target_codes: list[str] = None):
         "sectors_count": len(sectors),
         "klines_count": len(klines),
         "klines_120min_count": kline120_count,
-        "klines_60min_count": intraday_counts.get("60分钟", 0),
-        "klines_30min_count": intraday_counts.get("30分钟", 0),
-        "klines_15min_count": intraday_counts.get("15分钟", 0),
         "files": {
             "indices": f"indices_{timestamp}.json",
             "codes": f"all_codes_{timestamp}.json",
@@ -966,9 +913,6 @@ def scrape_all(output_dir: str = "stock_data", target_codes: list[str] = None):
             "sectors": f"sectors_{timestamp}.json",
             "klines_dir": "klines/",
             "klines_120min_dir": "klines_120min/",
-            "klines_60min_dir": "klines_60min/",
-            "klines_30min_dir": "klines_30min/",
-            "klines_15min_dir": "klines_15min/",
         },
     }
     _save_json(summary, f"{output_dir}/summary.json")
@@ -976,10 +920,7 @@ def scrape_all(output_dir: str = "stock_data", target_codes: list[str] = None):
     print(f"\n{'═' * 60}")
     print(f"  ✅ 全部抓取完成!")
     print(f"  📂 数据目录: {os.path.abspath(output_dir)}/")
-    k60c = intraday_counts.get("60分钟", 0)
-    k30c = intraday_counts.get("30分钟", 0)
-    k15c = intraday_counts.get("15分钟", 0)
-    print(f"  📊 汇总: {len(quotes)} 只行情 | {len(sectors)} 个板块 | {len(klines)} 只日K | 120m:{kline120_count} | 60m:{k60c} | 30m:{k30c} | 15m:{k15c}")
+    print(f"  📊 汇总: {len(quotes)} 只行情 | {len(sectors)} 个板块 | {len(klines)} 只K线 | {kline120_count} 只120分钟K线")
     print(f"{'═' * 60}\n")
 
     return summary
@@ -1007,9 +948,6 @@ def _save_json(data, path):
 
 # 全局缓存
 _macd_120min_cache = {}
-_macd_60min_cache = {}
-_macd_30min_cache = {}
-_macd_15min_cache = {}
 _sector_kline_cache = {}
 
 @dataclass
@@ -1456,63 +1394,6 @@ def _check_macd_120min_up(code: str, cached_klines: list[dict] = None,
     return result
 
 
-def _check_macd_intraday_up(code: str, klines: list[dict], cache: dict,
-                            cache_key: str = None) -> bool:
-    """
-    通用分钟级MACD上行检查
-    检查MACD线当前 > 前一根 且 MACD > 0（即红柱上行）
-    klines: 该周期的K线数据
-    cache: 对应周期的缓存dict
-    """
-    key = cache_key or code
-    if key in cache:
-        return cache[key]
-
-    if not klines or len(klines) < 35:
-        cache[key] = False
-        return False
-
-    closes = [float(k.get("close", 0)) for k in klines if float(k.get("close", 0)) > 0]
-    if len(closes) < 35:
-        cache[key] = False
-        return False
-
-    macd_line, _, _ = _compute_macd(closes)
-    if len(macd_line) < 2:
-        cache[key] = False
-        return False
-
-    # MACD上行且为正（红柱）
-    result = macd_line[-1] > macd_line[-2] and macd_line[-1] > 0
-    cache[key] = result
-    return result
-
-
-def _check_multi_timeframe_macd_up(code: str, klines_day: list[dict] = None,
-                                   kline120: list[dict] = None,
-                                   kline60: list[dict] = None,
-                                   kline30: list[dict] = None,
-                                   kline15: list[dict] = None) -> tuple[bool, str]:
-    """
-    多周期MACD共振检查：120/60/30/15分钟全部MACD红柱上行
-    返回 (通过?, 原因)
-    """
-    # 120分钟
-    if not _check_macd_120min_up(code, cached_klines=klines_day, cached_klines_120min=kline120):
-        return False, "120分钟MACD未上行"
-    # 60分钟
-    if not _check_macd_intraday_up(code, kline60 or [], _macd_60min_cache, f"{code}_60"):
-        return False, "60分钟MACD未上行"
-    # 30分钟
-    if not _check_macd_intraday_up(code, kline30 or [], _macd_30min_cache, f"{code}_30"):
-        return False, "30分钟MACD未上行"
-    # 15分钟
-    if not _check_macd_intraday_up(code, kline15 or [], _macd_15min_cache, f"{code}_15"):
-        return False, "15分钟MACD未上行"
-
-    return True, "四周期MACD共振上行"
-
-
 def _check_weekly_macd_red_growing(code: str, cached_klines: list[dict] = None) -> bool:
     """
     检查周MACD红柱变大
@@ -1917,16 +1798,14 @@ def pool_trend(c: dict, klines: list[dict], tc: dict = None, em: dict = None) ->
 def pool_technical(code: str, klines: list[dict], name: str = "",
                    price: float = 0, market_cap_yi: float = 0,
                    sector: str = "", sector_code: str = "",
-                   kline120_map: dict = None, sector_klines: dict = None,
-                   kline60_map: dict = None, kline30_map: dict = None,
-                   kline15_map: dict = None) -> tuple[bool, str]:
+                   kline120_map: dict = None, sector_klines: dict = None) -> tuple[bool, str]:
     """
     策略池4 · 技术池（多周期MACD共振）
     ─────────────────────────────────
     条件:
       1.  主板（沪60/深00）
       2.  非ST
-      3.  120/60/30/15分钟MACD全部红柱上行（多周期共振）
+      3.  120分钟MACD向上
       4.  市值 < 400亿
       5.  价格 < 120元
       6.  月MACD红柱向上
@@ -1941,16 +1820,10 @@ def pool_technical(code: str, klines: list[dict], name: str = "",
     # 2. 非ST
     if "ST" in name.upper():
         return False, "ST"
-    # 3. 多周期MACD共振（120/60/30/15分钟全部红柱上行）
+    # 3. 120分钟MACD向上
     k120 = (kline120_map or {}).get(code, [])
-    k60 = (kline60_map or {}).get(code, [])
-    k30 = (kline30_map or {}).get(code, [])
-    k15 = (kline15_map or {}).get(code, [])
-    ok_multi, reason_multi = _check_multi_timeframe_macd_up(
-        code, klines_day=klines, kline120=k120,
-        kline60=k60, kline30=k30, kline15=k15)
-    if not ok_multi:
-        return False, reason_multi
+    if not _check_macd_120min_up(code, cached_klines=klines, cached_klines_120min=k120):
+        return False, "120分钟MACD未向上"
     # 4. 市值 < 400亿
     if market_cap_yi >= 400:
         return False, "市值≥400亿"
@@ -2345,21 +2218,6 @@ def run_from_data_dir(data_dir: str, html_path: str = None, quiet: bool = False)
                 kline120_map[code] = json.load(f)
         print(f"  ✅ 120分钟K线: {len(kline120_map)} 只")
 
-    # ---- 6b. 加载60/30/15分钟K线 ----
-    kline60_map = {}
-    kline30_map = {}
-    kline15_map = {}
-    for tf_name, tf_dir, tf_map in [("60分钟", "klines_60min", kline60_map),
-                                     ("30分钟", "klines_30min", kline30_map),
-                                     ("15分钟", "klines_15min", kline15_map)]:
-        tf_path = os.path.join(data_dir, tf_dir)
-        if os.path.isdir(tf_path):
-            for kf in _glob.glob(os.path.join(tf_path, "*.json")):
-                code = os.path.splitext(os.path.basename(kf))[0]
-                with open(kf, "r", encoding="utf-8") as f:
-                    tf_map[code] = json.load(f)
-            print(f"  ✅ {tf_name}K线: {len(tf_map)} 只")
-
     # 板块K线（目前未提供，默认空）
     sector_klines = {}
 
@@ -2553,9 +2411,7 @@ def run_from_data_dir(data_dir: str, html_path: str = None, quiet: bool = False)
         ok_tech, reason_tech = pool_technical(code, klines, name=c.get("name", ""),
                                               price=c["price"], market_cap_yi=c.get("market_cap_yi", 0),
                                               sector=c.get("sector", ""), sector_code=c.get("sector_code", ""),
-                                              kline120_map=kline120_map, sector_klines=sector_klines,
-                                              kline60_map=kline60_map, kline30_map=kline30_map,
-                                              kline15_map=kline15_map)
+                                              kline120_map=kline120_map, sector_klines=sector_klines)
         # 量价池
         ok_vp, _ = pool_volume_price(c, tc, em, klines=klines)
 
@@ -2749,6 +2605,9 @@ def run_oneclick():
             print("❌ 没有有效股票代码")
             return
 
+    # ---- 导入分析模块 ----
+    from 分析筹码_主板筛选V3 import run_from_data_dir
+
     # ---- 临时目录存放抓取数据 ----
     data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_nylo_cache")
     os.makedirs(data_dir, exist_ok=True)
@@ -2828,20 +2687,6 @@ def run_oneclick():
             k120_count += 1
     print(f"  ✅ 120分钟K线: {k120_count} 只")
 
-    # ---- 6b. 60/30/15分钟K线（多周期MACD共振）----
-    for tf_scale, tf_name, tf_dir in [(60, "60分钟", "klines_60min"),
-                                       (30, "30分钟", "klines_30min"),
-                                       (15, "15分钟", "klines_15min")]:
-        tf_path = f"{data_dir}/{tf_dir}"
-        os.makedirs(tf_path, exist_ok=True)
-        tf_count = 0
-        for code in codes:
-            kdata = fetch_kline_intraday(code, scale=tf_scale, count=80, session=session)
-            if kdata:
-                _save_json(kdata, f"{tf_path}/{code}.json")
-                tf_count += 1
-        print(f"  ✅ {tf_name}K线: {tf_count} 只")
-
     # ---- 7. 运行分析 ----
     html_out = f"{data_dir}/report.html"
     print(f"\n{'═'*50}")
@@ -2851,10 +2696,6 @@ def run_oneclick():
     run_from_data_dir(data_dir, html_path=html_out)
 
     print(f"\n📄 报告: {html_out}")
-
-
-if __name__ == "__main__":
-    main()
 
 
 # ════════════════════════════════════════════════════
@@ -2882,7 +2723,6 @@ def main():
     parser.add_argument("--test", "-t", action="store_true", help="测试接口连通性")
     parser.add_argument("--output", "-o", default="stock_data", help="输出目录")
     parser.add_argument("--data-dir", "-d", help="从NYLO数据目录离线分析（无需联网）")
-    parser.add_argument("--image", "-i", help="股票截图图片路径")
     parser.add_argument("--html", default=None, help="HTML报告保存路径")
     parser.add_argument("--analyze", "-a", action="store_true", help="抓取完成后自动运行分析")
     parser.add_argument("--quiet", "-q", action="store_true", help="静默模式")
