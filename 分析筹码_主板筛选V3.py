@@ -2377,9 +2377,9 @@ def screen_mainboard_strategy() -> list[dict]:
         for p, cnt in sorted(pool_counts.items(), key=lambda x: -x[1]):
             print(f"    ✅ {p}: {cnt} 只")
 
-    # ========== 第十步半：策略池4(技术池)深度分析 ==========
-    # 对所有最终入选股票再过一遍技术池，标注MACD共振状态
-    print(f"\n📊 执行策略池4(技术池)深度分析（{len(final)} 只）...")
+    # ========== 第十步半：策略池4(技术池)过滤 ==========
+    # 对初选池股票再过一遍技术池，通过的才留下继续分析
+    print(f"\n📊 执行策略池4(技术池)过滤（{len(final)} 只）...")
     _tech_pass = 0
     _tech_fail = 0
     for c in final:
@@ -2451,7 +2451,17 @@ def screen_mainboard_strategy() -> list[dict]:
 
     print(f"  ✅ 技术池通过: {_tech_pass} 只")
     if _tech_fail > 0:
-        print(f"  ⚠  技术池未通过: {_tech_fail} 只（已标注，可参考但不淘汰）")
+        print(f"  🗑  技术池未通过: {_tech_fail} 只，淘汰")
+
+    # ========== 策略池4过滤：只留通过技术池的股票 ==========
+    before_pool4 = len(final)
+    final = [c for c in final if c.get("tech_pool_pass")]
+    removed_pool4 = before_pool4 - len(final)
+    if removed_pool4 > 0:
+        print(f"\n  🗑  策略池4过滤: 淘汰 {removed_pool4} 只，保留 {len(final)} 只")
+    if not final:
+        print("  ⚠  策略池4过滤后无股票剩余")
+        return []
 
     # 输出板块分布统计
     sector_result = {}
@@ -2801,6 +2811,31 @@ def screen_mainboard_strategy() -> list[dict]:
         freq = (1 if vr >= 5 else 0) + (1 if chg >= 5 else 0) + (1 if rr >= 60 else 0) + (1 if cr >= 3 else 0)
         c["frequency"] = freq
         c["strategy"] = _compute_screen_strategy(c)
+
+    # ========== 策略池4(技术池)过滤 ==========
+    print(f"\n📊 执行策略池4(技术池)过滤（{len(final)} 只）...")
+    kline_map_fb = _fetch_kline_concurrent([c["code"] for c in final], days=1000)
+    _tech_pass = 0
+    for c in final:
+        code = c["code"]
+        klines = kline_map_fb.get(code, [])
+        ok_tech, reason_tech = pool_technical(code, klines, name=c.get("name", ""),
+                                              price=c["price"], market_cap_yi=c.get("market_cap_yi", 0),
+                                              sector=c.get("sector", ""), sector_code=c.get("sector_code", ""))
+        c["tech_pool_pass"] = ok_tech
+        c["tech_pool_reason"] = reason_tech if not ok_tech else ""
+        if ok_tech:
+            _tech_pass += 1
+
+    print(f"  ✅ 技术池通过: {_tech_pass} 只")
+    _tech_fail = len(final) - _tech_pass
+    if _tech_fail > 0:
+        print(f"  🗑  技术池未通过: {_tech_fail} 只，淘汰")
+    before_pool4 = len(final)
+    final = [c for c in final if c.get("tech_pool_pass")]
+    if not final:
+        print("  ⚠  策略池4过滤后无股票剩余")
+        return []
 
     # 按板块类型分组，识别龙头
     board_groups = {}
