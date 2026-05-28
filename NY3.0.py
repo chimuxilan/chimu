@@ -2605,9 +2605,6 @@ def run_oneclick():
             print("❌ 没有有效股票代码")
             return
 
-    # ---- 导入分析模块 ----
-    from 分析筹码_主板筛选V3 import run_from_data_dir
-
     # ---- 临时目录存放抓取数据 ----
     data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_nylo_cache")
     os.makedirs(data_dir, exist_ok=True)
@@ -2763,8 +2760,9 @@ def main():
     # ---- 纯抓取模式（--codes 或 全市场）----
     scrape_all(output_dir=args.output, target_codes=args.codes)
 
-    # 抓取完成后自动运行分析
-    if args.analyze:
+    # 全市场模式（无参数）默认自动运行分析；--codes 模式需显式 --analyze
+    should_analyze = args.analyze or (not args.codes and not args.inputs)
+    if should_analyze:
         html_out = args.html or os.path.join(args.output, "screen_report.html")
         print(f"\n{'═'*60}")
         print(f"  🚀 自动运行分析...")
