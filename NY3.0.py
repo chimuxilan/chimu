@@ -535,7 +535,25 @@ def fetch_sectors(session: requests.Session = None) -> dict:
             "fields": "f2,f3,f12,f14,f104,f105",
         },
         headers={"Referer": "https://quote.eastmoney.com/center/boardlist.html"},
+        max_retries=5,
     )
+    # 如果失败，等10秒重试一次
+    if not r:
+        print("    ⏳ 板块列表首次失败，等待10秒后重试...")
+        time.sleep(10)
+        r = safe_request(
+            "https://push2.eastmoney.com/api/qt/clist/get",
+            _limiter_eastmoney, session,
+            params={
+                "cb": "jQuery", "pn": "1", "pz": "50", "po": "1", "np": "1",
+                "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+                "fltt": "2", "invt": "2", "fid": "f3",
+                "fs": "m:90+t:2+f:!50",
+                "fields": "f2,f3,f12,f14,f104,f105",
+            },
+            headers={"Referer": "https://quote.eastmoney.com/center/boardlist.html"},
+            max_retries=5,
+        )
     if not r:
         print("    ❌ 板块列表获取失败")
         return sectors
@@ -599,7 +617,7 @@ def fetch_sectors(session: requests.Session = None) -> dict:
         return sname, []
 
     print(f"    📦 获取各板块成分股...")
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    with ThreadPoolExecutor(max_workers=3) as executor:
         futures = {executor.submit(_fetch_stocks, sn, sectors[sn]["code"]): sn for sn in sectors}
         for future in as_completed(futures):
             sname, stocks = future.result()
@@ -893,6 +911,9 @@ def scrape_all(output_dir: str = "stock_data", target_codes: list[str] = None):
         details = fetch_stock_details(all_codes, session, quotes_ref=quotes)
         print(f"    ✅ 获取到 {len(details)} 只详情数据")
         _save_json(details, f"{output_dir}/details_{timestamp}.json")
+
+        # 东财冷却：股票详情打完后等几秒再请求板块
+        time.sleep(3)
 
         # ── 4. 行业板块 + 成分股（东财）──
         print(f"\n📊 [5/6] 抓取行业板块 + 成分股...")
