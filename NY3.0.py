@@ -1134,29 +1134,104 @@ def scrape_all(output_dir: str = "stock_data", target_codes: list[str] = None):
             _save_json(data, f"{kline_dir}/{code}.json")
         print(f"    ✅ K线已保存到 {kline_dir}/ ({len(klines)} 个文件)")
 
-        # 120分钟K线（新浪60分钟合并，并发）
+        # ── 冷却：避免连续请求触发限流 ──
+        print(f"    ⏳ 等待 10 秒冷却，避免新浪限流...")
+        time.sleep(10)
+
+        # 120分钟K线（异步低并发，防封）
         kline120_dir = f"{output_dir}/klines_120min"
         os.makedirs(kline120_dir, exist_ok=True)
-        print(f"\n📊 [补充] 抓取120分钟K线 ({len(kline_codes)} 只, 8线程)...")
-        kline120_count = 0
-        kline120_lock = threading.Lock()
+        print(f"\n📊 [补充] 抓取120分钟K线 ({len(kline_codes)} 只, 异步10并发)...")
 
-        def _fetch_120(code):
-            nonlocal kline120_count
-            k120 = fetch_kline_120min(code, count=60, session=session)
-            if k120:
-                _save_json(k120, f"{kline120_dir}/{code}.json")
-                with kline120_lock:
-                    kline120_count += 1
-            return code
+        async def _async_fetch_120_batch(codes, concurrency=10):
+            semaphore = asyncio.Semaphore(concurrency)
+            connector = aiohttp.TCPConnector(limit=concurrency, limit_per_host=concurrency)
+            timeout = aiohttp.ClientTimeout(total=20)
+            count = 0
+            done_count = 0
+            rate_lock = asyncio.Lock()
+            last_time = 0.0
 
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            futures = {executor.submit(_fetch_120, c): c for c in kline_codes}
-            done = 0
-            for future in as_completed(futures):
-                done += 1
-                if done % 200 == 0:
-                    print(f"    进度: {done}/{len(kline_codes)} ({kline120_count} 有数据)")
+            async def _rate_wait():
+                nonlocal last_time
+                async with rate_lock:
+                    now = asyncio.get_event_loop().time()
+                    gap = now - last_time
+                    if gap < 0.1:
+                        await asyncio.sleep(0.1 - gap)
+                    last_time = asyncio.get_event_loop().time()
+
+            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                async def _fetch_one(code):
+                    nonlocal count, done_count
+                    sym = f"sh{code}" if code.startswith("6") else f"sz{code}"
+                    url = "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData"
+                    params = {"symbol": sym, "scale": "60", "ma": "no", "datalen": 120}
+                    headers = {"Referer": "https://finance.sina.com.cn/", "User-Agent": _random_ua_async()}
+
+                    await _rate_wait()
+                    async with semaphore:
+                        try:
+                            async with session.get(url, params=params, headers=headers,
+                                                   timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                                if resp.status == 429:
+                                    await asyncio.sleep(3 + random.uniform(0, 2))
+                                    return code, []
+                                if resp.status != 200:
+                                    return code, []
+                                text = await resp.text()
+                                if not text.strip() or text.strip() == "null":
+                                    return code, []
+                                m60 = json.loads(text)
+                                if not m60 or len(m60) < 2:
+                                    return code, []
+                                m120 = []
+                                for i in range(0, len(m60) - 1, 2):
+                                    a, b = m60[i], m60[i + 1]
+                                    m120.append({
+                                        "day": b["day"],
+                                        "open": a["open"],
+                                        "close": b["close"],
+                                        "high": str(max(float(a["high"]), float(b["high"]))),
+                                        "low": str(min(float(a["low"]), float(b["low"]))),
+                                        "volume": str(int(float(a.get("volume", 0)) + float(b.get("volume", 0)))),
+                                    })
+                                return code, m120
+                        except Exception:
+                            return code, []
+
+                tasks = [_fetch_one(c) for c in codes]
+                for coro in asyncio.as_completed(tasks):
+                    code, k120 = await coro
+                    done_count += 1
+                    if k120:
+                        _save_json(k120, f"{kline120_dir}/{code}.json")
+                        count += 1
+                    if done_count % 200 == 0:
+                        print(f"    进度: {done_count}/{len(codes)} ({count} 有数据)")
+            return count
+
+        if _HAS_AIOHTTP:
+            kline120_count = asyncio.run(_async_fetch_120_batch(kline_codes, concurrency=10))
+        else:
+            kline120_count = 0
+            kline120_lock = threading.Lock()
+            def _fetch_120(code):
+                nonlocal kline120_count
+                k120 = fetch_kline_120min(code, count=60, session=session)
+                if k120:
+                    _save_json(k120, f"{kline120_dir}/{code}.json")
+                    with kline120_lock:
+                        kline120_count += 1
+                return code
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                futures = {executor.submit(_fetch_120, c): c for c in kline_codes}
+                done = 0
+                for future in as_completed(futures):
+                    done += 1
+                    if done % 200 == 0:
+                        print(f"    进度: {done}/{len(kline_codes)} ({kline120_count} 有数据)")
+
         print(f"    ✅ 120分钟K线已保存到 {kline120_dir}/ ({kline120_count} 个文件)")
 
         # ── 汇总 ──
