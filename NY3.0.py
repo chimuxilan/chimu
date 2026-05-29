@@ -45,6 +45,7 @@ import argparse
 import html as html_module
 import glob as _glob
 import subprocess
+import threading
 
 
 # ════════════════════════════════════════════════════
@@ -821,6 +822,15 @@ def scrape_all(output_dir: str = "stock_data", target_codes: list[str] = None):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     session = _build_session()
 
+    # 清理旧的时间戳文件，防止 glob 加载到旧数据
+    for pattern in ("quotes_*.json", "details_*.json", "sectors_*.json",
+                    "indices_*.json", "all_codes_*.json"):
+        for old in _glob.glob(os.path.join(output_dir, pattern)):
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+
     print(f"\n{'═' * 60}")
     print(f"  🕷️  NYLO — A股数据抓取 · 开始抓取（纯HTTP模式）")
     print(f"  时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -887,18 +897,29 @@ def scrape_all(output_dir: str = "stock_data", target_codes: list[str] = None):
             _save_json(data, f"{kline_dir}/{code}.json")
         print(f"    ✅ K线已保存到 {kline_dir}/ ({len(klines)} 个文件)")
 
-        # 120分钟K线（新浪60分钟合并）
+        # 120分钟K线（新浪60分钟合并，并发）
         kline120_dir = f"{output_dir}/klines_120min"
         os.makedirs(kline120_dir, exist_ok=True)
-        print(f"\n📊 [补充] 抓取120分钟K线 ({len(kline_codes)} 只)...")
+        print(f"\n📊 [补充] 抓取120分钟K线 ({len(kline_codes)} 只, 8线程)...")
         kline120_count = 0
-        for i, code in enumerate(kline_codes):
+        kline120_lock = threading.Lock()
+
+        def _fetch_120(code):
+            nonlocal kline120_count
             k120 = fetch_kline_120min(code, count=60, session=session)
             if k120:
                 _save_json(k120, f"{kline120_dir}/{code}.json")
-                kline120_count += 1
-            if (i + 1) % 100 == 0:
-                print(f"    进度: {i+1}/{len(kline_codes)} ({kline120_count} 有数据)")
+                with kline120_lock:
+                    kline120_count += 1
+            return code
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = {executor.submit(_fetch_120, c): c for c in kline_codes}
+            done = 0
+            for future in as_completed(futures):
+                done += 1
+                if done % 200 == 0:
+                    print(f"    进度: {done}/{len(kline_codes)} ({kline120_count} 有数据)")
         print(f"    ✅ 120分钟K线已保存到 {kline120_dir}/ ({kline120_count} 个文件)")
 
         # ── 汇总 ──
@@ -935,9 +956,8 @@ def scrape_all(output_dir: str = "stock_data", target_codes: list[str] = None):
 
 
 def _save_json(data, path):
-    """保存JSON文件（Windows用GBK，其他平台用UTF-8）"""
-    enc = "gbk" if sys.platform == "win32" else "utf-8"
-    with open(path, "w", encoding=enc) as f:
+    """保存JSON文件（统一UTF-8编码）"""
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     size = os.path.getsize(path)
     if size > 1024 * 1024:
@@ -2188,13 +2208,15 @@ def run_from_data_dir(data_dir: str, html_path: str = None, quiet: bool = False)
     if not quote_files:
         print("❌ 未找到行情数据 (quotes_*.json)")
         return []
+    quote_files.sort(key=lambda f: os.path.getmtime(f), reverse=True)  # 最新文件优先
     quotes = _load_json(quote_files[0])
-    print(f"  ✅ 行情: {len(quotes)} 只")
+    print(f"  ✅ 行情: {len(quotes)} 只 (文件: {os.path.basename(quote_files[0])})")
 
     # ---- 2. 加载股票详情（市值/量比/换手率）----
     detail_files = _glob.glob(os.path.join(data_dir, "details_*.json"))
     details = {}
     if detail_files:
+        detail_files.sort(key=lambda f: os.path.getmtime(f), reverse=True)
         details = _load_json(detail_files[0])
         print(f"  ✅ 详情: {len(details)} 只")
 
@@ -2202,6 +2224,7 @@ def run_from_data_dir(data_dir: str, html_path: str = None, quiet: bool = False)
     sector_files = _glob.glob(os.path.join(data_dir, "sectors_*.json"))
     sectors = {}
     if sector_files:
+        sector_files.sort(key=lambda f: os.path.getmtime(f), reverse=True)
         sectors = _load_json(sector_files[0])
         print(f"  ✅ 板块: {len(sectors)} 个")
 
@@ -2209,6 +2232,7 @@ def run_from_data_dir(data_dir: str, html_path: str = None, quiet: bool = False)
     index_files = _glob.glob(os.path.join(data_dir, "indices_*.json"))
     indices = []
     if index_files:
+        index_files.sort(key=lambda f: os.path.getmtime(f), reverse=True)
         indices = _load_json(index_files[0])
         for idx in indices:
             sign = "+" if idx["change_pct"] > 0 else ""
@@ -2686,15 +2710,22 @@ def run_oneclick():
             _save_json(data, f"{kline_dir}/{code}.json")
         print(f"  ✅ K线: {len(klines)} 只")
 
-        # ---- 6. 120分钟K线（新浪60分钟合并）----
+        # ---- 6. 120分钟K线（新浪60分钟合并，并发）----
         kline120_dir = f"{data_dir}/klines_120min"
         os.makedirs(kline120_dir, exist_ok=True)
         k120_count = 0
-        for code in codes:
+        k120_lock = threading.Lock()
+
+        def _fetch_120_oc(code):
+            nonlocal k120_count
             k120 = fetch_kline_120min(code, count=60, session=session)
             if k120:
                 _save_json(k120, f"{kline120_dir}/{code}.json")
-                k120_count += 1
+                with k120_lock:
+                    k120_count += 1
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            list(executor.map(_fetch_120_oc, codes))
         print(f"  ✅ 120分钟K线: {k120_count} 只")
 
         # ---- 7. 运行分析 ----
