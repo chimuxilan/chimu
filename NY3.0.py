@@ -515,7 +515,7 @@ def fetch_all_stock_codes(session: requests.Session = None) -> list[str]:
 
 def fetch_sectors(session: requests.Session = None) -> dict:
     """
-    获取行业板块列表及各板块下的股票
+    获取行业板块列表及各板块下的股票（新浪源，无封IP风险）
     返回: {sector_name: {"code": scode, "stocks": [...], "limit_up": N, ...}}
     """
     if session is None:
@@ -523,98 +523,86 @@ def fetch_sectors(session: requests.Session = None) -> dict:
 
     sectors = {}
 
-    # 第一步：板块列表（涨停数倒序，取前50）
+    # 第一步：新浪板块列表
     r = safe_request(
-        "https://push2.eastmoney.com/api/qt/clist/get",
-        _limiter_eastmoney, session,
-        params={
-            "cb": "jQuery", "pn": "1", "pz": "50", "po": "1", "np": "1",
-            "ut": "bd1d9ddb04089700cf9c27f6f7426281",
-            "fltt": "2", "invt": "2", "fid": "f3",
-            "fs": "m:90+t:2+f:!50",
-            "fields": "f2,f3,f12,f14,f104,f105",
-        },
-        headers={"Referer": "https://quote.eastmoney.com/center/boardlist.html"},
-        max_retries=5,
+        "https://vip.stock.finance.sina.com.cn/q/view/newSinaHy.php",
+        _limiter_sina, session, encoding="gbk",
     )
-    # 如果失败，等10秒重试一次
-    if not r:
-        print("    ⏳ 板块列表首次失败，等待10秒后重试...")
-        time.sleep(10)
-        r = safe_request(
-            "https://push2.eastmoney.com/api/qt/clist/get",
-            _limiter_eastmoney, session,
-            params={
-                "cb": "jQuery", "pn": "1", "pz": "50", "po": "1", "np": "1",
-                "ut": "bd1d9ddb04089700cf9c27f6f7426281",
-                "fltt": "2", "invt": "2", "fid": "f3",
-                "fs": "m:90+t:2+f:!50",
-                "fields": "f2,f3,f12,f14,f104,f105",
-            },
-            headers={"Referer": "https://quote.eastmoney.com/center/boardlist.html"},
-            max_retries=5,
-        )
     if not r:
         print("    ❌ 板块列表获取失败")
         return sectors
 
     try:
-        m = re.search(r"jQuery\((.+)\);", r.text)
+        m = re.search(r'=\s*\{(.+)\}', r.text, re.DOTALL)
         if m:
-            data = json.loads(m.group(1))
-            for item in data.get("data", {}).get("diff", []):
-                scode = item.get("f12", "")
-                sname = item.get("f14", "")
-                if scode and sname:
-                    sectors[sname] = {
-                        "code": scode,
-                        "stocks": [],
-                        "limit_up": item.get("f104", 0),
-                        "limit_down": item.get("f105", 0),
-                        "change_pct": item.get("f3", 0),
-                    }
+            data = json.loads('{' + m.group(1) + '}')
+            for key, val in data.items():
+                parts = val.split(',')
+                if len(parts) < 9:
+                    continue
+                sname = parts[1]
+                stock_count = int(parts[2]) if parts[2].isdigit() else 0
+                change_pct = float(parts[4]) if parts[4] else 0
+                sectors[sname] = {
+                    "code": key,       # 新浪板块代码，如 new_dlhy
+                    "stocks": [],
+                    "limit_up": 0,
+                    "limit_down": 0,
+                    "change_pct": round(change_pct, 2),
+                    "stock_count": stock_count,
+                }
     except Exception as e:
         print(f"    ❌ 板块列表解析失败: {e}")
         return sectors
 
     print(f"    ✅ 获取到 {len(sectors)} 个行业板块")
 
-    # 第二步：并发获取每个板块的成分股
+    # 第二步：并发获取每个板块的成分股（新浪接口）
     def _fetch_stocks(sname, scode):
-        r = safe_request(
-            "https://push2.eastmoney.com/api/qt/clist/get",
-            _limiter_eastmoney, session,
-            params={
-                "cb": "jQuery", "pn": "1", "pz": "1000", "po": "1", "np": "1",
-                "ut": "bd1d9ddb04089700cf9c27f6f7426281",
-                "fltt": "2", "invt": "2", "fid": "f3",
-                "fs": f"b:{scode}",
-                "fields": "f2,f3,f12,f14",
-            },
-            headers={"Referer": "https://quote.eastmoney.com/center/boardlist.html"},
-        )
-        if not r:
-            return sname, []
         try:
-            m = re.search(r"jQuery\((.+)\);", r.text)
-            if m:
-                data = json.loads(m.group(1))
-                stocks = []
-                for it in data.get("data", {}).get("diff", []):
-                    code = str(it.get("f12", ""))
-                    name = it.get("f14", "")
-                    if code and len(code) == 6 and code[0].isdigit():
-                        stocks.append({
-                            "code": code,
-                            "name": name,
-                            "symbol": ("sh" if code.startswith(("6", "9")) else "sz") + code,
-                            "price": it.get("f2", 0),
-                            "change_pct": it.get("f3", 0),
-                        })
-                return sname, stocks
+            # 先获取数量
+            r_count = safe_request(
+                "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeStockCount",
+                _limiter_sina, session,
+                params={"node": scode},
+                encoding="gbk",
+            )
+            total = int(r_count.text.strip().strip('"')) if r_count else 0
+            if total <= 0:
+                return sname, []
+
+            # 拉取全部成分股
+            r_stocks = safe_request(
+                "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData",
+                _limiter_sina, session,
+                params={
+                    "num": str(total),
+                    "sort": "symbol",
+                    "asc": "1",
+                    "node": scode,
+                    "_s_r_a": "auto",
+                },
+                encoding="gbk",
+            )
+            if not r_stocks:
+                return sname, []
+
+            items = json.loads(r_stocks.text)
+            stocks = []
+            for it in items:
+                sym = it.get("symbol", "")
+                code = sym[2:] if len(sym) >= 8 else ""
+                if code and len(code) == 6 and code[0].isdigit():
+                    stocks.append({
+                        "code": code,
+                        "name": it.get("name", ""),
+                        "symbol": sym,
+                        "price": float(it.get("trade", 0) or 0),
+                        "change_pct": float(it.get("changepercent", 0) or 0),
+                    })
+            return sname, stocks
         except Exception:
-            pass
-        return sname, []
+            return sname, []
 
     print(f"    📦 获取各板块成分股...")
     with ThreadPoolExecutor(max_workers=3) as executor:
@@ -837,8 +825,8 @@ def test_connectivity():
         ("新浪K线", lambda: fetch_kline_sina("600519", 5, session)),
         ("东财K线", lambda: fetch_kline_tencent("600519", 5, session)),
         ("大盘指数", lambda: fetch_indices(session)),
-        ("东财股票详情", lambda: fetch_stock_details(["600519"], session)),
-        ("东财板块列表", lambda: fetch_sectors(session)),
+        ("东财股票详情", lambda: fetch_stock_details(["600519"], session, quotes_ref={})),
+        ("新浪板块列表", lambda: fetch_sectors(session)),
     ]
 
     for name, fn in tests:
@@ -872,8 +860,8 @@ def scrape_all(output_dir: str = "stock_data", target_codes: list[str] = None):
     完整抓取流程（纯HTTP，无Selenium依赖）：
     1. 获取全A代码列表（或使用指定代码）
     2. 批量获取实时行情（腾讯）
-    3. 批量获取股票详情（东财）
-    4. 获取行业板块 + 成分股（东财）
+    3. 批量获取股票详情（腾讯兜底）
+    4. 获取行业板块 + 成分股（新浪）
     5. 获取K线历史（新浪+腾讯）
     6. 全部保存为JSON
     """
