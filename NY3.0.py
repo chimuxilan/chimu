@@ -1103,6 +1103,186 @@ def fetch_sector_kline(sector_code: str, days: int = 10, session: requests.Sessi
 
 
 # ════════════════════════════════════════════════════
+# 8a. 板块资金流向 + 主线板块排名
+# ════════════════════════════════════════════════════
+
+def fetch_sector_money_flow(session: requests.Session = None) -> list[dict]:
+    """
+    获取行业板块资金流向（东方财富）
+    返回: [{"code": "BK0XXX", "name": "板块名", "main_net": 主力净流入(亿),
+            "change_pct": 涨跌幅, ...}, ...]
+    """
+    if session is None:
+        session = _build_session()
+
+    r = safe_request(
+        "https://push2.eastmoney.com/api/qt/clist/get",
+        _limiter_eastmoney, session,
+        params={
+            "pn": "1", "pz": "200", "po": "1",
+            "np": "1", "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+            "fltt": "2", "invt": "2", "fid": "f62",  # 按主力净流入排序
+            "fs": "m:90+t:2",  # 行业板块
+            "fields": "f12,f14,f2,f3,f62,f184,f66,f69,f72,f75,f78,f81,f84,f87,f204,f205,f124",
+            # f12=板块代码 f14=名称 f2=最新价 f3=涨跌幅
+            # f62=主力净流入 f184=主力净占比
+            # f66=超大单净流入 f69=超大单净占比
+            # f72=大单净流入 f75=大单净占比
+            # f78=中单净流入 f81=中单净占比
+            # f84=小单净流入 f87=小单净占比
+            # f204=上涨家数 f205=下跌家数
+        },
+        headers={"Referer": "https://data.eastmoney.com/bkzj/hy.html"},
+    )
+    if not r:
+        return []
+
+    try:
+        data = r.json().get("data", {})
+        items = data.get("diff", []) if data else []
+        results = []
+        for item in items:
+            code = str(item.get("f12", ""))
+            name = str(item.get("f14", ""))
+            main_net = float(item.get("f62", 0) or 0) / 1e8  # 转为亿
+            change_pct = float(item.get("f3", 0) or 0)
+            results.append({
+                "code": code,
+                "name": name,
+                "main_net": round(main_net, 2),       # 主力净流入(亿)
+                "change_pct": round(change_pct, 2),    # 涨跌幅
+                "up_count": int(item.get("f204", 0) or 0),
+                "down_count": int(item.get("f205", 0) or 0),
+            })
+        return results
+    except Exception as e:
+        print(f"    ❌ 板块资金流向解析失败: {e}")
+        return []
+
+
+def rank_main_line_sectors(sectors: dict, session: requests.Session = None,
+                           top_n: int = 10) -> list[dict]:
+    """
+    综合排名主线板块
+    维度：主力金额(净流入) + 五日涨幅 + 十日涨幅
+    返回排名前N的板块列表，每项包含: {
+        "name", "code", "score", "rank",
+        "main_net", "change_5d", "change_10d",
+        "detail_scores": {...}
+    }
+    """
+    if session is None:
+        session = _build_session()
+
+    # 1. 获取板块资金流向
+    print("  📊 获取板块资金流向...")
+    money_flows = fetch_sector_money_flow(session)
+    flow_map = {f["code"]: f for f in money_flows}
+    print(f"    ✅ 资金流向: {len(money_flows)} 个板块")
+
+    # 2. 获取板块K线（5日+10日涨幅）
+    print("  📊 获取板块K线数据...")
+    sector_list = list(sectors.items())
+    sector_kline_results = {}
+
+    def _fetch_kline(sn, scode):
+        try:
+            klines = fetch_sector_kline(scode, days=15, session=session)
+            return sn, klines
+        except Exception:
+            return sn, []
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {executor.submit(_fetch_kline, sn, sd.get("code", "")): sn
+                   for sn, sd in sector_list if sd.get("code")}
+        for fut in as_completed(futures):
+            sn, klines = fut.result()
+            if klines:
+                sector_kline_results[sn] = klines
+
+    print(f"    ✅ 板块K线: {len(sector_kline_results)} 个")
+
+    # 3. 计算各维度数据
+    sector_scores = []
+    for sn, sd in sector_list:
+        scode = sd.get("code", "")
+        if not scode:
+            continue
+
+        # 主力净流入(亿)
+        flow = flow_map.get(scode, {})
+        main_net = flow.get("main_net", 0)
+
+        # K线涨幅
+        klines = sector_kline_results.get(sn, [])
+        change_5d = 0
+        change_10d = 0
+        if len(klines) >= 2:
+            close_now = float(klines[-1].get("close", 0))
+            if len(klines) >= 6:
+                close_5d = float(klines[-6].get("close", 0))
+                if close_5d > 0:
+                    change_5d = round((close_now - close_5d) / close_5d * 100, 2)
+            if len(klines) >= 11:
+                close_10d = float(klines[-11].get("close", 0))
+                if close_10d > 0:
+                    change_10d = round((close_now - close_10d) / close_10d * 100, 2)
+
+        sector_scores.append({
+            "name": sn,
+            "code": scode,
+            "main_net": main_net,
+            "change_5d": change_5d,
+            "change_10d": change_10d,
+            "up_count": flow.get("up_count", 0),
+            "down_count": flow.get("down_count", 0),
+        })
+
+    if not sector_scores:
+        return []
+
+    # 4. 各维度归一化排名打分（百分位排名）
+    # 主力金额排名
+    sorted_by_money = sorted(sector_scores, key=lambda x: -x["main_net"])
+    money_rank_map = {}
+    for i, s in enumerate(sorted_by_money):
+        # 排名越靠前分越高，满分100
+        money_rank_map[s["name"]] = round((1 - i / len(sorted_by_money)) * 100, 1)
+
+    # 五日涨幅排名
+    sorted_by_5d = sorted(sector_scores, key=lambda x: -x["change_5d"])
+    rank_5d_map = {}
+    for i, s in enumerate(sorted_by_5d):
+        rank_5d_map[s["name"]] = round((1 - i / len(sorted_by_5d)) * 100, 1)
+
+    # 十日涨幅排名
+    sorted_by_10d = sorted(sector_scores, key=lambda x: -x["change_10d"])
+    rank_10d_map = {}
+    for i, s in enumerate(sorted_by_10d):
+        rank_10d_map[s["name"]] = round((1 - i / len(sorted_by_10d)) * 100, 1)
+
+    # 5. 综合评分（加权：主力40% + 五日30% + 十日30%）
+    for s in sector_scores:
+        sn = s["name"]
+        money_score = money_rank_map.get(sn, 0)
+        score_5d = rank_5d_map.get(sn, 0)
+        score_10d = rank_10d_map.get(sn, 0)
+        s["score"] = round(money_score * 0.4 + score_5d * 0.3 + score_10d * 0.3, 1)
+        s["detail_scores"] = {
+            "money": money_score,
+            "5d": score_5d,
+            "10d": score_10d,
+        }
+
+    # 6. 排序输出前N
+    sector_scores.sort(key=lambda x: -x["score"])
+    for i, s in enumerate(sector_scores[:top_n], 1):
+        s["rank"] = i
+
+    return sector_scores[:top_n]
+
+
+# ════════════════════════════════════════════════════
 # 接口连通性测试
 # ════════════════════════════════════════════════════
 
@@ -2477,8 +2657,10 @@ def _compute_screen_strategy(s: dict) -> str:
     return base
 
 
-def save_screen_html(stocks: list[dict], indices: list[dict], path: str) -> str:
+def save_screen_html(stocks: list[dict], indices: list[dict], path: str, main_line_sectors: list = None) -> str:
     """保存主板筛选策略HTML报告（与截图一致的格式）"""
+    if main_line_sectors is None:
+        main_line_sectors = []
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     # 大盘指数板块
@@ -2545,10 +2727,17 @@ def save_screen_html(stocks: list[dict], indices: list[dict], path: str) -> str:
             ts_color = "#8b949e"
             ts_verdict_html = "⚪-"
 
+        # 主线板块标记
+        main_line_1_name = main_line_sectors[0]["name"] if main_line_sectors else ""
+        is_main_line = main_line_1_name and sector == main_line_1_name
+        main_line_mark = "🔥主线" if is_main_line else ""
+        main_line_color = "#f0883e" if is_main_line else "#8b949e"
+
         rows += f"""<tr>
 <td>{html_module.escape(s["code"])}</td>
 <td style="text-align:left;font-weight:600">{html_module.escape(s["name"])}</td>
 <td style="text-align:left;font-size:12px">{html_module.escape(sector)}<span style="color:#8b949e;font-size:10px">({sector_lc}涨停)</span></td>
+<td style="color:{main_line_color};font-weight:{'700' if is_main_line else '400'}">{main_line_mark}</td>
 <td style="color:{leader_color};font-weight:{'700' if is_leader else '400'}">{leader_mark}{leader_count}</td>
 <td>{s["auction_price"]:.2f}</td>
 <td>{s.get("price_0926", s["price"]):.2f}</td>
@@ -2591,6 +2780,31 @@ def save_screen_html(stocks: list[dict], indices: list[dict], path: str) -> str:
             leader_cells += f'<span style="background:#161b22;border:1px solid #f0883e;border-radius:4px;padding:4px 8px;margin:2px;display:inline-block;font-size:12px">🏆 {html_module.escape(name)}({html_module.escape(code)}) <span style="color:#f0883e;font-weight:700">频次{freq}</span> <span style="color:#8b949e;font-size:10px">{html_module.escape(sector)}({cnt}只)</span></span> '
         leader_html = f'<div style="text-align:center;margin-bottom:12px;padding:8px;background:rgba(240,136,62,.08);border-radius:8px"><div style="color:#f0883e;font-size:13px;font-weight:600;margin-bottom:6px">🏆 龙头股（板块内频次最高）</div>{leader_cells}</div>'
 
+    # 主线板块排名HTML
+    main_line_html = ""
+    if main_line_sectors:
+        ml_cells = ""
+        for s in main_line_sectors[:10]:
+            rank = s["rank"]
+            rank_icon = "🥇" if rank == 1 else ("🥈" if rank == 2 else ("🥉" if rank == 3 else f"#{rank}"))
+            border = "border:1px solid #f0883e" if rank == 1 else "border:1px solid #30363d"
+            bg = "rgba(240,136,62,.08)" if rank == 1 else "#161b22"
+            sign_5d = "+" if s["change_5d"] > 0 else ""
+            sign_10d = "+" if s["change_10d"] > 0 else ""
+            sign_money = "+" if s["main_net"] > 0 else ""
+            ml_cells += f"""<div style="background:{bg};{border};border-radius:8px;padding:10px 14px;text-align:center;min-width:140px">
+<div style="color:#f0883e;font-size:13px;font-weight:700">{rank_icon} {html_module.escape(s["name"])}</div>
+<div style="color:#58a6ff;font-size:16px;font-weight:700;margin:4px 0">{s["score"]:.1f}分</div>
+<div style="color:#8b949e;font-size:11px">主力 {sign_money}{s["main_net"]:.2f}亿</div>
+<div style="color:{'#f85149' if s['change_5d']>0 else '#3fb950'};font-size:11px">5日 {sign_5d}{s["change_5d"]:.2f}%</div>
+<div style="color:{'#f85149' if s['change_10d']>0 else '#3fb950'};font-size:11px">10日 {sign_10d}{s["change_10d"]:.2f}%</div>
+</div>"""
+        main_line_html = f"""
+<div style="text-align:center;margin-bottom:16px;padding:12px;background:rgba(88,166,255,.06);border-radius:10px;border:1px solid #1f2937">
+<div style="color:#58a6ff;font-size:14px;font-weight:600;margin-bottom:8px">📊 主线板块排名（主力金额40% + 五日涨幅30% + 十日涨幅30%）</div>
+<div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap">{ml_cells}</div>
+</div>"""
+
     html = f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>集合竞价 - 策略池OR筛选 · 频次排名</title>
@@ -2610,12 +2824,13 @@ tr:hover{{background:#161b22}}
 </style></head><body>
 <div class="hd"><h1>📊 集合竞价 - 策略池OR筛选 · 频次排名TOP10</h1><div class="t">更新时间: {now}</div></div>
 {idx_html}
+{main_line_html}
 {leader_html}
 {sector_html}
 <div class="tbl-wrap">
 <table>
 <thead><tr>
-<th>代码</th><th>名称</th><th>板块(涨停数)</th><th>龙头</th><th>09:25</th><th>09:26</th><th>搓合量</th>
+<th>代码</th><th>名称</th><th>板块(涨停数)</th><th>主线</th><th>龙头</th><th>09:25</th><th>09:26</th><th>搓合量</th>
 <th>竞昨比</th><th>剩余率</th><th>09:26涨幅</th>
 <th>筹码判断</th><th>频次</th><th>尾段判定</th><th>策略池</th><th>策略</th>
 <th>DIF</th><th>DEA</th><th>BAR</th><th>趋势</th><th>信号</th>
@@ -2698,6 +2913,30 @@ def run_from_data_dir(data_dir: str, html_path: str = None, quiet: bool = False)
 
     # 板块K线（目前未提供，默认空）
     sector_klines = {}
+
+    # ---- 6a. 主线板块排名（主力金额+5日涨幅+10日涨幅）----
+    main_line_sectors = []
+    if sectors:
+        print(f"\n📊 [5.5/6] 排名主线板块...")
+        try:
+            session = _build_session()
+            main_line_sectors = rank_main_line_sectors(sectors, session=session, top_n=10)
+            if main_line_sectors:
+                print(f"\n{'─'*100}")
+                print(f"  {'排名':>4}  {'板块':<12} {'综合分':>6}  {'主力净流入(亿)':>14}  {'5日涨幅':>8}  {'10日涨幅':>9}  {'上涨':>4}  {'下跌':>4}")
+                print(f"{'─'*100}")
+                for s in main_line_sectors:
+                    sign_5d = "+" if s["change_5d"] > 0 else ""
+                    sign_10d = "+" if s["change_10d"] > 0 else ""
+                    sign_money = "+" if s["main_net"] > 0 else ""
+                    up_cnt = s.get("up_count", 0)
+                    down_cnt = s.get("down_count", 0)
+                    rank_mark = "🥇" if s["rank"] == 1 else ("🥈" if s["rank"] == 2 else ("🥉" if s["rank"] == 3 else f" {s['rank']}"))
+                    print(f"  {rank_mark:>4}  {s['name']:<12} {s['score']:>6.1f}  {sign_money}{s['main_net']:>12.2f}  {sign_5d}{s['change_5d']:>6.2f}%  {sign_10d}{s['change_10d']:>7.2f}%  {up_cnt:>4}  {down_cnt:>4}")
+                print(f"{'─'*100}")
+                print(f"  📌 主线板块 #1: {main_line_sectors[0]['name']} (综合分 {main_line_sectors[0]['score']})")
+        except Exception as e:
+            print(f"    ⚠️ 主线板块排名失败: {e}")
 
     # ---- 7a. 直接分析模式（当quotes中股票数≤20时，直接分析每只）----
     if len(quotes) <= 20:
@@ -3102,11 +3341,14 @@ def run_from_data_dir(data_dir: str, html_path: str = None, quiet: bool = False)
     if leader_sector:
         print(f"🏆 龙头板块: {leader_sector} ({leader_sector_count}只入选)")
 
+    # 主线板块 #1 名称（用于标记）
+    main_line_1_name = main_line_sectors[0]["name"] if main_line_sectors else ""
+
     # 输出结果
     if not quiet:
-        print(f"\n{'─'*170}")
-        print(f"  {'#':>3}  {'代码':<8} {'名称':<8} {'板块':<10} {'龙头':>4} {'09:25':>7} {'09:26':>7} {'搓合量':>8} {'竞昨比':>7} {'剩余率':>7} {'涨幅':>7} {'筹码':<6} {'频次':>4} {'尾段':>6} {'策略池':<12} {'策略':<14} {'DIF':>7} {'DEA':>7} {'BAR':>7} {'趋势':>4} {'信号':<20}")
-        print(f"{'─'*170}")
+        print(f"\n{'─'*180}")
+        print(f"  {'#':>3}  {'代码':<8} {'名称':<8} {'板块':<10} {'主线':>4} {'龙头':>4} {'09:25':>7} {'09:26':>7} {'搓合量':>8} {'竞昨比':>7} {'剩余率':>7} {'涨幅':>7} {'筹码':<6} {'频次':>4} {'尾段':>6} {'策略池':<12} {'策略':<14} {'DIF':>7} {'DEA':>7} {'BAR':>7} {'趋势':>4} {'信号':<20}")
+        print(f"{'─'*180}")
 
         for i, s in enumerate(final, 1):
             vol_fmt = _format_volume(s.get("auction_vol", s.get("volume", 0)))
@@ -3120,6 +3362,9 @@ def run_from_data_dir(data_dir: str, html_path: str = None, quiet: bool = False)
             is_leader = s.get("is_leader", False)
             leader_count = s.get("leader_count", 0)
             leader_mark = f"🏆{leader_count}" if is_leader else f"  {leader_count}"
+            # 主线板块标记
+            is_main_line = main_line_1_name and s.get("sector", "") == main_line_1_name
+            main_mark = "🔥" if is_main_line else "  "
             dif = s.get("macd_dif", 0)
             dea = s.get("macd_dea", 0)
             bar = s.get("macd_bar", 0)
@@ -3131,13 +3376,13 @@ def run_from_data_dir(data_dir: str, html_path: str = None, quiet: bool = False)
             ts_score = s.get("tail_score", 0)
             ts_icon = "🟢" if ts_verdict == "看多" else ("🔴" if ts_verdict == "不看多" else "⚪")
             tail_mark = f"{ts_icon}{ts_score:>2}"
-            print(f"  {i:>3}  {s['code']:<8} {s['name']:<8} {sector:<10} {leader_mark:>4} {s.get('auction_price', s['price']):>7.2f} {s.get('price_0926', s['price']):>7.2f} {vol_fmt:>8} {comp_ratio:>6.1f}% {remaining:>6.1f}% {chg_0926:>+6.2f}% {verdict:<6} {freq:>4} {tail_mark:>6} {pools:<12} {strategy:<14} {dif:>7.3f} {dea:>7.3f} {bar:>7.3f} {trend:>4} {freq_sigs:<20}")
+            print(f"  {i:>3}  {s['code']:<8} {s['name']:<8} {sector:<10} {main_mark:>4} {leader_mark:>4} {s.get('auction_price', s['price']):>7.2f} {s.get('price_0926', s['price']):>7.2f} {vol_fmt:>8} {comp_ratio:>6.1f}% {remaining:>6.1f}% {chg_0926:>+6.2f}% {verdict:<6} {freq:>4} {tail_mark:>6} {pools:<12} {strategy:<14} {dif:>7.3f} {dea:>7.3f} {bar:>7.3f} {trend:>4} {freq_sigs:<20}")
 
         print(f"{'─'*170}")
 
     # 保存HTML
     if html_path:
-        path = save_screen_html(final, indices, html_path)
+        path = save_screen_html(final, indices, html_path, main_line_sectors=main_line_sectors)
         print(f"\n✅ 筛选报告: {path}")
 
     return final
