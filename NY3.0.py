@@ -1681,7 +1681,7 @@ def _compute_strategy(r: AuctionResult) -> str:
     return "观望"
 
 
-def _auction_result_to_screen_dict(r: AuctionResult) -> dict:
+def _auction_result_to_screen_dict(r: AuctionResult, week_rank="-", week_chg=0) -> dict:
     """将 AuctionResult 转换为 save_screen_html 所需的 dict 格式"""
     buy_vol = r.buy_vol
     sell_vol = r.sell_vol
@@ -1714,6 +1714,8 @@ def _auction_result_to_screen_dict(r: AuctionResult) -> dict:
         "tail_score": r.tail_score,
         "tail_verdict": r.tail_verdict,
         "tail_signals": r.tail_signals,
+        "week_rank": week_rank,
+        "week_chg": week_chg,
     }
 
 
@@ -2545,6 +2547,21 @@ def save_screen_html(stocks: list[dict], indices: list[dict], path: str) -> str:
             ts_color = "#8b949e"
             ts_verdict_html = "⚪-"
 
+        # 周排行
+        week_rank = s.get("week_rank", "-")
+        week_chg = s.get("week_chg", 0)
+        if isinstance(week_rank, int):
+            week_rank_html = f"#{week_rank}({week_chg:+.1f}%)"
+            if week_rank == 1:
+                week_color = "#f0883e"  # 金色
+            elif week_rank <= 3:
+                week_color = "#f85149"  # 红色
+            else:
+                week_color = "#c9d1d9"
+        else:
+            week_rank_html = "-"
+            week_color = "#484f58"
+
         rows += f"""<tr>
 <td>{html_module.escape(s["code"])}</td>
 <td style="text-align:left;font-weight:600">{html_module.escape(s["name"])}</td>
@@ -2559,6 +2576,7 @@ def save_screen_html(stocks: list[dict], indices: list[dict], path: str) -> str:
 <td style="color:{v_color};background:{v_bg};border-radius:4px;font-weight:600;padding:4px 8px">{verdict}</td>
 <td style="font-weight:700">{freq}</td>
 <td style="color:{ts_color};font-weight:600">{ts_verdict_html}({ts_score})</td>
+<td style="font-weight:700;color:{week_color}">{week_rank_html}</td>
 <td style="text-align:left;font-size:11px">{html_module.escape(pools)}</td>
 <td style="text-align:left;font-size:12px">{html_module.escape(strategy)}</td>
 <td style="font-size:11px">{s.get("macd_dif", 0):.3f}</td>
@@ -2617,7 +2635,7 @@ tr:hover{{background:#161b22}}
 <thead><tr>
 <th>代码</th><th>名称</th><th>板块(涨停数)</th><th>龙头</th><th>09:25</th><th>09:26</th><th>搓合量</th>
 <th>竞昨比</th><th>剩余率</th><th>09:26涨幅</th>
-<th>筹码判断</th><th>频次</th><th>尾段判定</th><th>策略池</th><th>策略</th>
+<th>筹码判断</th><th>频次</th><th>尾段判定</th><th>周排名</th><th>策略池</th><th>策略</th>
 <th>DIF</th><th>DEA</th><th>BAR</th><th>趋势</th><th>信号</th>
 </tr></thead>
 <tbody>{rows}</tbody>
@@ -2738,14 +2756,41 @@ def run_from_data_dir(data_dir: str, html_path: str = None, quiet: bool = False)
                 direct_results.append(r)
 
         if direct_results:
+            # 计算一周排行（终端输出也需要）
+            week_data_term = []
+            for r in direct_results:
+                klines = kline_map.get(r.code, [])
+                week_chg = 0
+                if klines and len(klines) >= 6:
+                    try:
+                        cur_close = float(klines[-1].get("close", 0))
+                        prev_5d = float(klines[-6].get("close", 0))
+                        if prev_5d > 0:
+                            week_chg = round((cur_close - prev_5d) / prev_5d * 100, 2)
+                    except (ValueError, TypeError):
+                        pass
+                week_data_term.append((r, week_chg))
+            week_data_term.sort(key=lambda x: -x[1])
+            week_rank_map_term = {}
+            for rank, (r, wc) in enumerate(week_data_term, 1):
+                week_rank_map_term[r.code] = (rank, wc)
+
             if not quiet:
                 for r in direct_results:
                     print_result(r)
                     # 额外输出技术指标
                     print(f"    DIF={r.macd_dif:.3f} DEA={r.macd_dea:.3f} BAR={r.macd_bar:.3f} 趋势={r.macd_trend}")
+                    # 周排行
+                    rank, wc = week_rank_map_term.get(r.code, ("-", 0))
+                    if isinstance(rank, int):
+                        rank_icon = "🥇" if rank == 1 else ("🥈" if rank == 2 else ("🥉" if rank == 3 else f"#{rank}"))
+                        print(f"    📅 一周排行: {rank_icon} {wc:+.2f}%")
 
             if html_path:
-                screen_dicts = [_auction_result_to_screen_dict(r) for r in direct_results]
+                screen_dicts = []
+                for r in direct_results:
+                    rank, wc = week_rank_map_term.get(r.code, ("-", 0))
+                    screen_dicts.append(_auction_result_to_screen_dict(r, week_rank=rank, week_chg=wc))
                 path = save_screen_html(screen_dicts, [], html_path)
                 print(f"\n✅ 分析报告: {path}")
 
@@ -3093,15 +3138,46 @@ def run_from_data_dir(data_dir: str, html_path: str = None, quiet: bool = False)
             c["is_leader"] = False
             c["leader_count"] = 0
 
+    # ---- 13. 一周排行 ----
+    for c in final:
+        code = c["code"]
+        klines = kline_map.get(code, [])
+        week_rank = "-"
+        week_chg = 0
+        if klines and len(klines) >= 6:
+            try:
+                cur_close = float(klines[-1].get("close", 0))
+                # 5个交易日前的收盘价
+                prev_close_5d = float(klines[-6].get("close", 0))
+                if prev_close_5d > 0:
+                    week_chg = round((cur_close - prev_close_5d) / prev_close_5d * 100, 2)
+            except (ValueError, TypeError):
+                pass
+        c["week_chg"] = week_chg
+
+    # 按周涨幅排名（只对有K线数据的股票排名）
+    stocks_with_week = [c for c in final if c.get("week_chg", 0) != 0]
+    stocks_with_week.sort(key=lambda x: -x["week_chg"])
+    for rank, c in enumerate(stocks_with_week, 1):
+        c["week_rank"] = rank
+    # 没有K线数据的标记为 "-"
+    for c in final:
+        if "week_rank" not in c:
+            c["week_rank"] = "-"
+        if "week_chg" not in c:
+            c["week_chg"] = 0
+
     print(f"\n✅ 最终筛选: {len(final)} 只股票")
     if leader_sector:
         print(f"🏆 龙头板块: {leader_sector} ({leader_sector_count}只入选)")
+    if stocks_with_week:
+        print(f"📅 一周排行TOP: {stocks_with_week[0]['name']}({stocks_with_week[0]['code']}) +{stocks_with_week[0]['week_chg']:.2f}%")
 
     # 输出结果
     if not quiet:
-        print(f"\n{'─'*170}")
-        print(f"  {'#':>3}  {'代码':<8} {'名称':<8} {'板块':<10} {'龙头':>4} {'09:25':>7} {'09:26':>7} {'搓合量':>8} {'竞昨比':>7} {'剩余率':>7} {'涨幅':>7} {'筹码':<6} {'频次':>4} {'尾段':>6} {'策略池':<12} {'策略':<14} {'DIF':>7} {'DEA':>7} {'BAR':>7} {'趋势':>4} {'信号':<20}")
-        print(f"{'─'*170}")
+        print(f"\n{'─'*180}")
+        print(f"  {'#':>3}  {'代码':<8} {'名称':<8} {'板块':<10} {'龙头':>4} {'09:25':>7} {'09:26':>7} {'搓合量':>8} {'竞昨比':>7} {'剩余率':>7} {'涨幅':>7} {'筹码':<6} {'频次':>4} {'尾段':>6} {'周排':>4} {'周涨':>7} {'策略池':<12} {'策略':<14} {'DIF':>7} {'DEA':>7} {'BAR':>7} {'趋势':>4} {'信号':<20}")
+        print(f"{'─'*180}")
 
         for i, s in enumerate(final, 1):
             vol_fmt = _format_volume(s.get("auction_vol", s.get("volume", 0)))
@@ -3126,9 +3202,14 @@ def run_from_data_dir(data_dir: str, html_path: str = None, quiet: bool = False)
             ts_score = s.get("tail_score", 0)
             ts_icon = "🟢" if ts_verdict == "看多" else ("🔴" if ts_verdict == "不看多" else "⚪")
             tail_mark = f"{ts_icon}{ts_score:>2}"
-            print(f"  {i:>3}  {s['code']:<8} {s['name']:<8} {sector:<10} {leader_mark:>4} {s.get('auction_price', s['price']):>7.2f} {s.get('price_0926', s['price']):>7.2f} {vol_fmt:>8} {comp_ratio:>6.1f}% {remaining:>6.1f}% {chg_0926:>+6.2f}% {verdict:<6} {freq:>4} {tail_mark:>6} {pools:<12} {strategy:<14} {dif:>7.3f} {dea:>7.3f} {bar:>7.3f} {trend:>4} {freq_sigs:<20}")
+            # 周排行
+            week_rank = s.get("week_rank", "-")
+            week_chg = s.get("week_chg", 0)
+            week_mark = f"{week_rank:>4}" if isinstance(week_rank, int) else f"{'-':>4}"
+            week_chg_str = f"{week_chg:>+6.2f}%" if week_chg != 0 else f"{'-':>7}"
+            print(f"  {i:>3}  {s['code']:<8} {s['name']:<8} {sector:<10} {leader_mark:>4} {s.get('auction_price', s['price']):>7.2f} {s.get('price_0926', s['price']):>7.2f} {vol_fmt:>8} {comp_ratio:>6.1f}% {remaining:>6.1f}% {chg_0926:>+6.2f}% {verdict:<6} {freq:>4} {tail_mark:>6} {week_mark} {week_chg_str} {pools:<12} {strategy:<14} {dif:>7.3f} {dea:>7.3f} {bar:>7.3f} {trend:>4} {freq_sigs:<20}")
 
-        print(f"{'─'*170}")
+        print(f"{'─'*180}")
 
     # 保存HTML
     if html_path:
