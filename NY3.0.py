@@ -45,6 +45,7 @@ import argparse
 import html as html_module
 import glob as _glob
 import subprocess
+import threading
 
 
 # ════════════════════════════════════════════════════
@@ -76,7 +77,16 @@ def _build_session():
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         "Accept-Encoding": "gzip, deflate",
         "Connection": "keep-alive",
+        "Keep-Alive": "timeout=30, max=100",
     })
+    # 连接池复用，减少握手开销
+    adapter = requests.adapters.HTTPAdapter(
+        pool_connections=10,
+        pool_maxsize=20,
+        max_retries=0,  # 由 safe_request 控制重试
+    )
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
     return s
 
 # ════════════════════════════════════════════════════
@@ -99,7 +109,7 @@ class RateLimiter:
 # 每个域名独立限速
 _limiter_sina = RateLimiter(0.3)      # 新浪：~3次/秒
 _limiter_tencent = RateLimiter(0.2)   # 腾讯：~5次/秒
-_limiter_eastmoney = RateLimiter(0.25) # 东财：~4次/秒
+_limiter_eastmoney = RateLimiter(0.5)  # 东财：~2次/秒（防封核心）
 
 
 def safe_request(url: str, limiter: RateLimiter, session: requests.Session = None,
@@ -110,7 +120,7 @@ def safe_request(url: str, limiter: RateLimiter, session: requests.Session = Non
     if session is None:
         session = _build_session()
 
-    kwargs.setdefault("timeout", 15)
+    kwargs.setdefault("timeout", 20)
     # 每次请求随机换 UA
     session.headers["User-Agent"] = _random_ua()
 
@@ -149,7 +159,7 @@ def safe_request(url: str, limiter: RateLimiter, session: requests.Session = Non
         except requests.exceptions.ConnectionError:
             last_err = "connection error"
             if attempt < max_retries - 1:
-                time.sleep((2 ** attempt) + random.uniform(1, 2))
+                time.sleep((2 ** (attempt + 2)) + random.uniform(2, 4))  # 更长退避: 4-8s, 8-12s
         except Exception as e:
             last_err = str(e)
             if attempt < max_retries - 1:
@@ -620,9 +630,16 @@ def fetch_stock_details(codes: list[str], session: requests.Session = None,
         market = "1" if code.startswith(("6", "9")) else "0"
         secids.append(f"{market}.{code}")
 
-    batch_size = 30
+    batch_size = 20  # 减小批次，降低单次请求压力
+    total_batches = (len(secids) + batch_size - 1) // batch_size
+    fail_count = 0
     for i in range(0, len(secids), batch_size):
         batch = secids[i:i + batch_size]
+        # 每10个批次额外冷却5秒，防止东财封IP
+        batch_num = i // batch_size + 1
+        if batch_num > 1 and batch_num % 10 == 0:
+            print(f"    ⏳ 已完成 {batch_num}/{total_batches} 批次，冷却5秒...")
+            time.sleep(5)
         r = safe_request(
             "https://push2.eastmoney.com/api/qt/ulist.np/get",
             _limiter_eastmoney, session,
@@ -635,7 +652,14 @@ def fetch_stock_details(codes: list[str], session: requests.Session = None,
             headers={"Referer": "https://quote.eastmoney.com/center/boardlist.html"},
         )
         if not r:
+            fail_count += 1
+            # 连续失败超过5次，暂停30秒让IP冷却
+            if fail_count >= 5:
+                print(f"    ⚠ 连续失败{fail_count}次，暂停30秒冷却...")
+                time.sleep(30)
+                fail_count = 0
             continue
+        fail_count = 0  # 成功则重置计数
         try:
             m = re.search(r"jQuery\((.+)\);", r.text)
             if m:
@@ -672,7 +696,10 @@ def fetch_stock_details(codes: list[str], session: requests.Session = None,
                         "volume": int(item.get("f5", 0) or 0),
                     }
         except Exception as e:
-            print(f"    ⚠ 批次{i // batch_size + 1}解析失败: {e}")
+            print(f"    ⚠ 批次{batch_num}解析失败: {e}")
+        # 每20个批次打印进度
+        if batch_num % 20 == 0:
+            print(f"    📊 进度: {batch_num}/{total_batches} 批次, 已获取 {len(results)} 只")
 
     return results
 
@@ -821,6 +848,15 @@ def scrape_all(output_dir: str = "stock_data", target_codes: list[str] = None):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     session = _build_session()
 
+    # 清理旧的时间戳文件，防止 glob 加载到旧数据
+    for pattern in ("quotes_*.json", "details_*.json", "sectors_*.json",
+                    "indices_*.json", "all_codes_*.json"):
+        for old in _glob.glob(os.path.join(output_dir, pattern)):
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+
     print(f"\n{'═' * 60}")
     print(f"  🕷️  NYLO — A股数据抓取 · 开始抓取（纯HTTP模式）")
     print(f"  时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -887,18 +923,29 @@ def scrape_all(output_dir: str = "stock_data", target_codes: list[str] = None):
             _save_json(data, f"{kline_dir}/{code}.json")
         print(f"    ✅ K线已保存到 {kline_dir}/ ({len(klines)} 个文件)")
 
-        # 120分钟K线（新浪60分钟合并）
+        # 120分钟K线（新浪60分钟合并，并发）
         kline120_dir = f"{output_dir}/klines_120min"
         os.makedirs(kline120_dir, exist_ok=True)
-        print(f"\n📊 [补充] 抓取120分钟K线 ({len(kline_codes)} 只)...")
+        print(f"\n📊 [补充] 抓取120分钟K线 ({len(kline_codes)} 只, 8线程)...")
         kline120_count = 0
-        for i, code in enumerate(kline_codes):
+        kline120_lock = threading.Lock()
+
+        def _fetch_120(code):
+            nonlocal kline120_count
             k120 = fetch_kline_120min(code, count=60, session=session)
             if k120:
                 _save_json(k120, f"{kline120_dir}/{code}.json")
-                kline120_count += 1
-            if (i + 1) % 100 == 0:
-                print(f"    进度: {i+1}/{len(kline_codes)} ({kline120_count} 有数据)")
+                with kline120_lock:
+                    kline120_count += 1
+            return code
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = {executor.submit(_fetch_120, c): c for c in kline_codes}
+            done = 0
+            for future in as_completed(futures):
+                done += 1
+                if done % 200 == 0:
+                    print(f"    进度: {done}/{len(kline_codes)} ({kline120_count} 有数据)")
         print(f"    ✅ 120分钟K线已保存到 {kline120_dir}/ ({kline120_count} 个文件)")
 
         # ── 汇总 ──
@@ -935,9 +982,8 @@ def scrape_all(output_dir: str = "stock_data", target_codes: list[str] = None):
 
 
 def _save_json(data, path):
-    """保存JSON文件（Windows用GBK，其他平台用UTF-8）"""
-    enc = "gbk" if sys.platform == "win32" else "utf-8"
-    with open(path, "w", encoding=enc) as f:
+    """保存JSON文件（统一UTF-8编码）"""
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     size = os.path.getsize(path)
     if size > 1024 * 1024:
@@ -2188,13 +2234,15 @@ def run_from_data_dir(data_dir: str, html_path: str = None, quiet: bool = False)
     if not quote_files:
         print("❌ 未找到行情数据 (quotes_*.json)")
         return []
+    quote_files.sort(key=lambda f: os.path.getmtime(f), reverse=True)  # 最新文件优先
     quotes = _load_json(quote_files[0])
-    print(f"  ✅ 行情: {len(quotes)} 只")
+    print(f"  ✅ 行情: {len(quotes)} 只 (文件: {os.path.basename(quote_files[0])})")
 
     # ---- 2. 加载股票详情（市值/量比/换手率）----
     detail_files = _glob.glob(os.path.join(data_dir, "details_*.json"))
     details = {}
     if detail_files:
+        detail_files.sort(key=lambda f: os.path.getmtime(f), reverse=True)
         details = _load_json(detail_files[0])
         print(f"  ✅ 详情: {len(details)} 只")
 
@@ -2202,6 +2250,7 @@ def run_from_data_dir(data_dir: str, html_path: str = None, quiet: bool = False)
     sector_files = _glob.glob(os.path.join(data_dir, "sectors_*.json"))
     sectors = {}
     if sector_files:
+        sector_files.sort(key=lambda f: os.path.getmtime(f), reverse=True)
         sectors = _load_json(sector_files[0])
         print(f"  ✅ 板块: {len(sectors)} 个")
 
@@ -2209,6 +2258,7 @@ def run_from_data_dir(data_dir: str, html_path: str = None, quiet: bool = False)
     index_files = _glob.glob(os.path.join(data_dir, "indices_*.json"))
     indices = []
     if index_files:
+        index_files.sort(key=lambda f: os.path.getmtime(f), reverse=True)
         indices = _load_json(index_files[0])
         for idx in indices:
             sign = "+" if idx["change_pct"] > 0 else ""
@@ -2686,15 +2736,22 @@ def run_oneclick():
             _save_json(data, f"{kline_dir}/{code}.json")
         print(f"  ✅ K线: {len(klines)} 只")
 
-        # ---- 6. 120分钟K线（新浪60分钟合并）----
+        # ---- 6. 120分钟K线（新浪60分钟合并，并发）----
         kline120_dir = f"{data_dir}/klines_120min"
         os.makedirs(kline120_dir, exist_ok=True)
         k120_count = 0
-        for code in codes:
+        k120_lock = threading.Lock()
+
+        def _fetch_120_oc(code):
+            nonlocal k120_count
             k120 = fetch_kline_120min(code, count=60, session=session)
             if k120:
                 _save_json(k120, f"{kline120_dir}/{code}.json")
-                k120_count += 1
+                with k120_lock:
+                    k120_count += 1
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            list(executor.map(_fetch_120_oc, codes))
         print(f"  ✅ 120分钟K线: {k120_count} 只")
 
         # ---- 7. 运行分析 ----
