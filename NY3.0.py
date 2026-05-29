@@ -624,24 +624,70 @@ def fetch_stock_details(codes: list[str], session: requests.Session = None,
                         quotes_ref: dict = None) -> dict:
     """
     批量获取股票详情（市值/量比/换手率/成交额）
-    quotes_ref: 可选，腾讯行情数据，用于交叉验证东财返回的价格是否正确
-    返回: {code: {market_cap_yi, volume_ratio, turnover, amount, volume}}
+    优先东财，东财不通则静默降级到腾讯行情数据
     """
     if session is None:
         session = _build_session()
 
     results = {}
+
+    # ── 快速探测东财是否可用（试1批） ──
+    eastmoney_ok = False
+    test_secids = []
+    for code in codes[:10]:
+        market = "1" if code.startswith(("6", "9")) else "0"
+        test_secids.append(f"{market}.{code}")
+
+    r = safe_request(
+        "https://push2.eastmoney.com/api/qt/ulist.np/get",
+        _limiter_eastmoney, session,
+        params={
+            "cb": "jQuery", "fltt": "2", "invt": "2",
+            "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+            "secids": ",".join(test_secids),
+            "fields": "f2,f5,f6,f8,f12,f14,f20,f21,f49",
+        },
+        headers={"Referer": "https://quote.eastmoney.com/center/boardlist.html"},
+        max_retries=2,
+    )
+    if r:
+        try:
+            m = re.search(r"jQuery\((.+)\);", r.text)
+            if m:
+                data = json.loads(m.group(1))
+                if data.get("data", {}).get("diff"):
+                    eastmoney_ok = True
+        except Exception:
+            pass
+
+    if not eastmoney_ok:
+        # 东财不可用，静默降级：直接用腾讯行情数据
+        print("    ⚡ 东财接口不通，直接使用腾讯行情数据")
+        if quotes_ref:
+            for code in codes:
+                if code in quotes_ref:
+                    q = quotes_ref[code]
+                    results[code] = {
+                        "market_cap_yi": round(float(q.get("market_cap_yi", 0) or 0), 2),
+                        "volume_ratio": round(float(q.get("volume_ratio_api", 0) or 0), 2),
+                        "turnover": round(float(q.get("turnover", 0) or 0), 4),
+                        "amount": round(float(q.get("amount", 0) or 0), 2),
+                        "volume": int(q.get("volume", 0) or 0),
+                    }
+        return results
+
+    # ── 东财可用，正常批量抓取 ──
+    print("    ✅ 东财接口可用，批量抓取中...")
     secids = []
     for code in codes:
         market = "1" if code.startswith(("6", "9")) else "0"
         secids.append(f"{market}.{code}")
 
-    batch_size = 20  # 减小批次，降低单次请求压力
+    batch_size = 20
     total_batches = (len(secids) + batch_size - 1) // batch_size
     fail_count = 0
     for i in range(0, len(secids), batch_size):
         batch = secids[i:i + batch_size]
-        # 每10个批次额外冷却5秒，防止东财封IP
         batch_num = i // batch_size + 1
         if batch_num > 1 and batch_num % 10 == 0:
             print(f"    ⏳ 已完成 {batch_num}/{total_batches} 批次，冷却5秒...")
@@ -659,7 +705,6 @@ def fetch_stock_details(codes: list[str], session: requests.Session = None,
         )
         if not r:
             fail_count += 1
-            # 东财挂了，用腾讯行情兜底这批股票
             if quotes_ref:
                 for sid in batch:
                     code = sid.split(".")[-1]
@@ -672,13 +717,24 @@ def fetch_stock_details(codes: list[str], session: requests.Session = None,
                             "amount": round(float(q.get("amount", 0) or 0), 2),
                             "volume": int(q.get("volume", 0) or 0),
                         }
-            # 连续失败超过5次，暂停30秒让IP冷却
-            if fail_count >= 5:
-                print(f"    ⚠ 连续失败{fail_count}次，暂停30秒冷却...")
-                time.sleep(30)
-                fail_count = 0
+            if fail_count >= 10:
+                print(f"    ⚠ 连续失败{fail_count}次，剩余改用腾讯数据")
+                # 剩余全部用腾讯兜底
+                for j in range(i + batch_size, len(secids), batch_size):
+                    for sid in secids[j:j + batch_size]:
+                        c = sid.split(".")[-1]
+                        if c in quotes_ref:
+                            q = quotes_ref[c]
+                            results[c] = {
+                                "market_cap_yi": round(float(q.get("market_cap_yi", 0) or 0), 2),
+                                "volume_ratio": round(float(q.get("volume_ratio_api", 0) or 0), 2),
+                                "turnover": round(float(q.get("turnover", 0) or 0), 4),
+                                "amount": round(float(q.get("amount", 0) or 0), 2),
+                                "volume": int(q.get("volume", 0) or 0),
+                            }
+                break
             continue
-        fail_count = 0  # 成功则重置计数
+        fail_count = 0
         try:
             m = re.search(r"jQuery\((.+)\);", r.text)
             if m:
@@ -687,14 +743,12 @@ def fetch_stock_details(codes: list[str], session: requests.Session = None,
                     code = str(item.get("f12", ""))
                     if not code or len(code) != 6:
                         continue
-                    # 东财API存在数据错位bug，用腾讯行情交叉验证
                     em_price = float(item.get("f2", 0) or 0)
                     if quotes_ref and code in quotes_ref:
                         tc_price = quotes_ref[code].get("price", 0)
                         if tc_price > 0 and em_price > 0:
                             diff_pct = abs(em_price - tc_price) / tc_price * 100
                             if diff_pct > 5:
-                                # 东财数据错位，跳过，用腾讯市值兜底
                                 tc_mkt = quotes_ref[code].get("market_cap_yi", 0)
                                 if tc_mkt > 0:
                                     results[code] = {
@@ -705,23 +759,19 @@ def fetch_stock_details(codes: list[str], session: requests.Session = None,
                                         "volume": int(quotes_ref[code].get("volume", 0) or 0),
                                     }
                                 continue
-
                     mktcap = float(item.get("f20", 0) or 0)
                     results[code] = {
                         "market_cap_yi": round(mktcap / 1e8, 2) if mktcap > 0 else 0,
                         "volume_ratio": round(float(item.get("f49", 0) or 0), 2),
                         "turnover": round(float(item.get("f8", 0) or 0), 4),
-                        "amount": round(float(item.get("f6", 0) or 0) / 1e4, 2),  # 元→万元
+                        "amount": round(float(item.get("f6", 0) or 0) / 1e4, 2),
                         "volume": int(item.get("f5", 0) or 0),
                     }
         except Exception as e:
             print(f"    ⚠ 批次{batch_num}解析失败: {e}")
-        # 每20个批次打印进度
         if batch_num % 20 == 0:
             print(f"    📊 进度: {batch_num}/{total_batches} 批次, 已获取 {len(results)} 只")
 
-    if fail_count > 0 and quotes_ref:
-        print(f"    ℹ 东财部分失败，已用腾讯行情数据兜底 ({len(results)} 只)")
     return results
 
 
