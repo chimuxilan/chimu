@@ -2158,6 +2158,8 @@ def _screen_unified(candidates: list[dict], tencent_map: dict, em_data: dict = N
     策略池3 · 趋势池：主板 / 非ST / 涨幅3-10% / 120日内有涨停 / 市值<1000亿 / 前一日未涨停
               / 非盘中下跌 / 高开 / 量比>3 / 换手率>0.1%（涨幅从大到小排名）
     策略池4 · 技术池：主板 / 非ST / 120分钟MACD↑ / 价格<120 / 月MACD红柱↑ / 周MACD红柱↑ / 2月内有涨停 / 板块5日涨>5%
+
+    最终流程：任一策略池通过 → 初选池 → 频次分析 → 按频次排名TOP10 → 龙头识别
     """
     if em_data is None:
         em_data = {}
@@ -2357,6 +2359,9 @@ def save_screen_html(stocks: list[dict], indices: list[dict], path: str) -> str:
         leader_mark = "🏆" if is_leader else ""
         leader_color = "#f0883e" if is_leader else "#8b949e"
 
+        pools = "/".join(s.get("passed_pools", []))
+        freq_sigs = ", ".join(s.get("freq_signals", []))
+
         rows += f"""<tr>
 <td>{html_module.escape(s["code"])}</td>
 <td style="text-align:left;font-weight:600">{html_module.escape(s["name"])}</td>
@@ -2369,14 +2374,14 @@ def save_screen_html(stocks: list[dict], indices: list[dict], path: str) -> str:
 <td>{remaining:.1f}%</td>
 <td style="color:{chg_color};font-weight:600">{chg_0926:+.2f}%</td>
 <td style="color:{v_color};background:{v_bg};border-radius:4px;font-weight:600;padding:4px 8px">{verdict}</td>
-<td>{freq}</td>
-<td style="text-align:left;font-size:12px">{strategy}</td>
-<td>{'✅' if s.get("tech_pool_pass") else '❌'}</td>
+<td style="font-weight:700">{freq}</td>
+<td style="text-align:left;font-size:11px">{html_module.escape(pools)}</td>
+<td style="text-align:left;font-size:12px">{html_module.escape(strategy)}</td>
 <td style="font-size:11px">{s.get("macd_dif", 0):.3f}</td>
 <td style="font-size:11px">{s.get("macd_dea", 0):.3f}</td>
 <td style="font-size:11px;color:{'#f85149' if s.get('macd_bar', 0) > 0 else '#3fb950'}">{s.get("macd_bar", 0):.3f}</td>
 <td>{s.get("macd_trend", "-")}</td>
-<td>{s.get("limit_up_60d", 0)}</td>
+<td style="text-align:left;font-size:11px">{html_module.escape(freq_sigs)}</td>
 </tr>"""
 
     # 板块分布统计
@@ -2393,18 +2398,18 @@ def save_screen_html(stocks: list[dict], indices: list[dict], path: str) -> str:
 
     # 板块龙头出现次数统计（HTML）
     leader_html = ""
-    leader_data = [(s["code"], s["name"], s.get("sector", ""), s.get("leader_count", 0))
+    leader_data = [(s["code"], s["name"], s.get("sector", ""), s.get("leader_count", 0), s.get("frequency", 0))
                    for s in stocks if s.get("is_leader")]
     if leader_data:
         leader_data.sort(key=lambda x: -x[3])
         leader_cells = ""
-        for code, name, sector, cnt in leader_data:
-            leader_cells += f'<span style="background:#161b22;border:1px solid #f0883e;border-radius:4px;padding:4px 8px;margin:2px;display:inline-block;font-size:12px">🏆 {html_module.escape(name)}({html_module.escape(code)}) <span style="color:#f0883e;font-weight:700">{cnt}次</span> <span style="color:#8b949e;font-size:10px">{html_module.escape(sector)}</span></span> '
-        leader_html = f'<div style="text-align:center;margin-bottom:12px;padding:8px;background:rgba(240,136,62,.08);border-radius:8px"><div style="color:#f0883e;font-size:13px;font-weight:600;margin-bottom:6px">🏆 板块龙头出现次数统计</div>{leader_cells}</div>'
+        for code, name, sector, cnt, freq in leader_data:
+            leader_cells += f'<span style="background:#161b22;border:1px solid #f0883e;border-radius:4px;padding:4px 8px;margin:2px;display:inline-block;font-size:12px">🏆 {html_module.escape(name)}({html_module.escape(code)}) <span style="color:#f0883e;font-weight:700">频次{freq}</span> <span style="color:#8b949e;font-size:10px">{html_module.escape(sector)}({cnt}只)</span></span> '
+        leader_html = f'<div style="text-align:center;margin-bottom:12px;padding:8px;background:rgba(240,136,62,.08);border-radius:8px"><div style="color:#f0883e;font-size:13px;font-weight:600;margin-bottom:6px">🏆 龙头股（板块内频次最高）</div>{leader_cells}</div>'
 
     html = f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>集合竞价 - 板块优先筛选</title>
+<title>集合竞价 - 策略池OR筛选 · 频次排名</title>
 <style>
 *{{margin:0;padding:0;box-sizing:border-box}}
 body{{font-family:"Microsoft YaHei","PingFang SC",sans-serif;background:#0d1117;color:#c9d1d9;padding:16px}}
@@ -2419,17 +2424,17 @@ tr:hover{{background:#161b22}}
 .ft{{text-align:center;color:#484f58;font-size:10px;padding:20px 0}}
 @media(max-width:768px){{table{{font-size:11px}}th,td{{padding:4px 6px}}}}
 </style></head><body>
-<div class="hd"><h1>📊 集合竞价 - 板块优先筛选</h1><div class="t">更新时间: {now}</div></div>
+<div class="hd"><h1>📊 集合竞价 - 策略池OR筛选 · 频次排名TOP10</h1><div class="t">更新时间: {now}</div></div>
 {idx_html}
 {leader_html}
 {sector_html}
 <div class="tbl-wrap">
 <table>
 <thead><tr>
-<th>代码</th><th>名称</th><th>板块(涨停数)</th><th>龙头次数</th><th>09:25</th><th>09:26</th><th>搓合量</th>
+<th>代码</th><th>名称</th><th>板块(涨停数)</th><th>龙头</th><th>09:25</th><th>09:26</th><th>搓合量</th>
 <th>竞昨比</th><th>剩余率</th><th>09:26涨幅</th>
-<th>筹码判断</th><th>频次</th><th>策略</th>
-<th>技术池</th><th>DIF</th><th>DEA</th><th>BAR</th><th>趋势</th><th>60日涨停</th>
+<th>筹码判断</th><th>频次</th><th>策略池</th><th>策略</th>
+<th>DIF</th><th>DEA</th><th>BAR</th><th>趋势</th><th>信号</th>
 </tr></thead>
 <tbody>{rows}</tbody>
 </table></div>
@@ -2667,8 +2672,8 @@ def run_from_data_dir(data_dir: str, html_path: str = None, quiet: bool = False)
     if not filtered:
         return []
 
-    # ---- 9. 策略池OR逻辑检查 ----
-    print("📊 执行策略池OR逻辑检查...")
+    # ---- 9. 策略池OR逻辑检查（任一策略池通过即可入选初选池）----
+    print("📊 执行策略池OR逻辑检查（任一池通过即入选）...")
     final = []
     for c in filtered:
         code = c["code"]
@@ -2684,7 +2689,7 @@ def run_from_data_dir(data_dir: str, html_path: str = None, quiet: bool = False)
             except (ValueError, TypeError):
                 pass
 
-        # 基础池(K线部分)
+        # 基础池(K线部分) —— 基本面过滤，非策略池
         ok_base, reason_base = pool_base_post_kline(code, c["price"], klines,
                                                      c.get("prev_close", 0),
                                                      c.get("yesterday_amount", 0))
@@ -2694,15 +2699,15 @@ def run_from_data_dir(data_dir: str, html_path: str = None, quiet: bool = False)
         tc = tencent_map.get(code, {})
         em = details.get(code, {})
 
+        # 量价池
+        ok_vp, reason_vp = pool_volume_price(c, tc, em, klines=klines)
         # 趋势池
-        ok_trend, _ = pool_trend(c, klines, tc=tc, em=em)
+        ok_trend, reason_trend = pool_trend(c, klines, tc=tc, em=em)
         # 技术池
         ok_tech, reason_tech = pool_technical(code, klines, name=c.get("name", ""),
                                               price=c["price"], market_cap_yi=c.get("market_cap_yi", 0),
                                               sector=c.get("sector", ""), sector_code=c.get("sector_code", ""),
                                               kline120_map=kline120_map, sector_klines=sector_klines)
-        # 量价池
-        ok_vp, _ = pool_volume_price(c, tc, em, klines=klines)
 
         passed_pools = []
         if ok_vp:
@@ -2712,6 +2717,7 @@ def run_from_data_dir(data_dir: str, html_path: str = None, quiet: bool = False)
         if ok_tech:
             passed_pools.append("技术池")
 
+        # OR逻辑：任一策略池通过即入选初选池
         if not passed_pools:
             continue
 
@@ -2719,6 +2725,8 @@ def run_from_data_dir(data_dir: str, html_path: str = None, quiet: bool = False)
         c["change_pct"] = c["auction_gain"]
         c["tech_pool_pass"] = ok_tech
         c["tech_pool_reason"] = reason_tech if not ok_tech else ""
+        c["trend_pool_pass"] = ok_trend
+        c["vp_pool_pass"] = ok_vp
 
         # MACD技术指标
         if klines and len(klines) >= 60:
@@ -2749,17 +2757,20 @@ def run_from_data_dir(data_dir: str, html_path: str = None, quiet: bool = False)
 
         final.append(c)
 
-    # 策略池4过滤
-    final = [c for c in final if c.get("tech_pool_pass")]
-
     if not final:
-        print("❌ 策略池4过滤后无股票剩余")
+        print("❌ 策略池过滤后无股票剩余")
         return []
 
-    # ---- 10. 计算展示字段 ----
+    print(f"  初选池: {len(final)} 只（任一策略池通过）")
+
+    # ---- 10. 抢筹/出货深度分析 + 频次统计 ----
+    print("📊 执行抢筹/出货深度分析...")
     for c in final:
         code = c["code"]
         tc = tencent_map.get(code, {})
+        em = details.get(code, {})
+        klines = kline_map.get(code, [])
+
         c["auction_price"] = c["open_price"]
         c["price_0926"] = c["price"]
         c["chg_0926"] = round((c["price_0926"] - c["prev_close"]) / c["prev_close"] * 100, 2) if c["prev_close"] > 0 else 0
@@ -2777,65 +2788,122 @@ def run_from_data_dir(data_dir: str, html_path: str = None, quiet: bool = False)
         rr = c["remaining_rate"]
         cr = c.get("comp_ratio", 0)
 
-        if chg >= 9:
+        # ---- 频次分析：6维度信号统计 ----
+        # 每个维度满足条件计1分，总分=频次
+        freq_signals = []
+        freq = 0
+
+        # 1. 量比 ≥ 5 → 资金关注度高
+        if vr >= 5:
+            freq += 1
+            freq_signals.append("量比≥5")
+        # 2. 竞价涨幅 ≥ 5% → 强势高开
+        if chg >= 5:
+            freq += 1
+            freq_signals.append("涨幅≥5%")
+        # 3. 剩余率 ≥ 60% → 买盘主导
+        if rr >= 60:
+            freq += 1
+            freq_signals.append("剩余率≥60%")
+        # 4. 竞昨比 ≥ 3% → 资金放大
+        if cr >= 3:
+            freq += 1
+            freq_signals.append("竞昨比≥3%")
+        # 5. 板块涨停数 ≥ 3 → 板块热度
+        if c.get("sector_limit_count", 0) >= 3:
+            freq += 1
+            freq_signals.append("板块涨停≥3")
+        # 6. 通过多个策略池 → 多维共振
+        if len(c.get("passed_pools", [])) >= 2:
+            freq += 1
+            freq_signals.append("多池共振")
+
+        c["frequency"] = freq
+        c["freq_signals"] = freq_signals
+
+        # ---- 抢筹/出货综合判断 ----
+        if chg >= 9.5:
             c["verdict"] = "真实抢筹"
         else:
             score = 0
+            # 涨幅维度
             if chg >= 7: score += 3
             elif chg >= 5: score += 2
             elif chg >= 3: score += 1
+            # 量比维度
             if vr >= 10: score += 3
             elif vr >= 7: score += 2
             elif vr >= 5: score += 1
+            # 剩余率维度
             if rr >= 65: score += 3
             elif rr >= 55: score += 1
             elif rr < 40: score -= 2
             elif rr < 45: score -= 1
+            # 竞昨比维度
             if cr >= 10: score += 2
             elif cr >= 5: score += 1
-            c["verdict"] = "真实抢筹" if score >= 4 else ("疑似出货" if score <= 0 else "正常")
+            # 频次加权
+            if freq >= 5: score += 3
+            elif freq >= 4: score += 2
+            elif freq >= 3: score += 1
+            # 多池共振加权
+            if len(c.get("passed_pools", [])) >= 3: score += 2
+            elif len(c.get("passed_pools", [])) >= 2: score += 1
 
-        freq = (1 if vr >= 5 else 0) + (1 if chg >= 5 else 0) + (1 if rr >= 60 else 0) + (1 if cr >= 3 else 0)
-        c["frequency"] = freq
+            c["verdict"] = "真实抢筹" if score >= 5 else ("疑似出货" if score <= 0 else "正常")
+
         c["strategy"] = _compute_screen_strategy(c)
 
-    # 排序
-    final.sort(key=lambda x: (-x["auction_gain"], -x.get("sector_limit_count", 0), -x.get("frequency", 0)))
+    # ---- 11. 按频次排序，保留前10 ----
+    final.sort(key=lambda x: (
+        -x.get("frequency", 0),          # 频次最高排第一
+        -x.get("auction_gain", 0),        # 同频次按涨幅
+        -x.get("sector_limit_count", 0),  # 再按板块热度
+    ))
+    if len(final) > 10:
+        final = final[:10]
 
-    # 龙头识别
+    # ---- 12. 龙头股识别 ----
+    # 在前10中，按板块分组，每个板块内频次最高者为龙头
     sector_groups = {}
     for c in final:
         sn = c.get("sector", "未知")
         sector_groups.setdefault(sn, []).append(c)
 
-    leader_scores = {}
+    leader_codes = set()
+    leader_sector = ""      # 龙头所在板块
+    leader_sector_count = 0 # 该板块在前10中的股票数
+
     for sn, stocks_in_sector in sector_groups.items():
-        best_code = None
-        best_score = -999
-        for s in stocks_in_sector:
-            comp = s.get("auction_gain", 0) * 3 + s.get("volume_ratio", 0) * 2 + s.get("frequency", 0) * 10
-            if comp > best_score:
-                best_score = comp
-                best_code = s["code"]
-        if best_code:
-            leader_scores[best_code] = best_score
+        # 板块内频次最高 + 涨幅最大 = 龙头
+        best = max(stocks_in_sector, key=lambda s: (
+            s.get("frequency", 0),
+            s.get("auction_gain", 0),
+            s.get("volume_ratio", 0),
+        ))
+        best["is_leader"] = True
+        best["leader_count"] = len(stocks_in_sector)  # 板块内入选数量
+        leader_codes.add(best["code"])
+
+        # 统计龙头板块（入选股票最多的板块）
+        if len(stocks_in_sector) > leader_sector_count:
+            leader_sector_count = len(stocks_in_sector)
+            leader_sector = sn
 
     for c in final:
-        c["is_leader"] = c["code"] in leader_scores
-        c["leader_count"] = 0
-
-    # 频次排序，保留前10
-    final.sort(key=lambda x: (-x.get("frequency", 0), -x.get("sector_limit_count", 0), -x.get("auction_gain", 0)))
-    if len(final) > 10:
-        final = final[:10]
+        if c["code"] not in leader_codes:
+            c["is_leader"] = False
+            c["leader_count"] = 0
 
     print(f"\n✅ 最终筛选: {len(final)} 只股票")
+    if leader_sector:
+        print(f"🏆 龙头板块: {leader_sector} ({leader_sector_count}只入选)")
 
     # 输出结果
     if not quiet:
-        print(f"\n{'─'*140}")
-        print(f"  {'#':>3}  {'代码':<8} {'名称':<8} {'板块':<10} {'龙头':>4} {'09:25':>7} {'09:26':>7} {'搓合量':>8} {'竞昨比':>7} {'剩余率':>7} {'涨幅':>7} {'筹码':<6} {'频次':>4} {'策略':<16} {'技术池':<6} {'DIF':>7} {'DEA':>7} {'BAR':>7} {'趋势':>4} {'60日涨停':>6}")
-        print(f"{'─'*140}")
+        print(f"\n{'─'*150}")
+        print(f"  {'#':>3}  {'代码':<8} {'名称':<8} {'板块':<10} {'龙头':>4} {'09:25':>7} {'09:26':>7} {'搓合量':>8} {'竞昨比':>7} {'剩余率':>7} {'涨幅':>7} {'筹码':<6} {'频次':>4} {'策略池':<12} {'策略':<14} {'DIF':>7} {'DEA':>7} {'BAR':>7} {'趋势':>4} {'信号':<20}")
+        print(f"{'─'*150}")
 
         for i, s in enumerate(final, 1):
             vol_fmt = _format_volume(s.get("auction_vol", s.get("volume", 0)))
@@ -2853,11 +2921,11 @@ def run_from_data_dir(data_dir: str, html_path: str = None, quiet: bool = False)
             dea = s.get("macd_dea", 0)
             bar = s.get("macd_bar", 0)
             trend = s.get("macd_trend", "-")
-            limit_cnt = s.get("limit_up_60d", 0)
-            tech = "✅" if s.get("tech_pool_pass") else "❌"
-            print(f"  {i:>3}  {s['code']:<8} {s['name']:<8} {sector:<10} {leader_mark:>4} {s.get('auction_price', s['price']):>7.2f} {s.get('price_0926', s['price']):>7.2f} {vol_fmt:>8} {comp_ratio:>6.1f}% {remaining:>6.1f}% {chg_0926:>+6.2f}% {verdict:<6} {freq:>4} {strategy:<16} {tech:<6} {dif:>7.3f} {dea:>7.3f} {bar:>7.3f} {trend:>4} {limit_cnt:>6}")
+            pools = "/".join(s.get("passed_pools", []))
+            freq_sigs = ",".join(s.get("freq_signals", []))[:18]
+            print(f"  {i:>3}  {s['code']:<8} {s['name']:<8} {sector:<10} {leader_mark:>4} {s.get('auction_price', s['price']):>7.2f} {s.get('price_0926', s['price']):>7.2f} {vol_fmt:>8} {comp_ratio:>6.1f}% {remaining:>6.1f}% {chg_0926:>+6.2f}% {verdict:<6} {freq:>4} {pools:<12} {strategy:<14} {dif:>7.3f} {dea:>7.3f} {bar:>7.3f} {trend:>4} {freq_sigs:<20}")
 
-        print(f"{'─'*140}")
+        print(f"{'─'*150}")
 
     # 保存HTML
     if html_path:
