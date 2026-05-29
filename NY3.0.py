@@ -1227,7 +1227,7 @@ def scrape_all(output_dir: str = "stock_data", target_codes: list[str] = None):
         _save_json(sectors_save, f"{output_dir}/sectors_{timestamp}.json")
 
         # ── 5. K线历史（新浪+腾讯双源，并行抓取120min）──
-        kline_codes = [c for c in all_codes if c.startswith(("60", "00")) and c in quotes]
+        kline_codes = [c for c in all_codes if c.startswith(("60", "00")) and c in quotes and 'ST' not in quotes[c].get('name', '').upper()]
         if target_codes:
             kline_codes = target_codes
 
