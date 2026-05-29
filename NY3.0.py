@@ -2103,12 +2103,11 @@ def pool_technical(code: str, klines: list[dict], name: str = "",
       1.  主板（沪60/深00）
       2.  非ST
       3.  120分钟MACD向上
-      4.  市值 < 400亿
-      5.  价格 < 120元
-      6.  月MACD红柱向上
-      7.  周MACD红柱变大
-      8.  2个月内有过涨停
-      9.  板块5日涨幅 > 5%
+      4.  价格 < 120元
+      5.  月MACD红柱向上
+      6.  周MACD红柱变大
+      7.  2个月内有过涨停
+      8.  板块5日涨幅 > 5%
     核心逻辑：多周期MACD共振确认趋势向上，排除假突破
     """
     # 1. 主板
@@ -2121,22 +2120,19 @@ def pool_technical(code: str, klines: list[dict], name: str = "",
     k120 = (kline120_map or {}).get(code, [])
     if not _check_macd_120min_up(code, cached_klines=klines, cached_klines_120min=k120):
         return False, "120分钟MACD未向上"
-    # 4. 市值 < 400亿
-    if market_cap_yi >= 400:
-        return False, "市值≥400亿"
-    # 5. 价格 < 120元
+    # 4. 价格 < 120元
     if price >= 120:
         return False, "价格≥120"
-    # 6. 月MACD红柱向上
+    # 5. 月MACD红柱向上
     if not _check_monthly_macd_red_up(code, cached_klines=klines):
         return False, "月MACD红柱未向上"
-    # 7. 周MACD红柱变大
+    # 6. 周MACD红柱变大
     if not _check_weekly_macd_red_growing(code, cached_klines=klines):
         return False, "周MACD红柱未变大"
-    # 8. 2个月内有过涨停
+    # 7. 2个月内有过涨停
     if not _check_has_limit_up_in_days(code, days=60, cached_klines=klines):
         return False, "2个月内无涨停"
-    # 9. 板块5日涨幅 > 5%
+    # 8. 板块5日涨幅 > 5%
     if sector_code and not _check_sector_5day_rise(sector_code, threshold=5.0,
                                                        cached_sector_klines=sector_klines):
         return False, f"板块5日涨幅<5%({sector})"
@@ -2161,7 +2157,7 @@ def _screen_unified(candidates: list[dict], tencent_map: dict, em_data: dict = N
               / 金额比>1.5 / 换手率>0.11% / 量比>5 / 3日涨幅<15% / 竞价量>4万手
     策略池3 · 趋势池：主板 / 非ST / 涨幅3-10% / 120日内有涨停 / 市值<1000亿 / 前一日未涨停
               / 非盘中下跌 / 高开 / 量比>3 / 换手率>0.1%（涨幅从大到小排名）
-    策略池4 · 技术池：主板 / 非ST / 120分钟MACD↑ / 市值<400亿 / 价格<120 / 月MACD红柱↑ / 周MACD红柱↑ / 2月内有涨停 / 板块5日涨>5%
+    策略池4 · 技术池：主板 / 非ST / 120分钟MACD↑ / 价格<120 / 月MACD红柱↑ / 周MACD红柱↑ / 2月内有涨停 / 板块5日涨>5%
     """
     if em_data is None:
         em_data = {}
@@ -2232,8 +2228,6 @@ def _screen_unified(candidates: list[dict], tencent_map: dict, em_data: dict = N
             ok4_pre = False; reason4_pre = "ST"
         elif c["price"] >= 120:
             ok4_pre = False; reason4_pre = "价格≥120"
-        if market_cap_yi >= 400:
-            ok4_pre = False; reason4_pre = "市值≥400亿"
 
         # ---- OR逻辑：量价池/趋势池/技术池 任一通过即可 ----
         passed_pools = []
