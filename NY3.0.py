@@ -474,35 +474,46 @@ async def _async_fetch_kline_batch(codes: list[str], days: int = 1000,
     """
     异步批量K线抓取（并发协程 + 匀速限速，防封IP）
     concurrency: 并发协程数（默认50）
+    限速策略：匀速出请求，锁内只计算时间不sleep，避免阻塞其他协程
     """
     semaphore = asyncio.Semaphore(concurrency)
     connector = aiohttp.TCPConnector(limit=concurrency, limit_per_host=concurrency)
     timeout = aiohttp.ClientTimeout(total=20)
     results = {}
     done_count = 0
-    # 异步限速器：请求间隔 0.05 秒（~20 req/s，匀速不触发封禁）
+    t_start = time.time()
+
+    # 限速器：锁内只做时间计算，sleep在锁外执行
     next_available = 0.0
     rate_lock = asyncio.Lock()
+    interval = 0.05  # 0.05秒/请求 ≈ 20 req/s
 
     async def _rate_wait():
         nonlocal next_available
+        sleep_time = 0.0
         async with rate_lock:
-            now = asyncio.get_running_loop().time()
+            now = time.monotonic()
             if now < next_available:
-                await asyncio.sleep(next_available - now)
-            next_available = max(now, next_available) + 0.05
+                sleep_time = next_available - now
+            next_available = max(now, next_available) + interval
+        # sleep在锁外，不阻塞其他协程获取锁
+        if sleep_time > 0:
+            await asyncio.sleep(sleep_time)
 
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
         async def _fetch_one(code):
             nonlocal done_count
-            await _rate_wait()  # 限速：匀速出请求
+            await _rate_wait()
             klines = await _async_fetch_kline_sina(session, code, min(days, 1000), semaphore)
             if not klines:
-                await _rate_wait()  # 腾讯也要限速
+                await _rate_wait()
                 klines = await _async_fetch_kline_tencent(session, code, min(days, 300), semaphore)
             done_count += 1
             if done_count % 500 == 0:
-                print(f"    进度: {done_count}/{len(codes)} ({len(results)} 有数据)")
+                elapsed = time.time() - t_start
+                speed = done_count / elapsed if elapsed > 0 else 0
+                eta = (len(codes) - done_count) / speed if speed > 0 else 0
+                print(f"    进度: {done_count}/{len(codes)} ({len(results)}有数据) | {speed:.0f}只/秒 | 预计剩余 {eta:.0f}s")
             return code, klines
 
         tasks = [_fetch_one(c) for c in codes]
