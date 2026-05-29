@@ -1103,178 +1103,133 @@ def fetch_sector_kline(sector_code: str, days: int = 10, session: requests.Sessi
 
 
 # ════════════════════════════════════════════════════
-# 8a. 板块资金流向 + 主线板块排名
+# 8a. 主线板块排名（基于股票数据聚合，无额外API依赖）
 # ════════════════════════════════════════════════════
 
-def fetch_sector_money_flow(session: requests.Session = None) -> list[dict]:
-    """
-    获取行业板块资金流向（东方财富）
-    返回: [{"code": "BK0XXX", "name": "板块名", "main_net": 主力净流入(亿),
-            "change_pct": 涨跌幅, ...}, ...]
-    """
-    if session is None:
-        session = _build_session()
-
-    r = safe_request(
-        "https://push2.eastmoney.com/api/qt/clist/get",
-        _limiter_eastmoney, session,
-        params={
-            "pn": "1", "pz": "200", "po": "1",
-            "np": "1", "ut": "bd1d9ddb04089700cf9c27f6f7426281",
-            "fltt": "2", "invt": "2", "fid": "f62",  # 按主力净流入排序
-            "fs": "m:90+t:2",  # 行业板块
-            "fields": "f12,f14,f2,f3,f62,f184,f66,f69,f72,f75,f78,f81,f84,f87,f204,f205,f124",
-            # f12=板块代码 f14=名称 f2=最新价 f3=涨跌幅
-            # f62=主力净流入 f184=主力净占比
-            # f66=超大单净流入 f69=超大单净占比
-            # f72=大单净流入 f75=大单净占比
-            # f78=中单净流入 f81=中单净占比
-            # f84=小单净流入 f87=小单净占比
-            # f204=上涨家数 f205=下跌家数
-        },
-        headers={"Referer": "https://data.eastmoney.com/bkzj/hy.html"},
-    )
-    if not r:
-        return []
-
-    try:
-        data = r.json().get("data", {})
-        items = data.get("diff", []) if data else []
-        results = []
-        for item in items:
-            code = str(item.get("f12", ""))
-            name = str(item.get("f14", ""))
-            main_net = float(item.get("f62", 0) or 0) / 1e8  # 转为亿
-            change_pct = float(item.get("f3", 0) or 0)
-            results.append({
-                "code": code,
-                "name": name,
-                "main_net": round(main_net, 2),       # 主力净流入(亿)
-                "change_pct": round(change_pct, 2),    # 涨跌幅
-                "up_count": int(item.get("f204", 0) or 0),
-                "down_count": int(item.get("f205", 0) or 0),
-            })
-        return results
-    except Exception as e:
-        print(f"    ❌ 板块资金流向解析失败: {e}")
-        return []
-
-
-def rank_main_line_sectors(sectors: dict, session: requests.Session = None,
+def rank_main_line_sectors(sectors: dict, quotes: dict = None,
+                           details: dict = None, kline_map: dict = None,
+                           session: requests.Session = None,
                            top_n: int = 10) -> list[dict]:
     """
-    综合排名主线板块
-    维度：主力金额(净流入) + 五日涨幅 + 十日涨幅
-    返回排名前N的板块列表，每项包含: {
-        "name", "code", "score", "rank",
-        "main_net", "change_5d", "change_10d",
-        "detail_scores": {...}
-    }
+    综合排名主线板块（基于已有股票数据聚合，不依赖外部API）
+    维度：板块成交金额 + 板块5日平均涨幅 + 板块10日平均涨幅
+    返回排名前N的板块列表
     """
-    if session is None:
-        session = _build_session()
+    if quotes is None:
+        quotes = {}
+    if details is None:
+        details = {}
+    if kline_map is None:
+        kline_map = {}
 
-    # 1. 获取板块资金流向
-    print("  📊 获取板块资金流向...")
-    money_flows = fetch_sector_money_flow(session)
-    flow_map = {f["code"]: f for f in money_flows}
-    print(f"    ✅ 资金流向: {len(money_flows)} 个板块")
+    # 构建 code -> sector 映射
+    code_to_sector = {}
+    for sn, sd in sectors.items():
+        for stk in sd.get("stocks", []):
+            code = stk.get("code", "") or stk.get("symbol", "")
+            if code:
+                code_to_sector[code] = sn
 
-    # 2. 获取板块K线（5日+10日涨幅）
-    print("  📊 获取板块K线数据...")
-    sector_list = list(sectors.items())
-    sector_kline_results = {}
+    # 按板块聚合数据
+    sector_data = {}  # {sector_name: {amounts, changes_5d, changes_10d, up, down, today_changes}}
+    for sn in sectors:
+        sector_data[sn] = {
+            "amounts": [],
+            "changes_5d": [],
+            "changes_10d": [],
+            "today_changes": [],
+            "up": 0,
+            "down": 0,
+        }
 
-    def _fetch_kline(sn, scode):
-        try:
-            klines = fetch_sector_kline(scode, days=15, session=session)
-            return sn, klines
-        except Exception:
-            return sn, []
-
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = {executor.submit(_fetch_kline, sn, sd.get("code", "")): sn
-                   for sn, sd in sector_list if sd.get("code")}
-        for fut in as_completed(futures):
-            sn, klines = fut.result()
-            if klines:
-                sector_kline_results[sn] = klines
-
-    print(f"    ✅ 板块K线: {len(sector_kline_results)} 个")
-
-    # 3. 计算各维度数据
-    sector_scores = []
-    for sn, sd in sector_list:
-        scode = sd.get("code", "")
-        if not scode:
+    for code, q in quotes.items():
+        sn = code_to_sector.get(code)
+        if not sn or sn not in sector_data:
             continue
 
-        # 主力净流入(亿)
-        flow = flow_map.get(scode, {})
-        main_net = flow.get("main_net", 0)
+        # 当日涨幅
+        chg = float(q.get("change_pct", 0) or 0)
+        sector_data[sn]["today_changes"].append(chg)
+        if chg > 0:
+            sector_data[sn]["up"] += 1
+        elif chg < 0:
+            sector_data[sn]["down"] += 1
 
-        # K线涨幅
-        klines = sector_kline_results.get(sn, [])
-        change_5d = 0
-        change_10d = 0
-        if len(klines) >= 2:
+        # 成交额(亿)
+        amount = float(q.get("amount", 0) or 0)
+        if amount > 0:
+            sector_data[sn]["amounts"].append(amount)
+
+        # K线计算5日/10日涨幅
+        klines = kline_map.get(code, [])
+        if klines and len(klines) >= 2:
             close_now = float(klines[-1].get("close", 0))
+            if close_now <= 0:
+                continue
             if len(klines) >= 6:
                 close_5d = float(klines[-6].get("close", 0))
                 if close_5d > 0:
-                    change_5d = round((close_now - close_5d) / close_5d * 100, 2)
+                    sector_data[sn]["changes_5d"].append(
+                        (close_now - close_5d) / close_5d * 100)
             if len(klines) >= 11:
                 close_10d = float(klines[-11].get("close", 0))
                 if close_10d > 0:
-                    change_10d = round((close_now - close_10d) / close_10d * 100, 2)
+                    sector_data[sn]["changes_10d"].append(
+                        (close_now - close_10d) / close_10d * 100)
+
+    # 计算板块汇总
+    import numpy as _np
+    sector_scores = []
+    for sn, sd in sectors.items():
+        dd = sector_data.get(sn, {})
+        amounts = dd.get("amounts", [])
+        changes_5d = dd.get("changes_5d", [])
+        changes_10d = dd.get("changes_10d", [])
+
+        total_amount = sum(amounts) / 1e8 if amounts else 0  # 亿
+        avg_5d = round(float(_np.mean(changes_5d)), 2) if changes_5d else 0
+        avg_10d = round(float(_np.mean(changes_10d)), 2) if changes_10d else 0
+        avg_today = round(float(_np.mean(dd.get("today_changes", [0]))), 2) if dd.get("today_changes") else 0
+
+        # 只收录有数据的板块
+        if total_amount <= 0 and not changes_5d:
+            continue
 
         sector_scores.append({
             "name": sn,
-            "code": scode,
-            "main_net": main_net,
-            "change_5d": change_5d,
-            "change_10d": change_10d,
-            "up_count": flow.get("up_count", 0),
-            "down_count": flow.get("down_count", 0),
+            "code": sd.get("code", ""),
+            "total_amount": round(total_amount, 2),
+            "avg_5d": avg_5d,
+            "avg_10d": avg_10d,
+            "avg_today": avg_today,
+            "up_count": dd.get("up", 0),
+            "down_count": dd.get("down", 0),
+            "stock_count": len(amounts),
         })
 
     if not sector_scores:
         return []
 
-    # 4. 各维度归一化排名打分（百分位排名）
-    # 主力金额排名
-    sorted_by_money = sorted(sector_scores, key=lambda x: -x["main_net"])
-    money_rank_map = {}
-    for i, s in enumerate(sorted_by_money):
-        # 排名越靠前分越高，满分100
-        money_rank_map[s["name"]] = round((1 - i / len(sorted_by_money)) * 100, 1)
+    # 各维度百分位排名打分
+    def _percentile_rank(items, key):
+        sorted_items = sorted(items, key=lambda x: -x[key])
+        rank_map = {}
+        for i, s in enumerate(sorted_items):
+            rank_map[s["name"]] = round((1 - i / len(sorted_items)) * 100, 1)
+        return rank_map
 
-    # 五日涨幅排名
-    sorted_by_5d = sorted(sector_scores, key=lambda x: -x["change_5d"])
-    rank_5d_map = {}
-    for i, s in enumerate(sorted_by_5d):
-        rank_5d_map[s["name"]] = round((1 - i / len(sorted_by_5d)) * 100, 1)
+    money_rank = _percentile_rank(sector_scores, "total_amount")
+    rank_5d = _percentile_rank(sector_scores, "avg_5d")
+    rank_10d = _percentile_rank(sector_scores, "avg_10d")
 
-    # 十日涨幅排名
-    sorted_by_10d = sorted(sector_scores, key=lambda x: -x["change_10d"])
-    rank_10d_map = {}
-    for i, s in enumerate(sorted_by_10d):
-        rank_10d_map[s["name"]] = round((1 - i / len(sorted_by_10d)) * 100, 1)
-
-    # 5. 综合评分（加权：主力40% + 五日30% + 十日30%）
+    # 综合评分（成交金额40% + 五日涨幅30% + 十日涨幅30%）
     for s in sector_scores:
         sn = s["name"]
-        money_score = money_rank_map.get(sn, 0)
-        score_5d = rank_5d_map.get(sn, 0)
-        score_10d = rank_10d_map.get(sn, 0)
-        s["score"] = round(money_score * 0.4 + score_5d * 0.3 + score_10d * 0.3, 1)
-        s["detail_scores"] = {
-            "money": money_score,
-            "5d": score_5d,
-            "10d": score_10d,
-        }
+        s["score"] = round(
+            money_rank.get(sn, 0) * 0.4 +
+            rank_5d.get(sn, 0) * 0.3 +
+            rank_10d.get(sn, 0) * 0.3, 1)
 
-    # 6. 排序输出前N
     sector_scores.sort(key=lambda x: -x["score"])
     for i, s in enumerate(sector_scores[:top_n], 1):
         s["rank"] = i
@@ -2789,19 +2744,19 @@ def save_screen_html(stocks: list[dict], indices: list[dict], path: str, main_li
             rank_icon = "🥇" if rank == 1 else ("🥈" if rank == 2 else ("🥉" if rank == 3 else f"#{rank}"))
             border = "border:1px solid #f0883e" if rank == 1 else "border:1px solid #30363d"
             bg = "rgba(240,136,62,.08)" if rank == 1 else "#161b22"
-            sign_5d = "+" if s["change_5d"] > 0 else ""
-            sign_10d = "+" if s["change_10d"] > 0 else ""
-            sign_money = "+" if s["main_net"] > 0 else ""
+            sign_5d = "+" if s["avg_5d"] > 0 else ""
+            sign_10d = "+" if s["avg_10d"] > 0 else ""
             ml_cells += f"""<div style="background:{bg};{border};border-radius:8px;padding:10px 14px;text-align:center;min-width:140px">
 <div style="color:#f0883e;font-size:13px;font-weight:700">{rank_icon} {html_module.escape(s["name"])}</div>
 <div style="color:#58a6ff;font-size:16px;font-weight:700;margin:4px 0">{s["score"]:.1f}分</div>
-<div style="color:#8b949e;font-size:11px">主力 {sign_money}{s["main_net"]:.2f}亿</div>
-<div style="color:{'#f85149' if s['change_5d']>0 else '#3fb950'};font-size:11px">5日 {sign_5d}{s["change_5d"]:.2f}%</div>
-<div style="color:{'#f85149' if s['change_10d']>0 else '#3fb950'};font-size:11px">10日 {sign_10d}{s["change_10d"]:.2f}%</div>
+<div style="color:#8b949e;font-size:11px">成交 {s["total_amount"]:.2f}亿</div>
+<div style="color:{'#f85149' if s['avg_5d']>0 else '#3fb950'};font-size:11px">5日 {sign_5d}{s["avg_5d"]:.2f}%</div>
+<div style="color:{'#f85149' if s['avg_10d']>0 else '#3fb950'};font-size:11px">10日 {sign_10d}{s["avg_10d"]:.2f}%</div>
+<div style="color:#8b949e;font-size:10px">{s["up_count"]}涨 {s["down_count"]}跌</div>
 </div>"""
         main_line_html = f"""
 <div style="text-align:center;margin-bottom:16px;padding:12px;background:rgba(88,166,255,.06);border-radius:10px;border:1px solid #1f2937">
-<div style="color:#58a6ff;font-size:14px;font-weight:600;margin-bottom:8px">📊 主线板块排名（主力金额40% + 五日涨幅30% + 十日涨幅30%）</div>
+<div style="color:#58a6ff;font-size:14px;font-weight:600;margin-bottom:8px">📊 主线板块排名（成交额40% + 五日涨幅30% + 十日涨幅30%）</div>
 <div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap">{ml_cells}</div>
 </div>"""
 
@@ -2914,26 +2869,25 @@ def run_from_data_dir(data_dir: str, html_path: str = None, quiet: bool = False)
     # 板块K线（目前未提供，默认空）
     sector_klines = {}
 
-    # ---- 6a. 主线板块排名（主力金额+5日涨幅+10日涨幅）----
+    # ---- 6a. 主线板块排名（基于股票数据聚合）----
     main_line_sectors = []
     if sectors:
         print(f"\n📊 [5.5/6] 排名主线板块...")
         try:
-            session = _build_session()
-            main_line_sectors = rank_main_line_sectors(sectors, session=session, top_n=10)
+            main_line_sectors = rank_main_line_sectors(
+                sectors, quotes=quotes, details=details,
+                kline_map=kline_map, top_n=10)
             if main_line_sectors:
-                print(f"\n{'─'*100}")
-                print(f"  {'排名':>4}  {'板块':<12} {'综合分':>6}  {'主力净流入(亿)':>14}  {'5日涨幅':>8}  {'10日涨幅':>9}  {'上涨':>4}  {'下跌':>4}")
-                print(f"{'─'*100}")
+                print(f"\n{'─'*110}")
+                print(f"  {'排名':>4}  {'板块':<12} {'综合分':>6}  {'成交额(亿)':>10}  {'5日涨幅':>8}  {'10日涨幅':>9}  {'今日涨幅':>8}  {'上涨':>4}  {'下跌':>4}  {'个股数':>4}")
+                print(f"{'─'*110}")
                 for s in main_line_sectors:
-                    sign_5d = "+" if s["change_5d"] > 0 else ""
-                    sign_10d = "+" if s["change_10d"] > 0 else ""
-                    sign_money = "+" if s["main_net"] > 0 else ""
-                    up_cnt = s.get("up_count", 0)
-                    down_cnt = s.get("down_count", 0)
+                    sign_5d = "+" if s["avg_5d"] > 0 else ""
+                    sign_10d = "+" if s["avg_10d"] > 0 else ""
+                    sign_today = "+" if s["avg_today"] > 0 else ""
                     rank_mark = "🥇" if s["rank"] == 1 else ("🥈" if s["rank"] == 2 else ("🥉" if s["rank"] == 3 else f" {s['rank']}"))
-                    print(f"  {rank_mark:>4}  {s['name']:<12} {s['score']:>6.1f}  {sign_money}{s['main_net']:>12.2f}  {sign_5d}{s['change_5d']:>6.2f}%  {sign_10d}{s['change_10d']:>7.2f}%  {up_cnt:>4}  {down_cnt:>4}")
-                print(f"{'─'*100}")
+                    print(f"  {rank_mark:>4}  {s['name']:<12} {s['score']:>6.1f}  {s['total_amount']:>10.2f}  {sign_5d}{s['avg_5d']:>6.2f}%  {sign_10d}{s['avg_10d']:>7.2f}%  {sign_today}{s['avg_today']:>6.2f}%  {s['up_count']:>4}  {s['down_count']:>4}  {s['stock_count']:>4}")
+                print(f"{'─'*110}")
                 print(f"  📌 主线板块 #1: {main_line_sectors[0]['name']} (综合分 {main_line_sectors[0]['score']})")
         except Exception as e:
             print(f"    ⚠️ 主线板块排名失败: {e}")
