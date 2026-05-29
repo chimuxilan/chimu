@@ -297,139 +297,6 @@ def fetch_quotes_batch(codes: list[str], session: requests.Session = None) -> di
     return results
 
 
-# ── 新浪行情（第二数据源，用于交叉验证）──
-
-def fetch_quotes_sina_batch(codes: list[str], session: requests.Session = None) -> dict:
-    """
-    批量获取新浪实时行情（第二源，用于交叉验证腾讯数据）
-    返回: {code: {name, price, open, high, low, volume, amount, ...}}
-    """
-    if session is None:
-        session = _build_session()
-
-    def _to_sym(code):
-        return f"sh{code}" if code.startswith(("6", "9")) else f"sz{code}"
-
-    results = {}
-    batch_size = 50  # 新浪单次不宜太多
-
-    for i in range(0, len(codes), batch_size):
-        batch = codes[i:i + batch_size]
-        symbols = ",".join(_to_sym(c) for c in batch)
-
-        r = safe_request(
-            f"https://hq.sinajs.cn/list={symbols}",
-            _limiter_sina, session,
-            headers={"Referer": "https://finance.sina.com.cn/"},
-        )
-        if not r:
-            continue
-
-        text = r.content.decode("gbk", errors="replace")
-        for line in text.strip().split("\n"):
-            m = re.search(r'var hq_str_(\w+)="(.+)"', line)
-            if not m:
-                continue
-            symbol = m.group(1)
-            code = symbol[2:]  # 去掉 sh/sz 前缀
-            fields = m.group(2).split(",")
-            if len(fields) < 32:
-                continue
-
-            try:
-                price = float(fields[3]) if fields[3] else 0
-                prev_close = float(fields[2]) if fields[2] else 0
-                open_p = float(fields[1]) if fields[1] else 0
-                high = float(fields[4]) if fields[4] else 0
-                low = float(fields[5]) if fields[5] else 0
-                volume = int(float(fields[8])) if fields[8] else 0  # 成交量（股）
-                amount = float(fields[9]) if fields[9] else 0       # 成交额（元）
-
-                if price <= 0:
-                    continue
-
-                results[code] = {
-                    "name": fields[0],
-                    "code": code,
-                    "price": price,
-                    "prev_close": prev_close,
-                    "open": open_p,
-                    "high": high,
-                    "low": low,
-                    "volume": volume,
-                    "amount": amount,
-                    "bid1_p": float(fields[11]) if fields[11] else 0,
-                    "bid1_v": int(float(fields[10])) if fields[10] else 0,
-                    "ask1_p": float(fields[13]) if fields[13] else 0,
-                    "ask1_v": int(float(fields[12])) if fields[12] else 0,
-                    "date": fields[30] if len(fields) > 30 else "",
-                    "time": fields[31] if len(fields) > 31 else "",
-                }
-            except (ValueError, IndexError):
-                continue
-
-        if i + batch_size < len(codes):
-            time.sleep(random.uniform(0.3, 0.8))
-
-    return results
-
-
-def merge_and_validate_quotes(quotes_tencent: dict, quotes_sina: dict) -> dict:
-    """
-    双源交叉验证：腾讯 + 新浪
-    - 价格偏差 >2% 标记警告，取腾讯值
-    - 某源缺失字段用另一源补全
-    - 返回合并后的 {code: {...}}
-    """
-    all_codes = set(quotes_tencent.keys()) | set(quotes_sina.keys())
-    merged = {}
-    warn_count = 0
-
-    for code in all_codes:
-        tc = quotes_tencent.get(code, {})
-        sn = quotes_sina.get(code, {})
-
-        if tc and sn:
-            # 两源都有数据，交叉验证
-            tc_price = tc.get("price", 0)
-            sn_price = sn.get("price", 0)
-
-            if tc_price > 0 and sn_price > 0:
-                diff_pct = abs(tc_price - sn_price) / sn_price * 100
-                if diff_pct > 2:
-                    warn_count += 1
-                    if warn_count <= 10:
-                        print(f"    ⚠ {code} 价格偏差: 腾讯={tc_price} 新浪={sn_price} ({diff_pct:.1f}%)")
-
-            # 以腾讯为主，新浪补全
-            base = dict(tc)
-            # 新浪补全：如果腾讯某字段为0而新浪有值
-            for field in ("volume", "amount", "high", "low"):
-                if not base.get(field) and sn.get(field):
-                    base[field] = sn[field]
-
-            # 验证成交量一致性（偏差>20%标记）
-            tc_vol = tc.get("volume", 0)
-            sn_vol = sn.get("volume", 0)
-            if tc_vol > 0 and sn_vol > 0:
-                vol_diff = abs(tc_vol - sn_vol) / max(tc_vol, sn_vol) * 100
-                if vol_diff > 20:
-                    base["_vol_warn"] = True
-
-            merged[code] = base
-
-        elif tc:
-            merged[code] = dict(tc)
-        elif sn:
-            merged[code] = dict(sn)
-
-    if warn_count > 0:
-        print(f"    ⚠ 共 {warn_count} 只股票价格偏差>2%")
-    print(f"    ✅ 双源校验完成: {len(merged)} 只 (腾讯{len(quotes_tencent)} + 新浪{len(quotes_sina)})")
-
-    return merged
-
-
 # ════════════════════════════════════════════════════
 # 3. 日K线历史（新浪 + 东财双源）
 # ════════════════════════════════════════════════════
@@ -489,92 +356,10 @@ def fetch_kline_tencent(code: str, days: int = 300, session: requests.Session = 
     return []
 
 
-def fetch_kline_eastmoney(code: str, days: int = 1000, session: requests.Session = None) -> list[dict]:
-    """
-    东财日K线（生产API，数据更全更准）
-    返回: [{"day", "open", "close", "high", "low", "volume"}, ...]
-    """
-    if session is None:
-        session = _build_session()
-
-    market = "1" if code.startswith(("6", "9")) else "0"
-    r = safe_request(
-        "https://push2his.eastmoney.com/api/qt/stock/kline/get",
-        _limiter_eastmoney, session,
-        params={
-            "secid": f"{market}.{code}",
-            "fields1": "f1,f2,f3,f4,f5,f6",
-            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
-            "klt": "101",  # 日K
-            "fqt": "1",    # 前复权
-            "lmt": str(days),
-            "end": "20500101",
-            "ut": "fa5fd1943c7b386f172d6893dbbd4dc0",
-        },
-        headers={"Referer": "https://quote.eastmoney.com/center/boardlist.html"},
-    )
-    if not r:
-        return []
-
-    try:
-        m = re.search(r"jQuery\((.+)\);", r.text)
-        if not m:
-            return []
-        data = json.loads(m.group(1))
-        klines_raw = data.get("data", {}).get("klines", [])
-        if not klines_raw:
-            return []
-
-        result = []
-        for line in klines_raw:
-            parts = line.split(",")
-            if len(parts) >= 6:
-                result.append({
-                    "day": parts[0],
-                    "open": parts[1],
-                    "close": parts[2],
-                    "high": parts[3],
-                    "low": parts[4],
-                    "volume": parts[5],
-                })
-        return result
-    except Exception:
-        return []
-
-
-def _merge_kline_sources(klines_a: list, klines_b: list, klines_c: list) -> list:
-    """
-    合并多个K线源，取数据量最多且最新的那个
-    a/b/c 对应不同数据源
-    """
-    candidates = [k for k in (klines_a, klines_b, klines_c) if k and len(k) > 5]
-    if not candidates:
-        # 都很少，取非空的那个
-        candidates = [k for k in (klines_a, klines_b, klines_c) if k]
-    if not candidates:
-        return []
-
-    # 按数据量降序，优先取量多的（覆盖天数更长）
-    candidates.sort(key=lambda x: len(x), reverse=True)
-    best = candidates[0]
-
-    # 如果最佳源数据量不足，尝试用其他源补最近的数据
-    if len(best) < 100 and len(candidates) > 1:
-        best_dates = {k["day"] for k in best}
-        for other in candidates[1:]:
-            for k in other:
-                if k["day"] not in best_dates:
-                    best.append(k)
-                    best_dates.add(k["day"])
-        best.sort(key=lambda x: x["day"])
-
-    return best
-
-
 def fetch_kline_batch(codes: list[str], days: int = 1000, max_workers: int = 4,
                       session: requests.Session = None) -> dict:
     """
-    批量获取K线数据（新浪 + 腾讯 + 东财三源合并）
+    批量获取K线数据（新浪为主，腾讯补救）
     返回: {code: [kline_data]}
     """
     if session is None:
@@ -583,24 +368,12 @@ def fetch_kline_batch(codes: list[str], days: int = 1000, max_workers: int = 4,
     results = {}
 
     def _fetch_one(code):
-        # 三源并取
-        k_sina = fetch_kline_sina(code, days=min(days, 1000), session=session)
-        k_tencent = fetch_kline_tencent(code, days=min(days, 300), session=session)
-        k_eastmoney = fetch_kline_eastmoney(code, days=min(days, 1000), session=session)
-
-        # 智能合并：取数据量最多、覆盖最全的
-        merged = _merge_kline_sources(k_sina, k_tencent, k_eastmoney)
-
-        # 验证数据完整性
-        if merged and len(merged) < 20:
-            # 数据太少，可能是接口抽风，尝试取次优源
-            all_sources = [(k_sina, "新浪"), (k_tencent, "腾讯"), (k_eastmoney, "东财")]
-            for src, name in all_sources:
-                if src and len(src) > len(merged) * 2:
-                    merged = src
-                    break
-
-        return code, merged
+        # 新浪K线（快速，支持最多约1024条）
+        klines = fetch_kline_sina(code, days=min(days, 1000), session=session)
+        if not klines:
+            # 腾讯K线备用
+            klines = fetch_kline_tencent(code, days=min(days, 300), session=session)
+        return code, klines
 
     print(f"    📦 批量获取K线: {len(codes)} 只, {days}天, {max_workers}线程...")
 
@@ -1000,11 +773,9 @@ def test_connectivity():
 
     tests = [
         ("腾讯行情", lambda: fetch_quotes_batch(["600519"], session)),
-        ("新浪行情", lambda: fetch_quotes_sina_batch(["600519"], session)),
         ("腾讯搜索", lambda: search_stock("茅台", session)),
         ("新浪K线", lambda: fetch_kline_sina("600519", 5, session)),
-        ("腾讯K线", lambda: fetch_kline_tencent("600519", 5, session)),
-        ("东财K线", lambda: fetch_kline_eastmoney("600519", 5, session)),
+        ("东财K线", lambda: fetch_kline_tencent("600519", 5, session)),
         ("大盘指数", lambda: fetch_indices(session)),
         ("东财股票详情", lambda: fetch_stock_details(["600519"], session)),
         ("东财板块列表", lambda: fetch_sectors(session)),
@@ -1038,34 +809,28 @@ def test_connectivity():
 
 def scrape_all(output_dir: str = "stock_data", target_codes: list[str] = None):
     """
-    完整抓取流程（同花顺 Selenium 爬虫）：
+    完整抓取流程（纯HTTP，无Selenium依赖）：
     1. 获取全A代码列表（或使用指定代码）
-    2. 批量获取实时行情
-    3. 批量获取K线历史
-    4. 获取板块数据
-    5. 获取股票详情
+    2. 批量获取实时行情（腾讯）
+    3. 批量获取股票详情（东财）
+    4. 获取行业板块 + 成分股（东财）
+    5. 获取K线历史（新浪+腾讯）
     6. 全部保存为JSON
     """
-    import ths_scraper
-
     os.makedirs(output_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    session = _build_session()
 
     print(f"\n{'═' * 60}")
-    print(f"  🕷️  NYLO — 同花顺 Selenium 爬虫 · 开始抓取")
+    print(f"  🕷️  NYLO — A股数据抓取 · 开始抓取（纯HTTP模式）")
     print(f"  时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  输出目录: {output_dir}/")
     print(f"{'═' * 60}\n")
 
-    # 初始化 Selenium 浏览器
-    print("🌐 启动 Selenium 浏览器...")
-    driver = ths_scraper.init_driver()
-    print("  ✅ 浏览器就绪\n")
-
     try:
         # ── 0. 大盘指数 ──
         print("📊 [1/6] 抓取大盘指数...")
-        indices = ths_scraper.fetch_indices(driver)
+        indices = fetch_indices(session)
         for idx in indices:
             sign = "+" if idx["change_pct"] > 0 else ""
             print(f"    {idx['name']}: {idx['price']:.2f} ({sign}{idx['change_pct']:.2f}%)")
@@ -1076,40 +841,26 @@ def scrape_all(output_dir: str = "stock_data", target_codes: list[str] = None):
             all_codes = target_codes
             print(f"\n📋 [2/6] 使用指定代码: {len(all_codes)} 只")
         else:
-            print(f"\n📋 [2/6] 抓取全A股代码列表（同花顺）...")
-            all_codes = ths_scraper.fetch_all_stock_codes(driver)
+            print(f"\n📋 [2/6] 抓取全A股代码列表（新浪）...")
+            all_codes = fetch_all_stock_codes(session)
             print(f"    ✅ 共 {len(all_codes)} 只主板A股")
         _save_json(all_codes, f"{output_dir}/all_codes_{timestamp}.json")
 
-        # ── 2. 批量实时行情（多源交叉验证）──
+        # ── 2. 批量实时行情（腾讯）──
         print(f"\n📊 [3/6] 抓取实时行情 ({len(all_codes)} 只)...")
-        quotes_tc = ths_scraper.fetch_quotes_batch(driver, all_codes)
-        print(f"    腾讯(THS): {len(quotes_tc)} 只")
-
-        # 新浪作为第二源交叉验证
-        print(f"    🔍 新浪交叉验证...")
-        quotes_sn = fetch_quotes_sina_batch(all_codes)
-        print(f"    新浪: {len(quotes_sn)} 只")
-
-        # 双源合并校验
-        quotes = merge_and_validate_quotes(quotes_tc, quotes_sn)
+        quotes = fetch_quotes_batch(all_codes, session)
+        print(f"    ✅ 获取到 {len(quotes)} 只行情数据")
         _save_json(quotes, f"{output_dir}/quotes_{timestamp}.json")
 
-        # ── 3. 股票详情（市值/量比/换手率）──
+        # ── 3. 股票详情（东财批量接口）──
         print(f"\n📊 [4/6] 抓取股票详情（市值/量比/换手率）...")
-        details = ths_scraper.fetch_stock_details(driver, all_codes)
-        if not details:
-            print("    ⚠ Selenium详情为空，回退到东财API...")
-            details = fetch_stock_details(all_codes, quotes_ref=quotes)
+        details = fetch_stock_details(all_codes, session, quotes_ref=quotes)
         print(f"    ✅ 获取到 {len(details)} 只详情数据")
         _save_json(details, f"{output_dir}/details_{timestamp}.json")
 
-        # ── 4. 行业板块 + 成分股 ──
+        # ── 4. 行业板块 + 成分股（东财）──
         print(f"\n📊 [5/6] 抓取行业板块 + 成分股...")
-        sectors = ths_scraper.fetch_sectors(driver)
-        if not sectors:
-            print("    ⚠ Selenium板块为空，回退到东财API...")
-            sectors = fetch_sectors()
+        sectors = fetch_sectors(session)
         sectors_save = {}
         for sn, sd in sectors.items():
             sectors_save[sn] = {
@@ -1121,16 +872,13 @@ def scrape_all(output_dir: str = "stock_data", target_codes: list[str] = None):
             }
         _save_json(sectors_save, f"{output_dir}/sectors_{timestamp}.json")
 
-        # ── 5. K线历史 ──
+        # ── 5. K线历史（新浪+腾讯双源）──
         kline_codes = [c for c in all_codes if c.startswith(("60", "00")) and c in quotes]
         if target_codes:
             kline_codes = target_codes
 
         print(f"\n📊 [6/6] 抓取K线历史 ({len(kline_codes)} 只主板, 1000天)...")
-        klines = ths_scraper.fetch_kline_batch(driver, kline_codes, days=1000)
-        if not klines:
-            print("    ⚠ Selenium K线为空，回退到新浪+腾讯+东财三源合并...")
-            klines = fetch_kline_batch(kline_codes, days=1000)
+        klines = fetch_kline_batch(kline_codes, days=1000, session=session)
         klines = supplement_kline_amount(klines, quotes)
 
         kline_dir = f"{output_dir}/klines"
@@ -1139,16 +887,13 @@ def scrape_all(output_dir: str = "stock_data", target_codes: list[str] = None):
             _save_json(data, f"{kline_dir}/{code}.json")
         print(f"    ✅ K线已保存到 {kline_dir}/ ({len(klines)} 个文件)")
 
-        # 120分钟K线
+        # 120分钟K线（新浪60分钟合并）
         kline120_dir = f"{output_dir}/klines_120min"
         os.makedirs(kline120_dir, exist_ok=True)
         print(f"\n📊 [补充] 抓取120分钟K线 ({len(kline_codes)} 只)...")
         kline120_count = 0
         for i, code in enumerate(kline_codes):
-            k120 = ths_scraper.fetch_kline_120min(driver, code, count=60)
-            if not k120:
-                # 回退到新浪60分钟K线合并
-                k120 = fetch_kline_120min(code, count=60)
+            k120 = fetch_kline_120min(code, count=60, session=session)
             if k120:
                 _save_json(k120, f"{kline120_dir}/{code}.json")
                 kline120_count += 1
@@ -1183,9 +928,8 @@ def scrape_all(output_dir: str = "stock_data", target_codes: list[str] = None):
         print(f"  📊 汇总: {len(quotes)} 只行情 | {len(sectors)} 个板块 | {len(klines)} 只K线 | {kline120_count} 只120分钟K线")
         print(f"{'═' * 60}\n")
 
-    finally:
-        ths_scraper.close_driver(driver)
-        print("🌐 浏览器已关闭")
+    except KeyboardInterrupt:
+        print(f"\n⚠ 用户中断，已保存已获取的数据")
 
     return summary
 
@@ -2854,9 +2598,8 @@ def run_from_data_dir(data_dir: str, html_path: str = None, quiet: bool = False)
 # ════════════════════════════════════════════════════
 
 def run_oneclick():
-    import ths_scraper
-
     inputs = sys.argv[1:]
+    session = _build_session()
 
     # ---- 解析输入：代码或名称 ----
     codes = []
@@ -2866,8 +2609,13 @@ def run_oneclick():
             if inp.isdigit() and len(inp) == 6:
                 codes.append(inp)
             else:
-                # 简单名称匹配（不调API）
-                print(f"  ⚠ 名称搜索需要联网，请直接输入股票代码")
+                # 名称搜索
+                result = search_stock(inp, session)
+                if result:
+                    codes.append(result["code"])
+                    print(f"  🔍 {inp} → {result['code']} {result['name']}")
+                else:
+                    print(f"  ⚠ 未找到: {inp}")
         if not codes:
             print("❌ 没有有效股票代码")
             return
@@ -2878,36 +2626,26 @@ def run_oneclick():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     print(f"\n{'═'*50}")
-    print(f"  NYLO — 同花顺 Selenium 抓取 + 分析")
+    print(f"  NYLO — A股数据抓取 + 分析（纯HTTP模式）")
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'═'*50}\n")
-
-    # 初始化 Selenium
-    print("🌐 启动 Selenium 浏览器...")
-    driver = ths_scraper.init_driver()
-    print("  ✅ 浏览器就绪\n")
 
     try:
         # ---- 1. 大盘指数 ----
         print("📊 获取大盘...")
-        indices = ths_scraper.fetch_indices(driver)
+        indices = fetch_indices(session)
         for idx in indices:
             sign = "+" if idx["change_pct"] > 0 else ""
             print(f"  {idx['name']}: {idx['price']:.2f} ({sign}{idx['change_pct']:.2f}%)")
         _save_json(indices, f"{data_dir}/indices_{timestamp}.json")
 
-        # ---- 2. 行情（多源交叉验证）----
+        # ---- 2. 行情 ----
         if codes:
             print(f"\n📊 获取行情 ({len(codes)} 只)...")
-            quotes_tc = ths_scraper.fetch_quotes_batch(driver, codes)
-            quotes_sn = fetch_quotes_sina_batch(codes)
-            quotes = merge_and_validate_quotes(quotes_tc, quotes_sn)
+            quotes = fetch_quotes_batch(codes, session)
         else:
             print("\n📊 获取板块数据...")
-            sectors = ths_scraper.fetch_sectors(driver)
-            if not sectors:
-                print("    ⚠ Selenium板块为空，回退到东财API...")
-                sectors = fetch_sectors()
+            sectors = fetch_sectors(session)
             _save_json(sectors, f"{data_dir}/sectors_{timestamp}.json")
 
             all_codes = set()
@@ -2920,19 +2658,14 @@ def run_oneclick():
             print(f"  共 {len(codes)} 只主板股票")
 
             print(f"\n📊 获取行情 ({len(codes)} 只)...")
-            quotes_tc = ths_scraper.fetch_quotes_batch(driver, codes)
-            quotes_sn = fetch_quotes_sina_batch(codes)
-            quotes = merge_and_validate_quotes(quotes_tc, quotes_sn)
+            quotes = fetch_quotes_batch(codes, session)
 
         print(f"  ✅ 行情: {len(quotes)} 只")
         _save_json(quotes, f"{data_dir}/quotes_{timestamp}.json")
 
-        # ---- 3. 详情 ----
+        # ---- 3. 详情（东财批量接口）----
         print(f"\n📊 获取详情...")
-        details = ths_scraper.fetch_stock_details(driver, codes)
-        if not details:
-            print("    ⚠ Selenium详情为空，回退到东财API...")
-            details = fetch_stock_details(codes, quotes_ref=quotes)
+        details = fetch_stock_details(codes, session, quotes_ref=quotes)
         print(f"  ✅ 详情: {len(details)} 只")
         _save_json(details, f"{data_dir}/details_{timestamp}.json")
 
@@ -2940,18 +2673,12 @@ def run_oneclick():
         sector_files = [f for f in os.listdir(data_dir) if f.startswith("sectors_")]
         if not sector_files:
             print(f"\n📊 获取板块...")
-            sectors = ths_scraper.fetch_sectors(driver)
-            if not sectors:
-                print("    ⚠ Selenium板块为空，回退到东财API...")
-                sectors = fetch_sectors()
+            sectors = fetch_sectors(session)
             _save_json(sectors, f"{data_dir}/sectors_{timestamp}.json")
 
-        # ---- 5. K线 ----
+        # ---- 5. K线（新浪+腾讯双源）----
         print(f"\n📊 获取K线 ({len(codes)} 只)...")
-        klines = ths_scraper.fetch_kline_batch(driver, codes, days=1000)
-        if not klines:
-            print("    ⚠ Selenium K线为空，回退到新浪+腾讯+东财三源合并...")
-            klines = fetch_kline_batch(codes, days=1000)
+        klines = fetch_kline_batch(codes, days=1000, session=session)
         klines = supplement_kline_amount(klines, quotes)
         kline_dir = f"{data_dir}/klines"
         os.makedirs(kline_dir, exist_ok=True)
@@ -2959,14 +2686,12 @@ def run_oneclick():
             _save_json(data, f"{kline_dir}/{code}.json")
         print(f"  ✅ K线: {len(klines)} 只")
 
-        # ---- 6. 120分钟K线 ----
+        # ---- 6. 120分钟K线（新浪60分钟合并）----
         kline120_dir = f"{data_dir}/klines_120min"
         os.makedirs(kline120_dir, exist_ok=True)
         k120_count = 0
         for code in codes:
-            k120 = ths_scraper.fetch_kline_120min(driver, code, count=60)
-            if not k120:
-                k120 = fetch_kline_120min(code, count=60)
+            k120 = fetch_kline_120min(code, count=60, session=session)
             if k120:
                 _save_json(k120, f"{kline120_dir}/{code}.json")
                 k120_count += 1
@@ -2982,9 +2707,8 @@ def run_oneclick():
 
         print(f"\n📄 报告: {html_out}")
 
-    finally:
-        ths_scraper.close_driver(driver)
-        print("🌐 浏览器已关闭")
+    except KeyboardInterrupt:
+        print(f"\n⚠ 用户中断")
 
 
 # ════════════════════════════════════════════════════
