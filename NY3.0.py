@@ -1340,6 +1340,132 @@ class AuctionResult:
     macd_dea: float = 0
     macd_bar: float = 0
     macd_trend: str = "-"
+    # 尾段竞价判定
+    tail_score: int = 0
+    tail_verdict: str = "-"
+    tail_signals: list = field(default_factory=list)
+
+
+def tail_segment_verdict(gap: float, vol: int, buy_vol: int, sell_vol: int,
+                         is_limit_up: bool = False,
+                         mid_buy_all: bool = False,
+                         mid_sell_vol: float = 0, tail_sell_vol: float = 0) -> tuple[int, str, list]:
+    """
+    尾段竞价判定规则（新规则三维评分）
+    ─────────────────────────────────────
+    第一层：新规则三维评分
+      硬否决规则（任一触发→判定"不看多"）
+      正面计分规则（总分≥5分才判定"看多"）
+
+    参数:
+      gap: 开盘跳空百分比 (op - prev_close) / prev_close * 100
+      vol: 成交量（手）
+      buy_vol: 尾段买量（手）
+      sell_vol: 尾段卖量（手）
+      is_limit_up: 是否涨停
+      mid_buy_all: 中段是否全买单
+      mid_sell_vol: 中段卖量（手）
+      tail_sell_vol: 尾段卖量（手）（用于计算中→尾卖盘变化）
+
+    返回:
+      (score, verdict, signals)
+      score: 综合得分（≥5=看多, <5=不看多, 硬否决时为负数）
+      verdict: "看多" / "不看多"
+      signals: 信号列表
+    """
+    signals = []
+
+    # ═══════════════════════════════════════════
+    # 硬否决规则（任一触发→直接判定"不看多"）
+    # ═══════════════════════════════════════════
+
+    # 1. 成交量维度：vol < 5000手 → "量太小"
+    if vol < 5000:
+        signals.append("❌ 量太小 (<5000手)")
+        return -1, "不看多", signals
+
+    # 2. 价格差值维度：gap < -1.0% → "价格向下"
+    if gap < -1.0:
+        signals.append("❌ 价格向下 (gap<-1.0%)")
+        return -2, "不看多", signals
+
+    # 3. jzb指标维度：jzb > 35% → "异常高（华塑陷阱）"
+    #    jzb = 尾段买量占比 = buy_vol / (buy_vol + sell_vol) * 100
+    total_tail = buy_vol + sell_vol
+    jzb = (buy_vol / total_tail * 100) if total_tail > 0 else 50
+    if jzb > 35:
+        signals.append(f"❌ 异常高/华塑陷阱 (jzb={jzb:.1f}%>35%)")
+        return -3, "不看多", signals
+
+    # 4. 组合条件：尾段全买单 + gap<0.5% + 非涨停 → "虚假信号"
+    if buy_vol > 0 and sell_vol == 0 and gap < 0.5 and not is_limit_up:
+        signals.append("❌ 虚假信号 (全买单+gap<0.5%+非涨停)")
+        return -4, "不看多", signals
+
+    # 5. 价格+量组合：gap>1% + vol<5万 → "薄里拉价（太阳能陷阱）"
+    if gap > 1 and vol < 50000:
+        signals.append("❌ 薄里拉价/太阳能陷阱 (gap>1%+vol<5万)")
+        return -5, "不看多", signals
+
+    # 6. jzb指标维度：jzb < 2% → "无人气"
+    if jzb < 2:
+        signals.append(f"❌ 无人气 (jzb={jzb:.1f}%<2%)")
+        return -6, "不看多", signals
+
+    # ═══════════════════════════════════════════
+    # 正面计分规则（总分≥5分才判定"看多"）
+    # ═══════════════════════════════════════════
+    score = 0
+
+    # 1. gap指标计分
+    if gap > 1.5:
+        score += 3
+        signals.append(f"✅ gap>{gap:.1f}%>1.5% → +3")
+    elif gap > 0.8:
+        score += 2
+        signals.append(f"✅ gap={gap:.1f}%∈(0.8,1.5] → +2")
+    elif gap > 0.3:
+        score += 1
+        signals.append(f"✅ gap={gap:.1f}%∈(0.3,0.8] → +1")
+
+    # 2. 尾段买卖量计分
+    if buy_vol > sell_vol and buy_vol > 50:
+        score += 2
+        signals.append(f"✅ 尾段买>卖且>50手 → +2")
+    elif buy_vol > sell_vol and buy_vol > 10:
+        score += 1
+        signals.append(f"✅ 尾段买>卖且>10手 → +1")
+
+    # 3. 中→尾卖盘变化计分
+    if mid_sell_vol > 0 and tail_sell_vol >= 0:
+        sell_decrease = (mid_sell_vol - tail_sell_vol) / mid_sell_vol * 100
+        if sell_decrease > 80:
+            score += 2
+            signals.append(f"✅ 卖盘减少{sell_decrease:.0f}%>80% → +2")
+        elif sell_decrease > 50:
+            score += 1
+            signals.append(f"✅ 卖盘减少{sell_decrease:.0f}%>50% → +1")
+
+    # 4. vol成交量计分
+    if vol > 100000:
+        score += 2
+        signals.append(f"✅ vol={vol:,}>10万 → +2")
+    elif vol > 50000:
+        score += 1
+        signals.append(f"✅ vol={vol:,}>5万 → +1")
+
+    # 5. jzb指标计分：3% ≤ jzb ≤ 20%
+    if 3 <= jzb <= 20:
+        score += 1
+        signals.append(f"✅ jzb={jzb:.1f}%∈[3%,20%] → +1")
+
+    # 6. 扣分项：中段全买单 + 非涨停
+    if mid_buy_all and not is_limit_up:
+        score -= 2
+        signals.append(f"⚠️ 中段全买单+非涨停 → -2")
+
+    verdict = "看多" if score >= 5 else "不看多"
+    return score, verdict, signals
 
 
 def analyze(code: str, quote: dict, hist: list[dict]) -> Optional[AuctionResult]:
@@ -1467,12 +1593,19 @@ def analyze(code: str, quote: dict, hist: list[dict]) -> Optional[AuctionResult]
     bs = min(bull, 100)
     rs = min(bear, 100)
     net = bs - rs
-    if net > 15:
+    if net > 25:
         v = "真实抢筹"
     elif net < -10:
         v = "疑似出货"
     else:
         v = "正常"
+
+    # ---- 尾段竞价判定 ----
+    is_limit_up = chg >= 9.5
+    ts_score, ts_verdict, ts_signals = tail_segment_verdict(
+        gap=gap, vol=vol, buy_vol=bv, sell_vol=sv,
+        is_limit_up=is_limit_up,
+    )
 
     return AuctionResult(
         code=code, name=quote["name"],
@@ -1482,6 +1615,7 @@ def analyze(code: str, quote: dict, hist: list[dict]) -> Optional[AuctionResult]
         amplitude=amp, turnover=to, buy_ratio=round(br, 1),
         buy_vol=bv, sell_vol=sv,
         bull_score=bs, bear_score=rs, verdict=v, signals=sigs,
+        tail_score=ts_score, tail_verdict=ts_verdict, tail_signals=ts_signals,
     )
 
 
@@ -1508,6 +1642,12 @@ def print_result(r: AuctionResult):
     print(f"  抢筹 [{bb}] {r.bull_score}/100")
     print(f"  出货 [{rb}] {r.bear_score}/100")
     print(f"\n  🔮 {r.verdict}")
+    # 尾段竞价判定
+    if r.tail_verdict and r.tail_verdict != "-":
+        ts_icon = "🟢" if r.tail_verdict == "看多" else "🔴"
+        print(f"  {ts_icon} 尾段判定: {r.tail_verdict} (得分:{r.tail_score})")
+        for ts in r.tail_signals:
+            print(f"    {ts}")
     print(f"{'─'*56}")
 
 
@@ -1541,84 +1681,40 @@ def _compute_strategy(r: AuctionResult) -> str:
     return "观望"
 
 
-def save_html(results: list[AuctionResult], path: str) -> str:
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    # 按涨幅降序
-    sorted_results = sorted(results, key=lambda x: x.change_pct, reverse=True)
-
-    rows = ""
-    for i, r in enumerate(sorted_results, 1):
-        chg_color = "#f85149" if r.change_pct > 0 else ("#3fb950" if r.change_pct < 0 else "#c9d1d9")
-        chg_str = f"{r.change_pct:+.2f}%" if r.change_pct != 999 else "涨停"
-
-        # 筹码判断颜色
-        if r.verdict == "真实抢筹":
-            v_color = "#f85149"
-            v_bg = "rgba(248,81,73,.12)"
-        elif r.verdict == "疑似出货":
-            v_color = "#3fb950"
-            v_bg = "rgba(63,185,80,.12)"
-        else:
-            v_color = "#d29922"
-            v_bg = "rgba(210,153,34,.12)"
-
-        freq = len([s for s in r.signals if any(k in s for k in ["高开", "低开", "放量", "缩量", "买盘", "卖盘", "连涨", "连跌", "平开"])])
-        strategy = _compute_strategy(r)
-        vol_fmt = _format_volume(r.volume)
-
-        # 竞昨比（今开 vs 昨收）
-        if r.prev_close > 0:
-            comp_ratio = f"{(r.open_price - r.prev_close) / r.prev_close * 100:.1f}%"
-        else:
-            comp_ratio = "-"
-
-        rows += f"""<tr>
-<td>{html_module.escape(r.code)}</td>
-<td style="text-align:left;font-weight:600">{html_module.escape(r.name)}</td>
-<td>{r.open_price:.2f}</td>
-<td>{r.price:.2f}</td>
-<td>{vol_fmt}</td>
-<td>{comp_ratio}</td>
-<td>{r.buy_ratio:.1f}%</td>
-<td style="color:{chg_color}">{chg_str}</td>
-<td style="color:{v_color};background:{v_bg};border-radius:4px;font-weight:600">{r.verdict}</td>
-<td>{freq}</td>
-<td style="text-align:left;font-size:12px">{strategy}</td>
-</tr>"""
-
-    html = f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>集合竞价 - 股票筛选</title>
-<style>
-*{{margin:0;padding:0;box-sizing:border-box}}
-body{{font-family:"Microsoft YaHei","PingFang SC",sans-serif;background:#0d1117;color:#c9d1d9;padding:16px}}
-.hd{{text-align:center;padding:16px 0}}
-.hd h1{{font-size:20px;color:#58a6ff}}
-.hd .t{{color:#8b949e;font-size:12px;margin-top:4px}}
-.tbl-wrap{{overflow-x:auto;margin:0 auto;max-width:1100px}}
-table{{width:100%;border-collapse:collapse;font-size:13px;white-space:nowrap}}
-th{{background:#161b22;color:#8b949e;font-weight:600;padding:8px 10px;text-align:center;border-bottom:2px solid #30363d;position:sticky;top:0}}
-td{{padding:6px 10px;text-align:center;border-bottom:1px solid #21262d}}
-tr:hover{{background:#161b22}}
-.ft{{text-align:center;color:#484f58;font-size:10px;padding:20px 0}}
-@media(max-width:768px){{table{{font-size:11px}}th,td{{padding:4px 6px}}}}
-</style></head><body>
-<div class="hd"><h1>📊 集合竞价 - 股票筛选</h1><div class="t">更新时间: {now}</div></div>
-<div class="tbl-wrap">
-<table>
-<thead><tr>
-<th>代码</th><th>名称</th><th>09:25</th><th>09:26</th><th>搓合量</th>
-<th>竞昨比</th><th>剩余率</th><th>09:26涨幅</th>
-<th>筹码判断</th><th>频次</th><th>策略</th>
-</tr></thead>
-<tbody>{rows}</tbody>
-</table></div>
-<div class="ft">⚠️ 仅供学习参考，不构成投资建议</div></body></html>"""
-
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(html)
-    return os.path.abspath(path)
+def _auction_result_to_screen_dict(r: AuctionResult) -> dict:
+    """将 AuctionResult 转换为 save_screen_html 所需的 dict 格式"""
+    buy_vol = r.buy_vol
+    sell_vol = r.sell_vol
+    remaining_rate = round(buy_vol / (buy_vol + sell_vol) * 100, 1) if (buy_vol + sell_vol) > 0 else 50.0
+    return {
+        "code": r.code,
+        "name": r.name,
+        "price": r.price,
+        "prev_close": r.prev_close,
+        "auction_price": r.open_price,
+        "price_0926": r.price,
+        "chg_0926": r.change_pct,
+        "auction_vol": r.volume,
+        "volume": r.volume,
+        "comp_ratio": 0,
+        "remaining_rate": remaining_rate,
+        "verdict": r.verdict,
+        "frequency": len([s for s in r.signals if any(k in s for k in ["高开", "低开", "放量", "缩量", "买盘", "卖盘", "连涨", "连跌", "平开"])]),
+        "freq_signals": [s for s in r.signals if any(k in s for k in ["高开", "低开", "放量", "缩量", "买盘", "卖盘", "连涨", "连跌", "平开"])],
+        "strategy": _compute_strategy(r),
+        "passed_pools": [],
+        "sector": "-",
+        "sector_limit_count": 0,
+        "is_leader": False,
+        "leader_count": 0,
+        "macd_dif": r.macd_dif,
+        "macd_dea": r.macd_dea,
+        "macd_bar": r.macd_bar,
+        "macd_trend": r.macd_trend,
+        "tail_score": r.tail_score,
+        "tail_verdict": r.tail_verdict,
+        "tail_signals": r.tail_signals,
+    }
 
 
 # ============================================================
@@ -2436,6 +2532,19 @@ def save_screen_html(stocks: list[dict], indices: list[dict], path: str) -> str:
         pools = "/".join(s.get("passed_pools", []))
         freq_sigs = ", ".join(s.get("freq_signals", []))
 
+        # 尾段判定
+        ts_verdict = s.get("tail_verdict", "-")
+        ts_score = s.get("tail_score", 0)
+        if ts_verdict == "看多":
+            ts_color = "#f85149"
+            ts_verdict_html = "🟢看多"
+        elif ts_verdict == "不看多":
+            ts_color = "#3fb950"
+            ts_verdict_html = "🔴不看多"
+        else:
+            ts_color = "#8b949e"
+            ts_verdict_html = "⚪-"
+
         rows += f"""<tr>
 <td>{html_module.escape(s["code"])}</td>
 <td style="text-align:left;font-weight:600">{html_module.escape(s["name"])}</td>
@@ -2449,6 +2558,7 @@ def save_screen_html(stocks: list[dict], indices: list[dict], path: str) -> str:
 <td style="color:{chg_color};font-weight:600">{chg_0926:+.2f}%</td>
 <td style="color:{v_color};background:{v_bg};border-radius:4px;font-weight:600;padding:4px 8px">{verdict}</td>
 <td style="font-weight:700">{freq}</td>
+<td style="color:{ts_color};font-weight:600">{ts_verdict_html}({ts_score})</td>
 <td style="text-align:left;font-size:11px">{html_module.escape(pools)}</td>
 <td style="text-align:left;font-size:12px">{html_module.escape(strategy)}</td>
 <td style="font-size:11px">{s.get("macd_dif", 0):.3f}</td>
@@ -2507,7 +2617,7 @@ tr:hover{{background:#161b22}}
 <thead><tr>
 <th>代码</th><th>名称</th><th>板块(涨停数)</th><th>龙头</th><th>09:25</th><th>09:26</th><th>搓合量</th>
 <th>竞昨比</th><th>剩余率</th><th>09:26涨幅</th>
-<th>筹码判断</th><th>频次</th><th>策略池</th><th>策略</th>
+<th>筹码判断</th><th>频次</th><th>尾段判定</th><th>策略池</th><th>策略</th>
 <th>DIF</th><th>DEA</th><th>BAR</th><th>趋势</th><th>信号</th>
 </tr></thead>
 <tbody>{rows}</tbody>
@@ -2635,7 +2745,8 @@ def run_from_data_dir(data_dir: str, html_path: str = None, quiet: bool = False)
                     print(f"    DIF={r.macd_dif:.3f} DEA={r.macd_dea:.3f} BAR={r.macd_bar:.3f} 趋势={r.macd_trend}")
 
             if html_path:
-                path = save_html(direct_results, html_path)
+                screen_dicts = [_auction_result_to_screen_dict(r) for r in direct_results]
+                path = save_screen_html(screen_dicts, [], html_path)
                 print(f"\n✅ 分析报告: {path}")
 
             # 转为dict列表返回
@@ -2864,69 +2975,85 @@ def run_from_data_dir(data_dir: str, html_path: str = None, quiet: bool = False)
         rr = c["remaining_rate"]
         cr = c.get("comp_ratio", 0)
 
-        # ---- 频次分析：6维度信号统计 ----
+        # ---- 频次分析：6维度信号统计（收紧阈值）----
         # 每个维度满足条件计1分，总分=频次
         freq_signals = []
         freq = 0
 
-        # 1. 量比 ≥ 5 → 资金关注度高
-        if vr >= 5:
+        # 1. 量比 ≥ 8 → 资金高度关注
+        if vr >= 8:
             freq += 1
-            freq_signals.append("量比≥5")
-        # 2. 竞价涨幅 ≥ 5% → 强势高开
-        if chg >= 5:
+            freq_signals.append("量比≥8")
+        # 2. 竞价涨幅 ≥ 7% → 极强势高开
+        if chg >= 7:
             freq += 1
-            freq_signals.append("涨幅≥5%")
-        # 3. 剩余率 ≥ 60% → 买盘主导
-        if rr >= 60:
+            freq_signals.append("涨幅≥7%")
+        # 3. 剩余率 ≥ 70% → 买盘绝对主导
+        if rr >= 70:
             freq += 1
-            freq_signals.append("剩余率≥60%")
-        # 4. 竞昨比 ≥ 3% → 资金放大
-        if cr >= 3:
+            freq_signals.append("剩余率≥70%")
+        # 4. 竞昨比 ≥ 5% → 显著资金放大
+        if cr >= 5:
             freq += 1
-            freq_signals.append("竞昨比≥3%")
-        # 5. 板块涨停数 ≥ 3 → 板块热度
-        if c.get("sector_limit_count", 0) >= 3:
+            freq_signals.append("竞昨比≥5%")
+        # 5. 板块涨停数 ≥ 5 → 板块强势
+        if c.get("sector_limit_count", 0) >= 5:
             freq += 1
-            freq_signals.append("板块涨停≥3")
+            freq_signals.append("板块涨停≥5")
         # 6. 通过多个策略池 → 多维共振
-        if len(c.get("passed_pools", [])) >= 2:
+        if len(c.get("passed_pools", [])) >= 3:
             freq += 1
             freq_signals.append("多池共振")
 
         c["frequency"] = freq
         c["freq_signals"] = freq_signals
 
-        # ---- 抢筹/出货综合判断 ----
+        # ---- 抢筹/出货综合判断（收紧评分体系）----
+        # 取消涨停直通，涨停也需要评分验证
+        score = 0
+        # 涨幅维度（最高3分）
+        if chg >= 9.5: score += 3       # 涨停强信号
+        elif chg >= 7: score += 2
+        elif chg >= 5: score += 1
+        # 量比维度（最高3分）
+        if vr >= 15: score += 3          # 超级放量
+        elif vr >= 10: score += 2
+        elif vr >= 8: score += 1
+        # 剩余率维度（最高3分，最低-2分）
+        if rr >= 75: score += 3
+        elif rr >= 65: score += 2
+        elif rr >= 55: score += 1
+        elif rr < 35: score -= 2         # 强卖压
+        elif rr < 45: score -= 1
+        # 注意：无数据时rr默认50%，不加分也不扣分
+        # 竞昨比维度（最高2分）
+        if cr >= 10: score += 2
+        elif cr >= 7: score += 1
+        # 频次加权（最高3分）
+        if freq >= 5: score += 3
+        elif freq >= 4: score += 2
+        elif freq >= 3: score += 1
+        # 多池共振加权（最高2分）
+        if len(c.get("passed_pools", [])) >= 4: score += 2
+        elif len(c.get("passed_pools", [])) >= 3: score += 1
+        # 涨停额外惩罚：涨停但其他信号弱 → 减分（防止一字板/缩量板误判）
         if chg >= 9.5:
-            c["verdict"] = "真实抢筹"
-        else:
-            score = 0
-            # 涨幅维度
-            if chg >= 7: score += 3
-            elif chg >= 5: score += 2
-            elif chg >= 3: score += 1
-            # 量比维度
-            if vr >= 10: score += 3
-            elif vr >= 7: score += 2
-            elif vr >= 5: score += 1
-            # 剩余率维度
-            if rr >= 65: score += 3
-            elif rr >= 55: score += 1
-            elif rr < 40: score -= 2
-            elif rr < 45: score -= 1
-            # 竞昨比维度
-            if cr >= 10: score += 2
-            elif cr >= 5: score += 1
-            # 频次加权
-            if freq >= 5: score += 3
-            elif freq >= 4: score += 2
-            elif freq >= 3: score += 1
-            # 多池共振加权
-            if len(c.get("passed_pools", [])) >= 3: score += 2
-            elif len(c.get("passed_pools", [])) >= 2: score += 1
+            if vr < 5: score -= 3        # 涨停但缩量，疑似一字板
+            if rr < 50: score -= 2       # 涨停但卖压重
+            if freq < 2: score -= 2      # 涨停但其他维度弱
 
-            c["verdict"] = "真实抢筹" if score >= 5 else ("疑似出货" if score <= 0 else "正常")
+        c["verdict"] = "真实抢筹" if score >= 9 else ("疑似出货" if score <= 0 else "正常")
+
+        # ---- 尾段竞价判定（新规则三维评分）----
+        is_limit_up = chg >= 9.5
+        ts_score, ts_verdict, ts_signals = tail_segment_verdict(
+            gap=chg, vol=c.get("auction_vol", c.get("volume", 0)),
+            buy_vol=buy_vol, sell_vol=sell_vol,
+            is_limit_up=is_limit_up,
+        )
+        c["tail_score"] = ts_score
+        c["tail_verdict"] = ts_verdict
+        c["tail_signals"] = ts_signals
 
         c["strategy"] = _compute_screen_strategy(c)
 
@@ -2977,9 +3104,9 @@ def run_from_data_dir(data_dir: str, html_path: str = None, quiet: bool = False)
 
     # 输出结果
     if not quiet:
-        print(f"\n{'─'*150}")
-        print(f"  {'#':>3}  {'代码':<8} {'名称':<8} {'板块':<10} {'龙头':>4} {'09:25':>7} {'09:26':>7} {'搓合量':>8} {'竞昨比':>7} {'剩余率':>7} {'涨幅':>7} {'筹码':<6} {'频次':>4} {'策略池':<12} {'策略':<14} {'DIF':>7} {'DEA':>7} {'BAR':>7} {'趋势':>4} {'信号':<20}")
-        print(f"{'─'*150}")
+        print(f"\n{'─'*170}")
+        print(f"  {'#':>3}  {'代码':<8} {'名称':<8} {'板块':<10} {'龙头':>4} {'09:25':>7} {'09:26':>7} {'搓合量':>8} {'竞昨比':>7} {'剩余率':>7} {'涨幅':>7} {'筹码':<6} {'频次':>4} {'尾段':>6} {'策略池':<12} {'策略':<14} {'DIF':>7} {'DEA':>7} {'BAR':>7} {'趋势':>4} {'信号':<20}")
+        print(f"{'─'*170}")
 
         for i, s in enumerate(final, 1):
             vol_fmt = _format_volume(s.get("auction_vol", s.get("volume", 0)))
@@ -2999,9 +3126,14 @@ def run_from_data_dir(data_dir: str, html_path: str = None, quiet: bool = False)
             trend = s.get("macd_trend", "-")
             pools = "/".join(s.get("passed_pools", []))
             freq_sigs = ",".join(s.get("freq_signals", []))[:18]
-            print(f"  {i:>3}  {s['code']:<8} {s['name']:<8} {sector:<10} {leader_mark:>4} {s.get('auction_price', s['price']):>7.2f} {s.get('price_0926', s['price']):>7.2f} {vol_fmt:>8} {comp_ratio:>6.1f}% {remaining:>6.1f}% {chg_0926:>+6.2f}% {verdict:<6} {freq:>4} {pools:<12} {strategy:<14} {dif:>7.3f} {dea:>7.3f} {bar:>7.3f} {trend:>4} {freq_sigs:<20}")
+            # 尾段判定
+            ts_verdict = s.get("tail_verdict", "-")
+            ts_score = s.get("tail_score", 0)
+            ts_icon = "🟢" if ts_verdict == "看多" else ("🔴" if ts_verdict == "不看多" else "⚪")
+            tail_mark = f"{ts_icon}{ts_score:>2}"
+            print(f"  {i:>3}  {s['code']:<8} {s['name']:<8} {sector:<10} {leader_mark:>4} {s.get('auction_price', s['price']):>7.2f} {s.get('price_0926', s['price']):>7.2f} {vol_fmt:>8} {comp_ratio:>6.1f}% {remaining:>6.1f}% {chg_0926:>+6.2f}% {verdict:<6} {freq:>4} {tail_mark:>6} {pools:<12} {strategy:<14} {dif:>7.3f} {dea:>7.3f} {bar:>7.3f} {trend:>4} {freq_sigs:<20}")
 
-        print(f"{'─'*150}")
+        print(f"{'─'*170}")
 
     # 保存HTML
     if html_path:
