@@ -671,6 +671,19 @@ def fetch_stock_details(codes: list[str], session: requests.Session = None,
         )
         if not r:
             fail_count += 1
+            # 东财挂了，用腾讯行情兜底这批股票
+            if quotes_ref:
+                for sid in batch:
+                    code = sid.split(".")[-1]
+                    if code in quotes_ref:
+                        q = quotes_ref[code]
+                        results[code] = {
+                            "market_cap_yi": round(float(q.get("market_cap_yi", 0) or 0), 2),
+                            "volume_ratio": round(float(q.get("volume_ratio_api", 0) or 0), 2),
+                            "turnover": round(float(q.get("turnover", 0) or 0), 4),
+                            "amount": round(float(q.get("amount", 0) or 0), 2),
+                            "volume": int(q.get("volume", 0) or 0),
+                        }
             # 连续失败超过5次，暂停30秒让IP冷却
             if fail_count >= 5:
                 print(f"    ⚠ 连续失败{fail_count}次，暂停30秒冷却...")
@@ -719,6 +732,8 @@ def fetch_stock_details(codes: list[str], session: requests.Session = None,
         if batch_num % 20 == 0:
             print(f"    📊 进度: {batch_num}/{total_batches} 批次, 已获取 {len(results)} 只")
 
+    if fail_count > 0 and quotes_ref:
+        print(f"    ℹ 东财部分失败，已用腾讯行情数据兜底 ({len(results)} 只)")
     return results
 
 
