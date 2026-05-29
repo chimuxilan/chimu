@@ -809,6 +809,16 @@ def fetch_sectors(session: requests.Session = None) -> dict:
 
     total = sum(len(s["stocks"]) for s in sectors.values())
     print(f"    ✅ 成分股获取完成: 共 {total} 只")
+
+    # 统计各板块涨停数（涨幅>=9.5%视为主板涨停）
+    for sname, sdata in sectors.items():
+        limit_cnt = 0
+        for stk in sdata.get("stocks", []):
+            chg = stk.get("change_pct", 0) or 0
+            if chg >= 9.5:
+                limit_cnt += 1
+        sdata["limit_up"] = limit_cnt
+
     return sectors
 
 
