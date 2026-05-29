@@ -62,24 +62,55 @@ except ImportError:
 # 浏览器模拟配置
 # ════════════════════════════════════════════════════
 
-# 多套 User-Agent 轮换，模拟不同浏览器
+# 多套 User-Agent 轮换，模拟不同浏览器/设备
 USER_AGENTS = [
+    # Chrome Win
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    # Chrome Mac
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    # Firefox
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:126.0) Gecko/20100101 Firefox/126.0",
+    # Safari
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    # Edge
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
+    # Chrome Linux
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+]
+
+# 多套 Accept 头，与浏览器类型匹配
+_ACCEPT_HEADERS = [
+    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
+    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "*/*",
 ]
 
 def _random_ua():
     return random.choice(USER_AGENTS)
+
+def _random_accept():
+    return random.choice(_ACCEPT_HEADERS)
+
+def _jitter_delay(base: float = 0.3, scale: float = 0.15) -> float:
+    """指数分布延迟：均值=base，偶尔长停顿模拟真人"""
+    return random.expovariate(1.0 / base) + scale
 
 def _build_session():
     """构建带 Cookie 的 requests.Session，模拟真实浏览器会话"""
     s = requests.Session()
     s.headers.update({
         "User-Agent": _random_ua(),
-        "Accept": "*/*",
+        "Accept": _random_accept(),
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         "Accept-Encoding": "gzip, deflate",
         "Connection": "keep-alive",
@@ -308,9 +339,9 @@ def fetch_quotes_batch(codes: list[str], session: requests.Session = None) -> di
                 "quote_time": fields[31] if len(fields) > 31 else "",
             }
 
-        # 随机间隔，模拟人类翻页
+        # 指数分布延迟，模拟真人翻页节奏
         if i + batch_size < len(codes):
-            time.sleep(random.uniform(0.2, 0.4))
+            time.sleep(_jitter_delay(0.3, 0.1))
 
     return results
 
@@ -419,7 +450,7 @@ async def _async_fetch_kline_sina(session, code: str,
     sym = f"sh{code}" if code.startswith(("6", "9")) else f"sz{code}"
     url = "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData"
     params = {"symbol": sym, "scale": "240", "ma": "no", "datalen": days}
-    headers = {"Referer": "https://finance.sina.com.cn/", "User-Agent": _random_ua()}
+    headers = {"Referer": "https://finance.sina.com.cn/", "User-Agent": _random_ua(), "Accept": _random_accept()}
 
     async with semaphore:
         try:
@@ -447,7 +478,7 @@ async def _async_fetch_kline_tencent(session, code: str,
     start = (datetime.now() - timedelta(days=days * 2)).strftime("%Y-%m-%d")
     url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
     params = {"param": f"{sym},day,{start},{end},{days},qfq", "_var": "kline_dayqfq"}
-    headers = {"Referer": "https://web.ifzq.gtimg.cn/", "User-Agent": _random_ua()}
+    headers = {"Referer": "https://web.ifzq.gtimg.cn/", "User-Agent": _random_ua(), "Accept": _random_accept()}
 
     async with semaphore:
         try:
@@ -631,7 +662,7 @@ async def _async_fetch_kline_120min_batch(codes: list[str]) -> dict:
             sym = f"sh{code}" if code.startswith("6") else f"sz{code}"
             url = "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData"
             params = {"symbol": sym, "scale": "60", "ma": "no", "datalen": 120}
-            headers = {"Referer": "https://finance.sina.com.cn/", "User-Agent": _random_ua()}
+            headers = {"Referer": "https://finance.sina.com.cn/", "User-Agent": _random_ua(), "Accept": _random_accept()}
 
             await limiter.acquire()
             async with semaphore:
