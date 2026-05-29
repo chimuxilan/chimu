@@ -558,12 +558,12 @@ async def _async_fetch_kline_batch(codes: list[str], days: int = 1000,
             if time.monotonic() > self.backoff_until:
                 self.current_rate = min(self.base_rate, self.current_rate * 1.05)
 
-    sina_limiter = AdaptiveRateLimiter(base_rate=18, name="新浪")
-    tencent_limiter = AdaptiveRateLimiter(base_rate=30, name="腾讯")
+    sina_limiter = AdaptiveRateLimiter(base_rate=40, name="新浪")
+    tencent_limiter = AdaptiveRateLimiter(base_rate=60, name="腾讯")
 
     # 双连接池
-    sina_conn = aiohttp.TCPConnector(limit=6, limit_per_host=6, ttl_dns_cache=300)
-    tencent_conn = aiohttp.TCPConnector(limit=10, limit_per_host=10, ttl_dns_cache=300)
+    sina_conn = aiohttp.TCPConnector(limit=20, limit_per_host=20, ttl_dns_cache=300)
+    tencent_conn = aiohttp.TCPConnector(limit=30, limit_per_host=30, ttl_dns_cache=300)
 
     async with aiohttp.ClientSession(connector=sina_conn, timeout=timeout) as sina_sess, \
                aiohttp.ClientSession(connector=tencent_conn, timeout=timeout) as tencent_sess:
@@ -653,8 +653,8 @@ async def _async_fetch_kline_120min_batch(codes: list[str]) -> dict:
             if time.monotonic() > self.backoff_until:
                 self.current_rate = min(self.base_rate, self.current_rate * 1.05)
 
-    limiter = AdaptiveRateLimiter(base_rate=20, name="新浪120min")
-    conn = aiohttp.TCPConnector(limit=10, limit_per_host=10, ttl_dns_cache=300)
+    limiter = AdaptiveRateLimiter(base_rate=40, name="新浪120min")
+    conn = aiohttp.TCPConnector(limit=20, limit_per_host=20, ttl_dns_cache=300)
 
     async with aiohttp.ClientSession(connector=conn, timeout=timeout) as sess:
         async def _fetch_one(code):
