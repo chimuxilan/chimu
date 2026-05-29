@@ -477,8 +477,8 @@ async def _async_fetch_kline_batch(codes: list[str], days: int = 1000,
     异步批量K线抓取（双域名分流 + 自适应限速）
     ───────────────────────────────────────────
     策略：正常时跑满安全线，429限流自动降速，恢复后自动提速
-    新浪：基础12 req/s，抖动±40%模拟真人，被限流降到3 req/s，恢复后逐步回升
-    腾讯：基础20 req/s，同策略
+    新浪：基础18 req/s，抖动±40%模拟真人，被限流降到3 req/s，恢复后逐步回升
+    腾讯：基础30 req/s，同策略
     """
     semaphore = asyncio.Semaphore(concurrency)
     timeout = aiohttp.ClientTimeout(total=15, connect=5)
@@ -527,8 +527,8 @@ async def _async_fetch_kline_batch(codes: list[str], days: int = 1000,
             if time.monotonic() > self.backoff_until:
                 self.current_rate = min(self.base_rate, self.current_rate * 1.05)
 
-    sina_limiter = AdaptiveRateLimiter(base_rate=12, name="新浪")
-    tencent_limiter = AdaptiveRateLimiter(base_rate=20, name="腾讯")
+    sina_limiter = AdaptiveRateLimiter(base_rate=18, name="新浪")
+    tencent_limiter = AdaptiveRateLimiter(base_rate=30, name="腾讯")
 
     # 双连接池
     sina_conn = aiohttp.TCPConnector(limit=6, limit_per_host=6, ttl_dns_cache=300)
@@ -577,6 +577,123 @@ async def _async_fetch_kline_batch(codes: list[str], days: int = 1000,
     return results
 
 
+async def _async_fetch_kline_120min_batch(codes: list[str]) -> dict:
+    """
+    异步批量120分钟K线抓取（与日K线并行，独立session+独立限速器）
+    新浪60分钟K线 → 每2根合并为1根120分钟K线
+    """
+    timeout = aiohttp.ClientTimeout(total=15, connect=5)
+    results = {}
+    done_count = 0
+    fail_count = 0
+    t_start = time.time()
+    semaphore = asyncio.Semaphore(50)
+
+    class AdaptiveRateLimiter:
+        def __init__(self, base_rate, name):
+            self.base_rate = base_rate
+            self.current_rate = base_rate
+            self.name = name
+            self.tokens = base_rate
+            self.last_time = time.monotonic()
+            self.lock = asyncio.Lock()
+            self.backoff_until = 0.0
+
+        async def acquire(self):
+            while True:
+                async with self.lock:
+                    now = time.monotonic()
+                    elapsed = now - self.last_time
+                    self.tokens = min(self.current_rate, self.tokens + elapsed * self.current_rate)
+                    self.last_time = now
+                    if self.tokens >= 1:
+                        self.tokens -= 1
+                        jitter = random.uniform(0.7, 1.3)
+                        await asyncio.sleep(0.01 * jitter)
+                        return
+                await asyncio.sleep(0.03)
+
+        def on_429(self):
+            self.current_rate = max(2.0, self.current_rate * 0.5)
+            self.backoff_until = time.monotonic() + 5
+            print(f"    ⚠ {self.name} 120min被限流，降速到 {self.current_rate:.0f} req/s")
+
+        def on_success(self):
+            if time.monotonic() > self.backoff_until:
+                self.current_rate = min(self.base_rate, self.current_rate * 1.05)
+
+    limiter = AdaptiveRateLimiter(base_rate=20, name="新浪120min")
+    conn = aiohttp.TCPConnector(limit=10, limit_per_host=10, ttl_dns_cache=300)
+
+    async with aiohttp.ClientSession(connector=conn, timeout=timeout) as sess:
+        async def _fetch_one(code):
+            nonlocal done_count, fail_count
+            sym = f"sh{code}" if code.startswith("6") else f"sz{code}"
+            url = "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData"
+            params = {"symbol": sym, "scale": "60", "ma": "no", "datalen": 120}
+            headers = {"Referer": "https://finance.sina.com.cn/", "User-Agent": _random_ua()}
+
+            await limiter.acquire()
+            async with semaphore:
+                try:
+                    async with sess.get(url, params=params, headers=headers) as resp:
+                        if resp.status == 429:
+                            limiter.on_429()
+                            raise ConnectionAbortedError("429")
+                        if resp.status != 200:
+                            raise Exception(f"HTTP {resp.status}")
+                        text = await resp.text()
+                        if not text.strip() or text.strip() == "null":
+                            raise Exception("empty")
+                        m60 = json.loads(text)
+                        if not m60 or len(m60) < 2:
+                            raise Exception("too short")
+                        m120 = []
+                        for i in range(0, len(m60) - 1, 2):
+                            a, b = m60[i], m60[i + 1]
+                            m120.append({
+                                "day": b["day"],
+                                "open": a["open"],
+                                "close": b["close"],
+                                "high": str(max(float(a["high"]), float(b["high"]))),
+                                "low": str(min(float(a["low"]), float(b["low"]))),
+                                "volume": str(int(float(a.get("volume", 0)) + float(b.get("volume", 0)))),
+                            })
+                        results[code] = m120
+                        limiter.on_success()
+                except ConnectionAbortedError:
+                    fail_count += 1
+                except Exception:
+                    fail_count += 1
+
+            done_count += 1
+            if done_count % 500 == 0:
+                elapsed = time.time() - t_start
+                speed = done_count / elapsed if elapsed > 0 else 0
+                eta = (len(codes) - done_count) / speed if speed > 0 else 0
+                print(f"    120min进度: {done_count}/{len(codes)} ({len(results)}有数据) | {speed:.0f}只/秒 | 剩余{eta:.0f}s")
+
+        tasks = [_fetch_one(c) for c in codes]
+        for coro in asyncio.as_completed(tasks):
+            await coro
+
+    elapsed = time.time() - t_start
+    print(f"    📊 120min异步完成: {len(results)}/{len(codes)} 有数据, 失败{fail_count}, 耗时{elapsed:.1f}s ({len(codes)/elapsed:.0f}只/秒)")
+    return results
+
+
+async def _async_fetch_all_klines(codes: list[str], days: int = 1000,
+                                   concurrency: int = 100) -> tuple[dict, dict]:
+    """
+    并行抓取日K线 + 120分钟K线（共享事件循环，独立限速器）
+    返回: (daily_klines, kline_120min_map)
+    """
+    daily_task = _async_fetch_kline_batch(codes, days, concurrency)
+    min120_task = _async_fetch_kline_120min_batch(codes)
+    daily_klines, kline_120 = await asyncio.gather(daily_task, min120_task)
+    return daily_klines, kline_120
+
+
 def fetch_kline_batch_async(codes: list[str], days: int = 1000,
                              concurrency: int = 100) -> dict:
     """同步包装：调用异步批量K线抓取（无aiohttp时降级为多线程）"""
@@ -591,6 +708,25 @@ def fetch_kline_batch_async(codes: list[str], days: int = 1000,
     else:
         print(f"    ⚠️ 未安装 aiohttp，使用多线程降级模式 (pip install aiohttp 可提速3-5倍)")
         return fetch_kline_batch(codes, days=days, max_workers=16)
+
+
+def fetch_all_klines_async(codes: list[str], days: int = 1000,
+                            concurrency: int = 100) -> tuple[dict, dict]:
+    """
+    同步包装：并行抓取日K线 + 120分钟K线
+    返回: (daily_klines, kline_120min_map)
+    """
+    if _HAS_AIOHTTP:
+        print(f"    📦 并行获取日K线 + 120minK线: {len(codes)} 只, {days}天...")
+        t0 = time.time()
+        daily, k120 = asyncio.run(_async_fetch_all_klines(codes, days, concurrency))
+        elapsed = time.time() - t0
+        speed = len(codes) / elapsed if elapsed > 0 else 0
+        print(f"    ⏱ 并行K线总耗时 {elapsed:.1f}s ({speed:.0f}只/秒)")
+        return daily, k120
+    else:
+        daily = fetch_kline_batch_async(codes, days, concurrency)
+        return daily, {}
 
 
 def fetch_kline_120min(code: str, count: int = 60, session: requests.Session = None,
@@ -1059,66 +1195,26 @@ def scrape_all(output_dir: str = "stock_data", target_codes: list[str] = None):
             }
         _save_json(sectors_save, f"{output_dir}/sectors_{timestamp}.json")
 
-        # ── 5. K线历史（新浪+腾讯双源）──
+        # ── 5. K线历史（新浪+腾讯双源，并行抓取120min）──
         kline_codes = [c for c in all_codes if c.startswith(("60", "00")) and c in quotes]
         if target_codes:
             kline_codes = target_codes
 
-        print(f"\n📊 [6/6] 抓取K线历史 ({len(kline_codes)} 只主板, 1000天)...")
-        klines = fetch_kline_batch_async(kline_codes, days=1000, concurrency=100)
+        print(f"\n📊 [6/6] 并行抓取日K线+120minK线 ({len(kline_codes)} 只主板, 1000天)...")
+        klines, klines_120 = fetch_all_klines_async(kline_codes, days=1000, concurrency=100)
         klines = supplement_kline_amount(klines, quotes)
 
         kline_dir = f"{output_dir}/klines"
         os.makedirs(kline_dir, exist_ok=True)
         for code, data in klines.items():
             _save_json(data, f"{kline_dir}/{code}.json")
-        print(f"    ✅ K线已保存到 {kline_dir}/ ({len(klines)} 个文件)")
+        print(f"    ✅ 日K线已保存到 {kline_dir}/ ({len(klines)} 个文件)")
 
-        # 120分钟K线（低并发，防封）
         kline120_dir = f"{output_dir}/klines_120min"
         os.makedirs(kline120_dir, exist_ok=True)
-        print(f"\n📊 [补充] 抓取120分钟K线 ({len(kline_codes)} 只, 10线程)...")
-        kline120_count = 0
-        kline120_lock = threading.Lock()
-        # 使用全新的 session，避免复用旧连接池的 stale connections
-        session_120 = _build_session()
-        # 专用快速限速器：0.2s间隔（~50/s），不影响其他新浪请求
-        _limiter_120 = RateLimiter(0.2)
-        # 连续失败计数，用于提前终止（避免IP被封后浪费时间）
-        _consec_fail = [0]  # 用列表以便在闭包中修改
-        _max_consec_fail = 50  # 连续50只失败则停止
-
-        def _fetch_120(code):
-            nonlocal kline120_count
-            k120 = fetch_kline_120min(code, count=60, session=session_120, limiter=_limiter_120)
-            if k120:
-                _save_json(k120, f"{kline120_dir}/{code}.json")
-                with kline120_lock:
-                    kline120_count += 1
-                    _consec_fail[0] = 0  # 成功则重置
-            else:
-                with kline120_lock:
-                    _consec_fail[0] += 1
-            return code
-
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            futures = {}
-            aborted = False
-            for c in kline_codes:
-                # 提前检查：如果连续失败太多，不再提交新任务
-                if _consec_fail[0] >= _max_consec_fail and not aborted:
-                    aborted = True
-                    print(f"    ⚠️ 连续 {_max_consec_fail} 只失败，疑似IP被限流，停止提交新任务...")
-                if not aborted:
-                    futures[executor.submit(_fetch_120, c)] = c
-            done = 0
-            for future in as_completed(futures):
-                done += 1
-                if done % 200 == 0:
-                    print(f"    进度: {done}/{len(futures)} ({kline120_count} 有数据)")
-            if aborted:
-                print(f"    ⚠️ 已提前终止，仅处理了 {len(futures)}/{len(kline_codes)} 只")
-        print(f"    ✅ 120分钟K线已保存到 {kline120_dir}/ ({kline120_count} 个文件)")
+        for code, data in klines_120.items():
+            _save_json(data, f"{kline120_dir}/{code}.json")
+        print(f"    ✅ 120minK线已保存到 {kline120_dir}/ ({len(klines_120)} 个文件)")
 
         # ── 汇总 ──
         summary = {
@@ -1128,7 +1224,7 @@ def scrape_all(output_dir: str = "stock_data", target_codes: list[str] = None):
             "details_count": len(details),
             "sectors_count": len(sectors),
             "klines_count": len(klines),
-            "klines_120min_count": kline120_count,
+            "klines_120min_count": len(klines_120),
             "files": {
                 "indices": f"indices_{timestamp}.json",
                 "codes": f"all_codes_{timestamp}.json",
@@ -1144,7 +1240,7 @@ def scrape_all(output_dir: str = "stock_data", target_codes: list[str] = None):
         print(f"\n{'═' * 60}")
         print(f"  ✅ 全部抓取完成!")
         print(f"  📂 数据目录: {os.path.abspath(output_dir)}/")
-        print(f"  📊 汇总: {len(quotes)} 只行情 | {len(sectors)} 个板块 | {len(klines)} 只K线 | {kline120_count} 只120分钟K线")
+        print(f"  📊 汇总: {len(quotes)} 只行情 | {len(sectors)} 个板块 | {len(klines)} 只K线 | {len(klines_120)} 只120分钟K线")
         print(f"{'═' * 60}\n")
 
     except KeyboardInterrupt:
@@ -2968,39 +3064,23 @@ def run_oneclick():
             sectors = fetch_sectors(session)
             _save_json(sectors, f"{data_dir}/sectors_{timestamp}.json")
 
-        # ---- 5. K线（新浪+腾讯双源）----
-        print(f"\n📊 获取K线 ({len(codes)} 只)...")
-        klines = fetch_kline_batch_async(codes, days=1000, concurrency=100)
+        # ---- 5. K线（并行抓取日K线+120minK线）----
+        print(f"\n📊 并行获取K线 ({len(codes)} 只)...")
+        klines, klines_120 = fetch_all_klines_async(codes, days=1000, concurrency=100)
         klines = supplement_kline_amount(klines, quotes)
         kline_dir = f"{data_dir}/klines"
         os.makedirs(kline_dir, exist_ok=True)
         for code, data in klines.items():
             _save_json(data, f"{kline_dir}/{code}.json")
-        print(f"  ✅ K线: {len(klines)} 只")
-
-        # ---- 6. 120分钟K线（同步，已验证可用）----
-        print(f"    ⏳ 等待 10 秒冷却，避免新浪限流...")
-        time.sleep(10)
+        print(f"  ✅ 日K线: {len(klines)} 只")
 
         kline120_dir = f"{data_dir}/klines_120min"
         os.makedirs(kline120_dir, exist_ok=True)
-        k120_count = 0
-        k120_lock = threading.Lock()
-        _limiter_120_oc = RateLimiter(0.2)
+        for code, data in klines_120.items():
+            _save_json(data, f"{kline120_dir}/{code}.json")
+        print(f"  ✅ 120minK线: {len(klines_120)} 只")
 
-        def _fetch_120_oc(code):
-            nonlocal k120_count
-            k120 = fetch_kline_120min(code, count=60, session=session, limiter=_limiter_120_oc)
-            if k120:
-                _save_json(k120, f"{kline120_dir}/{code}.json")
-                with k120_lock:
-                    k120_count += 1
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            list(executor.map(_fetch_120_oc, codes))
-
-        print(f"  ✅ 120分钟K线: {k120_count} 只")
-
-        # ---- 7. 运行分析 ----
+        # ---- 6. 运行分析 ----
         html_out = f"{data_dir}/report.html"
         print(f"\n{'═'*50}")
         print(f"  🚀 开始分析...")
