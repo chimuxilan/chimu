@@ -425,8 +425,7 @@ async def _async_fetch_kline_sina(session, code: str,
         try:
             async with session.get(url, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 if resp.status == 429:
-                    await asyncio.sleep(2 + random.uniform(0, 1))
-                    return []
+                    raise ConnectionAbortedError("429")  # 让自适应限速器检测到
                 if resp.status != 200:
                     return []
                 text = await resp.text()
@@ -434,6 +433,8 @@ async def _async_fetch_kline_sina(session, code: str,
                     return []
                 data = json.loads(text)
                 return data if data else []
+        except ConnectionAbortedError:
+            raise  # 429错误向上抛出
         except Exception:
             return []
 
@@ -452,8 +453,7 @@ async def _async_fetch_kline_tencent(session, code: str,
         try:
             async with session.get(url, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 if resp.status == 429:
-                    await asyncio.sleep(2 + random.uniform(0, 1))
-                    return []
+                    raise ConnectionAbortedError("429")  # 让自适应限速器检测到
                 if resp.status != 200:
                     return []
                 text = await resp.text()
@@ -464,6 +464,8 @@ async def _async_fetch_kline_tencent(session, code: str,
                 if klines:
                     return [{"day": k[0], "open": k[1], "close": k[2],
                              "high": k[3], "low": k[4], "volume": k[5]} for k in klines]
+        except ConnectionAbortedError:
+            raise  # 429错误向上抛出
         except Exception:
             pass
         return []
@@ -472,9 +474,11 @@ async def _async_fetch_kline_tencent(session, code: str,
 async def _async_fetch_kline_batch(codes: list[str], days: int = 1000,
                                     concurrency: int = 100) -> dict:
     """
-    异步批量K线抓取（双域名分流 + 令牌桶限速）
-    concurrency: 最大并发协程数（默认100）
-    限速策略：令牌桶（5 req/s/域名），锁外sleep不阻塞其他协程
+    异步批量K线抓取（双域名分流 + 自适应限速）
+    ───────────────────────────────────────────
+    策略：正常时跑满安全线，429限流自动降速，恢复后自动提速
+    新浪：基础12 req/s，抖动±40%模拟真人，被限流降到3 req/s，恢复后逐步回升
+    腾讯：基础20 req/s，同策略
     """
     semaphore = asyncio.Semaphore(concurrency)
     timeout = aiohttp.ClientTimeout(total=15, connect=5)
@@ -483,54 +487,85 @@ async def _async_fetch_kline_batch(codes: list[str], days: int = 1000,
     fail_count = 0
     t_start = time.time()
 
-    # 令牌桶限速器（每个域名独立）
-    class TokenBucket:
-        def __init__(self, rate: float):
-            self.rate = rate          # 令牌生成速率（个/秒）
-            self.tokens = rate        # 当前令牌数
-            self.last = time.monotonic()
+    class AdaptiveRateLimiter:
+        """自适应令牌桶：正常加速，429降速，自动恢复"""
+        def __init__(self, base_rate: float, name: str):
+            self.base_rate = base_rate
+            self.current_rate = base_rate
+            self.name = name
+            self.tokens = base_rate
+            self.last_time = time.monotonic()
             self.lock = asyncio.Lock()
+            self.backoff_until = 0.0
+
         async def acquire(self):
             while True:
                 async with self.lock:
                     now = time.monotonic()
-                    self.tokens = min(self.rate, self.tokens + (now - self.last) * self.rate)
-                    self.last = now
+                    # 补充令牌
+                    elapsed = now - self.last_time
+                    self.tokens = min(self.current_rate, self.tokens + elapsed * self.current_rate)
+                    self.last_time = now
+
                     if self.tokens >= 1:
                         self.tokens -= 1
-                        return  # 拿到令牌，锁已释放
-                # 没有令牌，等一小段时间再试（锁外等待）
-                await asyncio.sleep(0.05)
+                        # 抖动：±30%随机间隔，模拟真人节奏
+                        jitter = random.uniform(0.7, 1.3)
+                        await asyncio.sleep(0.01 * jitter)
+                        return
+                # 没有令牌，等一小段再试（锁外）
+                await asyncio.sleep(0.03)
 
-    sina_bucket = TokenBucket(rate=8)     # 新浪：8 req/s（安全线）
-    tencent_bucket = TokenBucket(rate=15) # 腾讯：15 req/s（更宽松）
+        def on_429(self):
+            """被限流：速率减半，最低2 req/s"""
+            self.current_rate = max(2.0, self.current_rate * 0.5)
+            self.backoff_until = time.monotonic() + 5
+            print(f"    ⚠ {self.name} 被限流，降速到 {self.current_rate:.0f} req/s")
 
-    # 双连接池：新浪10并发上限，腾讯15并发上限
-    sina_conn = aiohttp.TCPConnector(limit=10, limit_per_host=10, ttl_dns_cache=300)
-    tencent_conn = aiohttp.TCPConnector(limit=15, limit_per_host=15, ttl_dns_cache=300)
+        def on_success(self):
+            """成功：逐步恢复到基础速率"""
+            if time.monotonic() > self.backoff_until:
+                self.current_rate = min(self.base_rate, self.current_rate * 1.05)
+
+    sina_limiter = AdaptiveRateLimiter(base_rate=12, name="新浪")
+    tencent_limiter = AdaptiveRateLimiter(base_rate=20, name="腾讯")
+
+    # 双连接池
+    sina_conn = aiohttp.TCPConnector(limit=6, limit_per_host=6, ttl_dns_cache=300)
+    tencent_conn = aiohttp.TCPConnector(limit=10, limit_per_host=10, ttl_dns_cache=300)
 
     async with aiohttp.ClientSession(connector=sina_conn, timeout=timeout) as sina_sess, \
                aiohttp.ClientSession(connector=tencent_conn, timeout=timeout) as tencent_sess:
 
         async def _fetch_one(code):
             nonlocal done_count, fail_count
-            # 拿新浪令牌再发请求
-            await sina_bucket.acquire()
-            klines = await _async_fetch_kline_sina(sina_sess, code, min(days, 1000), semaphore)
+
+            await sina_limiter.acquire()
+            try:
+                klines = await _async_fetch_kline_sina(sina_sess, code, min(days, 1000), semaphore)
+            except Exception:
+                klines = []
+                sina_limiter.on_429()
+
             if not klines:
-                # 拿腾讯令牌再发请求
-                await tencent_bucket.acquire()
-                klines = await _async_fetch_kline_tencent(tencent_sess, code, min(days, 300), semaphore)
+                await tencent_limiter.acquire()
+                try:
+                    klines = await _async_fetch_kline_tencent(tencent_sess, code, min(days, 300), semaphore)
+                except Exception:
+                    klines = []
+
             done_count += 1
             if klines:
                 results[code] = klines
+                sina_limiter.on_success()
             else:
                 fail_count += 1
+
             if done_count % 500 == 0:
                 elapsed = time.time() - t_start
                 speed = done_count / elapsed if elapsed > 0 else 0
                 eta = (len(codes) - done_count) / speed if speed > 0 else 0
-                print(f"    进度: {done_count}/{len(codes)} ({len(results)}有数据) | {speed:.0f}只/秒 | 剩余{eta:.0f}s")
+                print(f"    进度: {done_count}/{len(codes)} ({len(results)}有数据) | {speed:.0f}只/秒 | 剩余{eta:.0f}s | 新浪{sina_limiter.current_rate:.0f}/s 腾讯{tencent_limiter.current_rate:.0f}/s")
             return code, klines
 
         tasks = [_fetch_one(c) for c in codes]
