@@ -2722,7 +2722,9 @@ def run_from_data_dir(data_dir: str, html_path: str = None, quiet: bool = False)
 
         c["auction_price"] = c["open_price"]
         c["price_0926"] = c["price"]
-        c["chg_0926"] = round((c["price_0926"] - c["prev_close"]) / c["prev_close"] * 100, 2) if c["prev_close"] > 0 else 0
+        # 涨幅 = 相对竞价额的变化（而非昨收）
+        base_price = c["auction_price"] if c["auction_price"] > 0 else c["prev_close"]
+        c["chg_0926"] = round((c["price_0926"] - base_price) / base_price * 100, 2) if base_price > 0 else 0
 
         auction_vol = c.get("auction_vol", c["volume"])
         yesterday_vol = c.get("yesterday_vol_hist", 0) or c.get("yesterday_vol", 1)
