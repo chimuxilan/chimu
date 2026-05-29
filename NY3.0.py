@@ -100,17 +100,19 @@ def _build_session():
 # ════════════════════════════════════════════════════
 
 class RateLimiter:
-    """令牌桶限速器：确保两次请求之间有最小间隔"""
+    """令牌桶限速器：确保两次请求之间有最小间隔（线程安全）"""
     def __init__(self, min_interval: float = 0.3):
         self._min_interval = min_interval
         self._last_time = 0.0
+        self._lock = threading.Lock()
 
     def wait(self):
-        now = time.monotonic()
-        elapsed = now - self._last_time
-        if elapsed < self._min_interval:
-            time.sleep(self._min_interval - elapsed)
-        self._last_time = time.monotonic()
+        with self._lock:
+            now = time.monotonic()
+            elapsed = now - self._last_time
+            if elapsed < self._min_interval:
+                time.sleep(self._min_interval - elapsed)
+            self._last_time = time.monotonic()
 
 # 每个域名独立限速
 _limiter_sina = RateLimiter(0.3)      # 新浪：~3次/秒
@@ -410,24 +412,14 @@ def fetch_kline_batch(codes: list[str], days: int = 1000, max_workers: int = 4,
 
 # ── 异步K线批量抓取（提速核心）──
 
-def _random_ua_async() -> str:
-    """异步版随机UA"""
-    uas = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Safari/605.1.15",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
-    ]
-    return random.choice(uas)
 
-
-async def _async_fetch_kline_sina(session: aiohttp.ClientSession, code: str,
-                                   days: int, semaphore: asyncio.Semaphore) -> list[dict]:
+async def _async_fetch_kline_sina(session, code: str,
+                                   days: int, semaphore) -> list[dict]:
     """异步新浪K线"""
     sym = f"sh{code}" if code.startswith(("6", "9")) else f"sz{code}"
     url = "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData"
     params = {"symbol": sym, "scale": "240", "ma": "no", "datalen": days}
-    headers = {"Referer": "https://finance.sina.com.cn/", "User-Agent": _random_ua_async()}
+    headers = {"Referer": "https://finance.sina.com.cn/", "User-Agent": _random_ua()}
 
     async with semaphore:
         try:
@@ -446,15 +438,15 @@ async def _async_fetch_kline_sina(session: aiohttp.ClientSession, code: str,
             return []
 
 
-async def _async_fetch_kline_tencent(session: aiohttp.ClientSession, code: str,
-                                      days: int, semaphore: asyncio.Semaphore) -> list[dict]:
+async def _async_fetch_kline_tencent(session, code: str,
+                                      days: int, semaphore) -> list[dict]:
     """异步腾讯K线"""
     sym = f"sh{code}" if code.startswith(("6", "9")) else f"sz{code}"
     end = datetime.now().strftime("%Y-%m-%d")
     start = (datetime.now() - timedelta(days=days * 2)).strftime("%Y-%m-%d")
     url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
     params = {"param": f"{sym},day,{start},{end},{days},qfq", "_var": "kline_dayqfq"}
-    headers = {"Referer": "https://web.ifzq.gtimg.cn/", "User-Agent": _random_ua_async()}
+    headers = {"Referer": "https://web.ifzq.gtimg.cn/", "User-Agent": _random_ua()}
 
     async with semaphore:
         try:
@@ -489,17 +481,16 @@ async def _async_fetch_kline_batch(codes: list[str], days: int = 1000,
     results = {}
     done_count = 0
     # 异步限速器：请求间隔 0.08 秒（~12 req/s，匀速不触发封禁）
-    last_req_time = 0.0
+    next_available = 0.0
     rate_lock = asyncio.Lock()
 
     async def _rate_wait():
-        nonlocal last_req_time
+        nonlocal next_available
         async with rate_lock:
-            now = asyncio.get_event_loop().time()
-            gap = now - last_req_time
-            if gap < 0.08:
-                await asyncio.sleep(0.08 - gap)
-            last_req_time = asyncio.get_event_loop().time()
+            now = asyncio.get_running_loop().time()
+            if now < next_available:
+                await asyncio.sleep(next_available - now)
+            next_available = max(now, next_available) + 0.08
 
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
         async def _fetch_one(code):
@@ -1150,16 +1141,15 @@ def scrape_all(output_dir: str = "stock_data", target_codes: list[str] = None):
             count = 0
             done_count = 0
             rate_lock = asyncio.Lock()
-            last_time = 0.0
+            next_available = 0.0
 
             async def _rate_wait():
-                nonlocal last_time
+                nonlocal next_available
                 async with rate_lock:
-                    now = asyncio.get_event_loop().time()
-                    gap = now - last_time
-                    if gap < 0.1:
-                        await asyncio.sleep(0.1 - gap)
-                    last_time = asyncio.get_event_loop().time()
+                    now = asyncio.get_running_loop().time()
+                    if now < next_available:
+                        await asyncio.sleep(next_available - now)
+                    next_available = max(now, next_available) + 0.1
 
             async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
                 async def _fetch_one(code):
@@ -1167,7 +1157,7 @@ def scrape_all(output_dir: str = "stock_data", target_codes: list[str] = None):
                     sym = f"sh{code}" if code.startswith("6") else f"sz{code}"
                     url = "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData"
                     params = {"symbol": sym, "scale": "60", "ma": "no", "datalen": 120}
-                    headers = {"Referer": "https://finance.sina.com.cn/", "User-Agent": _random_ua_async()}
+                    headers = {"Referer": "https://finance.sina.com.cn/", "User-Agent": _random_ua()}
 
                     await _rate_wait()
                     async with semaphore:
@@ -3022,22 +3012,85 @@ def run_oneclick():
             _save_json(data, f"{kline_dir}/{code}.json")
         print(f"  ✅ K线: {len(klines)} 只")
 
-        # ---- 6. 120分钟K线（新浪60分钟合并，并发）----
+        # ---- 6. 120分钟K线（异步低并发）----
+        print(f"    ⏳ 等待 10 秒冷却，避免新浪限流...")
+        time.sleep(10)
+
         kline120_dir = f"{data_dir}/klines_120min"
         os.makedirs(kline120_dir, exist_ok=True)
         k120_count = 0
-        k120_lock = threading.Lock()
 
-        def _fetch_120_oc(code):
-            nonlocal k120_count
-            k120 = fetch_kline_120min(code, count=60, session=session)
-            if k120:
-                _save_json(k120, f"{kline120_dir}/{code}.json")
-                with k120_lock:
-                    k120_count += 1
+        if _HAS_AIOHTTP:
+            async def _async_fetch_120_oc(codes, concurrency=10):
+                sem = asyncio.Semaphore(concurrency)
+                conn = aiohttp.TCPConnector(limit=concurrency, limit_per_host=concurrency)
+                to = aiohttp.ClientTimeout(total=20)
+                cnt = 0
+                done = 0
+                rl = asyncio.Lock()
+                lt = [0.0]
 
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            list(executor.map(_fetch_120_oc, codes))
+                async def _rw():
+                    async with rl:
+                        now = asyncio.get_running_loop().time()
+                        gap = now - lt[0]
+                        if gap < 0.1:
+                            await asyncio.sleep(0.1 - gap)
+                        lt[0] = asyncio.get_running_loop().time()
+
+                async with aiohttp.ClientSession(connector=conn, timeout=to) as sess:
+                    async def _one(code):
+                        nonlocal cnt, done
+                        sym = f"sh{code}" if code.startswith("6") else f"sz{code}"
+                        await _rw()
+                        async with sem:
+                            try:
+                                async with sess.get(
+                                    "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData",
+                                    params={"symbol": sym, "scale": "60", "ma": "no", "datalen": 120},
+                                    headers={"Referer": "https://finance.sina.com.cn/", "User-Agent": _random_ua()},
+                                    timeout=aiohttp.ClientTimeout(total=15)
+                                ) as resp:
+                                    if resp.status != 200:
+                                        return
+                                    text = await resp.text()
+                                    if not text.strip() or text.strip() == "null":
+                                        return
+                                    m60 = json.loads(text)
+                                    if not m60 or len(m60) < 2:
+                                        return
+                                    m120 = []
+                                    for i in range(0, len(m60) - 1, 2):
+                                        a, b = m60[i], m60[i + 1]
+                                        m120.append({"day": b["day"], "open": a["open"], "close": b["close"],
+                                                     "high": str(max(float(a["high"]), float(b["high"]))),
+                                                     "low": str(min(float(a["low"]), float(b["low"]))),
+                                                     "volume": str(int(float(a.get("volume", 0)) + float(b.get("volume", 0))))})
+                                    _save_json(m120, f"{kline120_dir}/{code}.json")
+                                    cnt += 1
+                            except Exception:
+                                pass
+                            done += 1
+                            if done % 200 == 0:
+                                print(f"    进度: {done}/{len(codes)} ({cnt} 有数据)")
+
+                    tasks = [_one(c) for c in codes]
+                    await asyncio.gather(*tasks)
+                return cnt
+
+            k120_count = asyncio.run(_async_fetch_120_oc(codes, concurrency=10))
+        else:
+            k120_lock = threading.Lock()
+            def _fetch_120_oc(code):
+                nonlocal k120_count
+                k120 = fetch_kline_120min(code, count=60, session=session)
+                if k120:
+                    _save_json(k120, f"{kline120_dir}/{code}.json")
+                    with k120_lock:
+                        k120_count += 1
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                list(executor.map(_fetch_120_oc, codes))
+
         print(f"  ✅ 120分钟K线: {k120_count} 只")
 
         # ---- 7. 运行分析 ----
