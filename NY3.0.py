@@ -470,17 +470,17 @@ async def _async_fetch_kline_tencent(session, code: str,
 
 
 async def _async_fetch_kline_batch(codes: list[str], days: int = 1000,
-                                    concurrency: int = 20) -> dict:
+                                    concurrency: int = 50) -> dict:
     """
     异步批量K线抓取（并发协程 + 匀速限速，防封IP）
-    concurrency: 并发协程数（默认20）
+    concurrency: 并发协程数（默认50）
     """
     semaphore = asyncio.Semaphore(concurrency)
     connector = aiohttp.TCPConnector(limit=concurrency, limit_per_host=concurrency)
     timeout = aiohttp.ClientTimeout(total=20)
     results = {}
     done_count = 0
-    # 异步限速器：请求间隔 0.08 秒（~12 req/s，匀速不触发封禁）
+    # 异步限速器：请求间隔 0.05 秒（~20 req/s，匀速不触发封禁）
     next_available = 0.0
     rate_lock = asyncio.Lock()
 
@@ -490,7 +490,7 @@ async def _async_fetch_kline_batch(codes: list[str], days: int = 1000,
             now = asyncio.get_running_loop().time()
             if now < next_available:
                 await asyncio.sleep(next_available - now)
-            next_available = max(now, next_available) + 0.08
+            next_available = max(now, next_available) + 0.05
 
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
         async def _fetch_one(code):
@@ -501,7 +501,7 @@ async def _async_fetch_kline_batch(codes: list[str], days: int = 1000,
                 await _rate_wait()  # 腾讯也要限速
                 klines = await _async_fetch_kline_tencent(session, code, min(days, 300), semaphore)
             done_count += 1
-            if done_count % 200 == 0:
+            if done_count % 500 == 0:
                 print(f"    进度: {done_count}/{len(codes)} ({len(results)} 有数据)")
             return code, klines
 
@@ -515,14 +515,15 @@ async def _async_fetch_kline_batch(codes: list[str], days: int = 1000,
 
 
 def fetch_kline_batch_async(codes: list[str], days: int = 1000,
-                             concurrency: int = 20) -> dict:
+                             concurrency: int = 50) -> dict:
     """同步包装：调用异步批量K线抓取（无aiohttp时降级为多线程）"""
     if _HAS_AIOHTTP:
         print(f"    📦 异步批量获取K线: {len(codes)} 只, {days}天, {concurrency}并发...")
         t0 = time.time()
         results = asyncio.run(_async_fetch_kline_batch(codes, days, concurrency))
         elapsed = time.time() - t0
-        print(f"    ✅ K线完成: {len(results)}/{len(codes)} 只有数据 (耗时 {elapsed:.1f}s)")
+        speed = len(codes) / elapsed if elapsed > 0 else 0
+        print(f"    ✅ K线完成: {len(results)}/{len(codes)} 只有数据 (耗时 {elapsed:.1f}s, {speed:.0f}只/秒)")
         return results
     else:
         # 降级方案：增加线程数 + 降低限速间隔
@@ -991,7 +992,7 @@ def scrape_all(output_dir: str = "stock_data", target_codes: list[str] = None):
             kline_codes = target_codes
 
         print(f"\n📊 [6/6] 抓取K线历史 ({len(kline_codes)} 只主板, 1000天)...")
-        klines = fetch_kline_batch_async(kline_codes, days=1000, concurrency=20)
+        klines = fetch_kline_batch_async(kline_codes, days=1000, concurrency=50)
         klines = supplement_kline_amount(klines, quotes)
 
         kline_dir = f"{output_dir}/klines"
@@ -2897,7 +2898,7 @@ def run_oneclick():
 
         # ---- 5. K线（新浪+腾讯双源）----
         print(f"\n📊 获取K线 ({len(codes)} 只)...")
-        klines = fetch_kline_batch_async(codes, days=1000, concurrency=20)
+        klines = fetch_kline_batch_async(codes, days=1000, concurrency=50)
         klines = supplement_kline_amount(klines, quotes)
         kline_dir = f"{data_dir}/klines"
         os.makedirs(kline_dir, exist_ok=True)
