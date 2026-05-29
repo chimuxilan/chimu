@@ -472,28 +472,54 @@ async def _async_fetch_kline_tencent(session, code: str,
 async def _async_fetch_kline_batch(codes: list[str], days: int = 1000,
                                     concurrency: int = 100) -> dict:
     """
-    异步批量K线抓取（双域名分流 + 连接池限速）
-    concurrency: 总并发协程数（默认100）
-    限速策略：不设全局锁，靠 limit_per_host 天然排队，同域名自动串行
+    异步批量K线抓取（双域名分流 + 令牌桶限速）
+    concurrency: 最大并发协程数（默认100）
+    限速策略：令牌桶（5 req/s/域名），锁外sleep不阻塞其他协程
     """
     semaphore = asyncio.Semaphore(concurrency)
-    timeout = aiohttp.ClientTimeout(total=10, connect=5)
+    timeout = aiohttp.ClientTimeout(total=15, connect=5)
     results = {}
     done_count = 0
     fail_count = 0
     t_start = time.time()
 
-    # 双连接池：新浪和腾讯各20并发上限，互不阻塞
-    sina_conn = aiohttp.TCPConnector(limit=20, limit_per_host=20, ttl_dns_cache=300)
-    tencent_conn = aiohttp.TCPConnector(limit=30, limit_per_host=30, ttl_dns_cache=300)
+    # 令牌桶限速器（每个域名独立）
+    class TokenBucket:
+        def __init__(self, rate: float):
+            self.rate = rate          # 令牌生成速率（个/秒）
+            self.tokens = rate        # 当前令牌数
+            self.last = time.monotonic()
+            self.lock = asyncio.Lock()
+        async def acquire(self):
+            while True:
+                async with self.lock:
+                    now = time.monotonic()
+                    self.tokens = min(self.rate, self.tokens + (now - self.last) * self.rate)
+                    self.last = now
+                    if self.tokens >= 1:
+                        self.tokens -= 1
+                        return  # 拿到令牌，锁已释放
+                # 没有令牌，等一小段时间再试（锁外等待）
+                await asyncio.sleep(0.05)
+
+    sina_bucket = TokenBucket(rate=8)     # 新浪：8 req/s（安全线）
+    tencent_bucket = TokenBucket(rate=15) # 腾讯：15 req/s（更宽松）
+
+    # 双连接池：新浪10并发上限，腾讯15并发上限
+    sina_conn = aiohttp.TCPConnector(limit=10, limit_per_host=10, ttl_dns_cache=300)
+    tencent_conn = aiohttp.TCPConnector(limit=15, limit_per_host=15, ttl_dns_cache=300)
 
     async with aiohttp.ClientSession(connector=sina_conn, timeout=timeout) as sina_sess, \
                aiohttp.ClientSession(connector=tencent_conn, timeout=timeout) as tencent_sess:
 
         async def _fetch_one(code):
             nonlocal done_count, fail_count
+            # 拿新浪令牌再发请求
+            await sina_bucket.acquire()
             klines = await _async_fetch_kline_sina(sina_sess, code, min(days, 1000), semaphore)
             if not klines:
+                # 拿腾讯令牌再发请求
+                await tencent_bucket.acquire()
                 klines = await _async_fetch_kline_tencent(tencent_sess, code, min(days, 300), semaphore)
             done_count += 1
             if klines:
@@ -509,7 +535,7 @@ async def _async_fetch_kline_batch(codes: list[str], days: int = 1000,
 
         tasks = [_fetch_one(c) for c in codes]
         for coro in asyncio.as_completed(tasks):
-            await coro  # 结果已在 _fetch_one 内写入 results
+            await coro
 
     elapsed = time.time() - t_start
     print(f"    📊 异步K线完成: {len(results)}/{len(codes)} 有数据, 失败{fail_count}, 耗时{elapsed:.1f}s ({len(codes)/elapsed:.0f}只/秒)")
