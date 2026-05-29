@@ -310,7 +310,7 @@ def fetch_quotes_batch(codes: list[str], session: requests.Session = None) -> di
 
         # 随机间隔，模拟人类翻页
         if i + batch_size < len(codes):
-            time.sleep(random.uniform(0.3, 0.8))
+            time.sleep(random.uniform(0.2, 0.4))
 
     return results
 
@@ -802,7 +802,7 @@ def fetch_sectors(session: requests.Session = None) -> dict:
             return sname, []
 
     print(f"    📦 获取各板块成分股...")
-    with ThreadPoolExecutor(max_workers=3) as executor:
+    with ThreadPoolExecutor(max_workers=5) as executor:
         futures = {executor.submit(_fetch_stocks, sn, sectors[sn]["code"]): sn for sn in sectors}
         for future in as_completed(futures):
             sname, stocks = future.result()
@@ -1073,11 +1073,6 @@ def scrape_all(output_dir: str = "stock_data", target_codes: list[str] = None):
         for code, data in klines.items():
             _save_json(data, f"{kline_dir}/{code}.json")
         print(f"    ✅ K线已保存到 {kline_dir}/ ({len(klines)} 个文件)")
-
-        # ── 冷却：避免连续请求触发限流 ──
-        cooldown_sec = 30
-        print(f"    ⏳ 等待 {cooldown_sec} 秒冷却，避免新浪限流...")
-        time.sleep(cooldown_sec)
 
         # 120分钟K线（低并发，防封）
         kline120_dir = f"{output_dir}/klines_120min"
