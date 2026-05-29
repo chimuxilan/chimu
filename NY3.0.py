@@ -593,7 +593,8 @@ def fetch_kline_batch_async(codes: list[str], days: int = 1000,
         return fetch_kline_batch(codes, days=days, max_workers=16)
 
 
-def fetch_kline_120min(code: str, count: int = 60, session: requests.Session = None) -> list[dict]:
+def fetch_kline_120min(code: str, count: int = 60, session: requests.Session = None,
+                       limiter: RateLimiter = None) -> list[dict]:
     """
     获取120分钟K线数据（新浪60分钟K线每2根合并为1根）
     用于分析脚本的 pool_technical (120分钟MACD检查)
@@ -605,7 +606,7 @@ def fetch_kline_120min(code: str, count: int = 60, session: requests.Session = N
     sym = f"sh{code}" if code.startswith("6") else f"sz{code}"
     r = safe_request(
         "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData",
-        _limiter_sina, session,
+        limiter or _limiter_sina, session,
         params={"symbol": sym, "scale": "60", "ma": "no", "datalen": count * 2},
         headers={"Referer": "https://finance.sina.com.cn/"},
     )
@@ -1086,13 +1087,15 @@ def scrape_all(output_dir: str = "stock_data", target_codes: list[str] = None):
         kline120_lock = threading.Lock()
         # 使用全新的 session，避免复用旧连接池的 stale connections
         session_120 = _build_session()
+        # 专用快速限速器：0.2s间隔（~50/s），不影响其他新浪请求
+        _limiter_120 = RateLimiter(0.2)
         # 连续失败计数，用于提前终止（避免IP被封后浪费时间）
         _consec_fail = [0]  # 用列表以便在闭包中修改
         _max_consec_fail = 50  # 连续50只失败则停止
 
         def _fetch_120(code):
             nonlocal kline120_count
-            k120 = fetch_kline_120min(code, count=60, session=session_120)
+            k120 = fetch_kline_120min(code, count=60, session=session_120, limiter=_limiter_120)
             if k120:
                 _save_json(k120, f"{kline120_dir}/{code}.json")
                 with kline120_lock:
@@ -2988,10 +2991,11 @@ def run_oneclick():
         os.makedirs(kline120_dir, exist_ok=True)
         k120_count = 0
         k120_lock = threading.Lock()
+        _limiter_120_oc = RateLimiter(0.2)
 
         def _fetch_120_oc(code):
             nonlocal k120_count
-            k120 = fetch_kline_120min(code, count=60, session=session)
+            k120 = fetch_kline_120min(code, count=60, session=session, limiter=_limiter_120_oc)
             if k120:
                 _save_json(k120, f"{kline120_dir}/{code}.json")
                 with k120_lock:
