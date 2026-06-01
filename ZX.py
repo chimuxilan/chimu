@@ -637,18 +637,18 @@ tr:hover{{background:rgba(255,255,255,.02)}}
 </div>
 </div>
 <script>
-function sw(n){
+function sw(n){{
   var t=event.target;
   var group=t.parentElement;
   group.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
   t.classList.add('active');
   var container=group.nextElementSibling;
-  while(container&&container.classList.contains('tc')){
+  while(container&&container.classList.contains('tc')){{
     container.classList.remove('active');
     container=container.nextElementSibling;
-  }
+  }}
   document.getElementById('t-'+n).classList.add('active');
-}
+}}
 </script>
 </body>
 </html>"""
