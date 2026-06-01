@@ -2025,9 +2025,10 @@ def screen_mainboard_strategy() -> list[dict]:
     is_auction = (h == 9 and 15 <= m <= 25)
     is_post_auction = (h == 9 and 25 < m <= 30)
     if not is_auction and not is_post_auction:
-        print(f"\n⚠️  当前 {h:02d}:{m:02d} 非集合竞价时段 (09:15-09:25)")
-        print("   腾讯接口返回的是全天数据而非竞价数据，量比/换手率可能不符合竞价条件")
-        print("   建议在 09:26-09:30 运行（撮合价已发布，数据更准确）\n")
+        print(f"\n❌ 当前 {h:02d}:{m:02d} 非集合竞价时段 (09:15-09:25)")
+        print("   腾讯接口返回的是全天数据而非竞价数据，筛选结果无意义")
+        print("   请在 09:26-09:30 运行（撮合价已发布，数据最准确）")
+        return []
     elif is_auction:
         print(f"\n⚠️  当前 {h:02d}:{m:02d} 竞价进行中，撮合价尚未最终确定")
         print("   建议 9:26 后再运行以获取最终撮合数据\n")
