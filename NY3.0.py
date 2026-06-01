@@ -3803,21 +3803,41 @@ def main():
             print(f"  ❌ 未找到: {args.search}")
         return
 
-    # ---- 收盘竞价监控模式 ----
+    # ---- 收盘竞价监控模式（命令行指定代码）----
     if args.close_auction is not None:
         codes = args.close_auction
-        now = datetime.now()
-        # 14:28 之后才触发收盘竞价报告，之前跑早盘报告
-        if now.hour < 14 or (now.hour == 14 and now.minute < 28):
-            print(f"  ⏳ 当前 {now.strftime('%H:%M')}，14:28 之前 → 运行早盘报告")
+        if not codes:
+            print("  ⚠️ 请用 --close-auction 600519 000858 指定股票代码")
+            return
+        html_out = args.html or "close_auction_report.html"
+        close_auction_monitor(codes, html_path=html_out)
+        return
+
+    # ---- 交互菜单模式（无参数时显示）----
+    if not args.inputs and not args.data_dir and not args.search and not args.test and not args.codes:
+        print(f"\n{'═'*40}")
+        print(f"  📊 NY3.0 集合竞价分析")
+        print(f"{'═'*40}")
+        print(f"  1. 早盘集合竞价分析（09:15-09:25）")
+        print(f"  2. 尾盘集合竞价分析（14:57-15:00）")
+        print(f"{'═'*40}")
+        choice = input("  请选择 (1/2): ").strip()
+
+        if choice == "1":
             run_oneclick()
-        else:
-            if not codes:
-                print("  ⚠️ 请用 --close-auction 600519 000858 指定股票代码")
+            return
+        elif choice == "2":
+            raw = input("  请输入股票代码（空格分隔，如 600519 000858）: ").strip()
+            if not raw:
+                print("  ❌ 未输入代码，退出")
                 return
+            codes = raw.split()
             html_out = args.html or "close_auction_report.html"
             close_auction_monitor(codes, html_path=html_out)
-        return
+            return
+        else:
+            print("  ❌ 无效选择，退出")
+            return
 
     # ---- 离线分析模式 ----
     if args.data_dir:
