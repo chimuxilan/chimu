@@ -352,301 +352,126 @@ def fmt_mktcap(val):
 
 def generate_html(ranked, strategy_pool, pool_5d, pool_10d, pool_20d, output_path):
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    core = [s for s in ranked if s["level"] == "🔴 核心主线"]
-    strong = [s for s in ranked if s["level"] == "🟠 强势支线"]
-    potential = [s for s in ranked if s["level"] == "🟡 潜力支线"]
 
     def color(val):
-        return "#e74c3c" if val > 0 else "#27ae60" if val < 0 else "#999"
+        return "#e74c3c" if val > 0 else "#27ae60" if val < 0 else "#888"
 
-    def make_card(s, idx):
-        chg_20d_html = ""
+    def c20(s):
         if s.get("chg_20d") is not None:
-            chg_20d_html = f'<div><small>20日涨幅</small><b style="color:{color(s["chg_20d"])}">{s["chg_20d"]:+.2f}%</b></div>'
-        return f"""
-    <div class="card">
-      <div class="card-head">
-        <span class="r">#{idx}</span>
-        <span class="nm">{s['name']}</span>
-        <span class="tag">{s['category']}</span>
-      </div>
-      <div class="card-grid">
-        <div><small>综合得分</small><b class="gold">{s['total_score']}</b></div>
-        <div><small>主力净流入</small><b style="color:{color(s['main_net'])}">{fmt_amount(s['main_net'])}</b></div>
-        <div><small>今日涨幅</small><b style="color:{color(s['pct_chg'])}">{s['pct_chg']:+.2f}%</b></div>
-        <div><small>5日涨幅</small><b style="color:{color(s['chg_5d'])}">{s['chg_5d']:+.2f}%</b></div>
-        <div><small>10日涨幅</small><b style="color:{color(s['chg_10d'])}">{s['chg_10d']:+.2f}%</b></div>
-        {chg_20d_html}
-        <div><small>领涨股</small><b>{s['leading_name']}</b></div>
-      </div>
-      <div class="card-foot">
-        <span>流入#{s['flow_rank']}</span><span>5日#{s['rank_5d']}</span><span>10日#{s['rank_10d']}</span>
-      </div>
-    </div>"""
+            return f'<td style="color:{color(s["chg_20d"])}">{s["chg_20d"]:+.2f}%</td>'
+        return '<td>—</td>'
 
-    cards = "".join(make_card(s, i + 1) for i, s in enumerate(core))
-
-    # 策略池卡片
-    def make_pool_card(s, idx):
-        return f"""
-    <div class="pool-card">
-      <div class="card-head" style="background:linear-gradient(135deg,rgba(231,76,60,.15),rgba(241,196,15,.1))">
-        <span class="r">#{idx}</span>
-        <span class="nm">{s['name']}</span>
-        <span class="tag" style="background:rgba(231,76,60,.2);color:#ff6b6b">策略池</span>
-      </div>
-      <div class="card-grid">
-        <div><small>综合得分</small><b class="gold">{s['total_score']}</b></div>
-        <div><small>主力净流入</small><b style="color:{color(s['main_net'])}">{fmt_amount(s['main_net'])}</b></div>
-        <div><small>今日涨幅</small><b style="color:{color(s['pct_chg'])}">{s['pct_chg']:+.2f}%</b></div>
-        <div><small>5日涨幅</small><b style="color:{color(s['chg_5d'])};font-size:1.1em">{s['chg_5d']:+.2f}%</b></div>
-        <div><small>10日涨幅</small><b style="color:{color(s['chg_10d'])};font-size:1.1em">{s['chg_10d']:+.2f}%</b></div>
-        <div><small>20日涨幅</small><b style="color:{color(s['chg_20d'])};font-size:1.1em">{s['chg_20d']:+.2f}%</b></div>
-        <div><small>领涨股</small><b>{s['leading_name']}</b></div>
-        <div><small>净占比</small><b>{s['net_ratio']:.2f}%</b></div>
-      </div>
-      <div class="card-foot" style="background:rgba(231,76,60,.08)">
-        <span>流入#{s['flow_rank']}</span><span>5日#{s['rank_5d']}</span><span>10日#{s['rank_10d']}</span>
-      </div>
-    </div>"""
-
-    pool_cards = "".join(make_pool_card(s, i + 1) for i, s in enumerate(strategy_pool))
-    pool_empty = '<div class="note" style="text-align:center;padding:30px"><b>暂无符合条件的板块</b><br>筛选条件：5日≥20% & 10日≥35% & 20日≥45% & 主力净流入>0</div>' if not strategy_pool else ""
-
-    # ---- 股池表格 ----
-    def make_stock_rows(items):
-        rows = ""
-        for s in items:
-            core_badge = '<span class="core-badge">⭐ 主线</span>' if s["is_core"] else ""
-            chg_20d_val = f"{s['chg_20d']:+.2f}%" if s.get("chg_20d") is not None else "—"
-            chg_20d_clr = color(s["chg_20d"]) if s.get("chg_20d") is not None else "#999"
-            rows += f"""<tr class="{'stock-core' if s['is_core'] else ''}">
-<td>{core_badge}</td>
-<td><b>{s['name']}</b><br><small style="color:#8b949e">{s['symbol']}</small></td>
-<td style="color:{color(s['chg_today'])}">{s['chg_today']:+.2f}%</td>
-<td style="color:{color(s['chg_5d'])};font-weight:700;font-size:.95em">{s['chg_5d']:+.2f}%</td>
-<td style="color:{color(s['chg_10d'])};font-weight:700;font-size:.95em">{s['chg_10d']:+.2f}%</td>
-<td style="color:{chg_20d_clr};font-weight:700;font-size:.95em">{chg_20d_val}</td>
-<td>{s['trade']:.2f}</td>
-<td>{fmt_mktcap(s['mktcap'])}</td>
-<td>{s['turnover']:.1f}%</td>
-<td><small>{s['from_sector']}</small></td>
-<td class="gold">{s['composite']}</td></tr>"""
-        return rows
-
-    stock_thead = """<thead><tr>
-<th>标记</th><th>股票</th><th>今日</th>
-<th>5日涨幅</th><th>10日涨幅</th><th>20日涨幅</th>
-<th>现价</th><th>总市值</th><th>换手率</th>
-<th>来源板块</th><th>综合分</th>
-</tr></thead>"""
-
-    def make_stock_table(items, empty_msg="暂无符合条件的股票"):
+    # ---- 股池表格（共用） ----
+    def stock_tbody(items):
         if not items:
-            return f'<tr><td colspan="11" style="text-align:center;padding:20px;color:#8b949e">{empty_msg}</td></tr>'
-        return make_stock_rows(items)
-
-    stock_5d_rows = make_stock_table(pool_5d, "暂无5日涨幅≥20%的股票")
-    stock_10d_rows = make_stock_table(pool_10d, "暂无10日涨幅≥35%的股票")
-    stock_20d_rows = make_stock_table(pool_20d, "暂无20日涨幅≥45%的股票")
-
-    # ---- 板块排名表 ----
-    def make_rows(items, cls=""):
+            return '<tr><td colspan="8" style="text-align:center;padding:24px;color:#666">暂无符合条件的股票</td></tr>'
         rows = ""
         for s in items:
-            chg_20d_val = f"{s['chg_20d']:+.2f}%" if s.get("chg_20d") is not None else "—"
-            chg_20d_clr = color(s["chg_20d"]) if s.get("chg_20d") is not None else "#999"
-            rows += f"""<tr class="{cls}">
-<td>{s['level']}</td><td><b>{s['name']}</b></td><td>{s['category']}</td>
-<td class="gold">{s['total_score']}</td>
-<td style="color:{color(s['main_net'])}">{fmt_amount(s['main_net'])}</td>
-<td style="color:{color(s['pct_chg'])}">{s['pct_chg']:+.2f}%</td>
-<td style="color:{color(s['chg_5d'])}">{s['chg_5d']:+.2f}%</td>
-<td style="color:{color(s['chg_10d'])}">{s['chg_10d']:+.2f}%</td>
-<td style="color:{chg_20d_clr}">{chg_20d_val}</td>
-<td>{s['net_ratio']:.2f}%</td>
-<td>{s['leading_name']}</td>
-<td>{s['flow_rank']}</td><td>{s['rank_5d']}</td><td>{s['rank_10d']}</td></tr>"""
+            star = '<span style="color:#e74c3c">⭐</span>' if s["is_core"] else ""
+            rows += f'<tr{"" if not s["is_core"] else " class=core"}>'
+            rows += f'<td>{star}</td>'
+            rows += f'<td><b>{s["name"]}</b> <small style="color:#666">{s["symbol"]}</small></td>'
+            rows += f'<td style="color:{color(s["chg_5d"])};font-weight:600">{s["chg_5d"]:+.2f}%</td>'
+            rows += f'<td style="color:{color(s["chg_10d"])}">{s["chg_10d"]:+.2f}%</td>'
+            rows += c20(s)
+            rows += f'<td>{s["trade"]:.2f}</td>'
+            rows += f'<td>{fmt_mktcap(s["mktcap"])}</td>'
+            rows += f'<td style="color:#888">{s["from_sector"]}</td>'
+            rows += '</tr>'
         return rows
 
-    def make_pool_rows(items):
+    sth = '<thead><tr><th></th><th>股票</th><th>5日涨幅</th><th>10日涨幅</th><th>20日涨幅</th><th>现价</th><th>市值</th><th>板块</th></tr></thead>'
+
+    # ---- 策略池板块表格 ----
+    def pool_tbody():
+        if not strategy_pool:
+            return '<tr><td colspan="9" style="text-align:center;padding:24px;color:#666">暂无</td></tr>'
         rows = ""
-        for s in items:
-            rows += f"""<tr class="pool-row">
-<td><b class="gold">{s['name']}</b></td><td>{s['category']}</td>
-<td class="gold">{s['total_score']}</td>
-<td style="color:{color(s['main_net'])}">{fmt_amount(s['main_net'])}</td>
-<td style="color:{color(s['pct_chg'])}">{s['pct_chg']:+.2f}%</td>
-<td style="color:{color(s['chg_5d'])};font-weight:700">{s['chg_5d']:+.2f}%</td>
-<td style="color:{color(s['chg_10d'])};font-weight:700">{s['chg_10d']:+.2f}%</td>
-<td style="color:{color(s['chg_20d'])};font-weight:700">{s['chg_20d']:+.2f}%</td>
-<td>{s['net_ratio']:.2f}%</td>
-<td>{s['leading_name']}</td>
-<td>{s['flow_rank']}</td></tr>"""
+        for s in strategy_pool:
+            rows += '<tr>'
+            rows += f'<td><b>{s["name"]}</b></td>'
+            rows += f'<td style="color:{color(s["main_net"])}">{fmt_amount(s["main_net"])}</td>'
+            rows += f'<td style="color:{color(s["chg_5d"])};font-weight:600">{s["chg_5d"]:+.2f}%</td>'
+            rows += f'<td style="color:{color(s["chg_10d"])};font-weight:600">{s["chg_10d"]:+.2f}%</td>'
+            rows += c20(s)
+            rows += f'<td>{s["net_ratio"]:.1f}%</td>'
+            rows += f'<td>{s["leading_name"]}</td>'
+            rows += f'<td class="g">{s["total_score"]}</td>'
+            rows += '</tr>'
         return rows
 
-    thead = """<thead><tr>
-<th>级别</th><th>板块</th><th>分类</th><th>综合分</th>
-<th>主力净流入</th><th>今日</th><th>5日</th><th>10日</th><th>20日</th>
-<th>净占比</th><th>领涨股</th><th>流入#</th><th>5日#</th><th>10日#</th>
-</tr></thead>"""
-
-    pool_thead = """<thead><tr>
-<th>板块</th><th>分类</th><th>综合分</th>
-<th>主力净流入</th><th>今日</th><th>5日</th><th>10日</th><th>20日</th>
-<th>净占比</th><th>领涨股</th><th>流入#</th>
-</tr></thead>"""
+    pth = '<thead><tr><th>板块</th><th>主力净流入</th><th>5日</th><th>10日</th><th>20日</th><th>净占比</th><th>领涨股</th><th>评分</th></tr></thead>'
 
     count_5d = len(pool_5d)
     count_10d = len(pool_10d)
     count_20d = len(pool_20d)
-    core_5d = len([s for s in pool_5d if s["is_core"]])
-    core_10d = len([s for s in pool_10d if s["is_core"]])
-    core_20d = len([s for s in pool_20d if s["is_core"]])
 
     html = f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>A股板块主线分析 {now}</title>
+<title>A股分析 {now}</title>
 <style>
 *{{margin:0;padding:0;box-sizing:border-box}}
-body{{font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;background:#0d1117;color:#c9d1d9;line-height:1.6;padding:16px}}
-.wrap{{max-width:1400px;margin:0 auto}}
-h1{{text-align:center;font-size:1.8em;margin:16px 0 4px;background:linear-gradient(90deg,#e74c3c,#f1c40f,#e74c3c);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}}
-.sub{{text-align:center;color:#8b949e;font-size:.85em;margin-bottom:20px}}
-.bar{{display:flex;justify-content:center;gap:16px;flex-wrap:wrap;margin:16px 0 24px}}
-.bar .it{{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:12px 20px;text-align:center;min-width:140px}}
-.bar .it .n{{font-size:1.8em;font-weight:700}}
-.bar .it .l{{color:#8b949e;font-size:.8em}}
-.sec{{font-size:1.3em;margin:24px 0 12px;padding-left:10px;border-left:4px solid #f1c40f}}
-.sec.pool{{border-left-color:#e74c3c}}
-.sec.stock{{border-left-color:#58a6ff}}
-.cards{{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px;margin:12px 0}}
-.card{{background:#161b22;border:1px solid #30363d;border-radius:10px;overflow:hidden;transition:.2s}}
-.card:hover{{transform:translateY(-2px);box-shadow:0 6px 20px rgba(231,76,60,.12)}}
-.card-head{{padding:10px 14px;background:linear-gradient(135deg,rgba(231,76,60,.1),rgba(241,196,15,.06));display:flex;align-items:center;gap:6px}}
-.r{{font-size:1.2em;font-weight:700;color:#f1c40f;min-width:28px}}
-.nm{{font-weight:700;font-size:1.05em;flex:1}}
-.tag{{font-size:.7em;background:rgba(56,139,253,.15);color:#58a6ff;padding:2px 7px;border-radius:8px}}
-.card-grid{{padding:10px 14px;display:grid;grid-template-columns:1fr 1fr;gap:6px}}
-.card-grid div{{display:flex;flex-direction:column}}
-.card-grid small{{font-size:.7em;color:#8b949e}}
-.card-grid b{{font-size:.95em}}
-.gold{{color:#f1c40f!important}}
-.card-foot{{padding:6px 14px;background:rgba(0,0,0,.25);display:flex;justify-content:space-between;font-size:.7em;color:#8b949e}}
-
-.pool-cards{{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px;margin:12px 0}}
-.pool-card{{background:#161b22;border:2px solid rgba(231,76,60,.35);border-radius:10px;overflow:hidden;transition:.2s;position:relative}}
-.pool-card:hover{{transform:translateY(-2px);box-shadow:0 8px 24px rgba(231,76,60,.18)}}
-.pool-card::before{{content:'';position:absolute;top:0;left:0;right:0;height:3px;background:linear-gradient(90deg,#e74c3c,#f1c40f,#e74c3c)}}
-.pool-row{{background:rgba(231,76,60,.04)}}
-.pool-badge{{display:inline-flex;align-items:center;gap:4px;background:linear-gradient(135deg,rgba(231,76,60,.15),rgba(241,196,15,.08));border:1px solid rgba(231,76,60,.3);border-radius:20px;padding:4px 12px;font-size:.8em;color:#ff6b6b;margin:8px 0}}
-
-/* 股池样式 */
-.stock-badge{{display:inline-flex;align-items:center;gap:4px;background:linear-gradient(135deg,rgba(56,139,253,.15),rgba(231,76,60,.08));border:1px solid rgba(56,139,253,.3);border-radius:20px;padding:4px 12px;font-size:.8em;color:#58a6ff;margin:8px 0}}
-.core-badge{{display:inline-flex;align-items:center;gap:2px;background:rgba(231,76,60,.12);border:1px solid rgba(231,76,60,.3);border-radius:6px;padding:1px 6px;font-size:.7em;color:#ff6b6b;white-space:nowrap}}
-.stock-core{{background:rgba(231,76,60,.04)}}
-
-.tabs{{display:flex;gap:0;margin:20px 0 0;flex-wrap:wrap}}
-.tab{{padding:8px 20px;background:#161b22;border:1px solid #30363d;cursor:pointer;border-radius:8px 8px 0 0;color:#8b949e;font-weight:500;font-size:.9em;transition:.2s}}
-.tab.active{{background:#30363d;color:#c9d1d9;border-bottom-color:#30363d}}
-.tc{{display:none;background:#161b22;border:1px solid #30363d;border-top:none;border-radius:0 0 10px 10px;padding:12px;overflow-x:auto}}
+body{{font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;background:#fafafa;color:#333;line-height:1.5;padding:20px;font-size:14px}}
+.wrap{{max-width:1200px;margin:0 auto}}
+h1{{font-size:1.5em;margin-bottom:4px;color:#222}}
+.sub{{color:#999;font-size:.8em;margin-bottom:24px}}
+.sec{{font-size:1.15em;font-weight:600;margin:28px 0 10px;color:#222;padding-bottom:6px;border-bottom:2px solid #e74c3c}}
+table{{width:100%;border-collapse:collapse;margin-bottom:8px}}
+th{{background:#f5f5f5;padding:8px 10px;text-align:left;font-size:.8em;color:#666;border-bottom:2px solid #eee;white-space:nowrap}}
+td{{padding:7px 10px;border-bottom:1px solid #f0f0f0;white-space:nowrap;font-size:.88em}}
+tr:hover{{background:#f8f8f8}}
+tr.core{{background:#fff5f5}}
+.g{{color:#e74c3c;font-weight:600}}
+.tabs{{display:flex;gap:0;margin:0}}
+.tab{{padding:8px 18px;background:#f5f5f5;border:1px solid #e0e0e0;cursor:pointer;border-radius:6px 6px 0 0;color:#888;font-weight:500;font-size:.85em;transition:.15s;border-bottom:none}}
+.tab.active{{background:#fff;color:#333;border-bottom-color:#fff;font-weight:600}}
+.tc{{display:none;background:#fff;border:1px solid #e0e0e0;border-top:none;border-radius:0 0 8px 8px;padding:10px;overflow-x:auto}}
 .tc.active{{display:block}}
-table{{width:100%;border-collapse:collapse;font-size:.82em}}
-th{{background:#0d1117;padding:8px 6px;text-align:left;border-bottom:2px solid #30363d;position:sticky;top:0;white-space:nowrap}}
-td{{padding:6px;border-bottom:1px solid #21262d;white-space:nowrap}}
-tr:hover{{background:rgba(255,255,255,.02)}}
-.core{{background:rgba(231,76,60,.06)}}
-.strong{{background:rgba(230,126,34,.04)}}
-.pot{{background:rgba(241,196,15,.02)}}
-.note{{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:16px;margin:20px 0;font-size:.85em;color:#8b949e}}
-.note b{{color:#c9d1d9}}
-@media(max-width:768px){{.cards,.pool-cards{{grid-template-columns:1fr}}.bar{{gap:8px}}.bar .it{{min-width:110px;padding:8px 12px}}}}
+.badge{{display:inline-block;background:#f0f0f0;border-radius:12px;padding:2px 10px;font-size:.78em;color:#666;margin:6px 0}}
+.empty{{text-align:center;padding:30px;color:#aaa}}
+.note{{margin-top:28px;padding:12px 14px;background:#fff;border:1px solid #eee;border-radius:8px;font-size:.78em;color:#999;line-height:1.8}}
+.note b{{color:#666}}
+@media(max-width:768px){{body{{padding:10px}}table{{font-size:.78em}}th,td{{padding:5px 6px}}}}
 </style>
 </head>
 <body>
 <div class="wrap">
-<h1>🔥 A股板块主线分析</h1>
-<p class="sub">{now} · 数据来源：新浪财经 · 领涨股5/10/20日涨幅作为板块趋势代理</p>
+<h1>A股板块主线分析</h1>
+<p class="sub">{now} · 数据来源：新浪财经</p>
 
-<div class="bar">
-  <div class="it"><div class="n" style="color:#e74c3c">{len(core)}</div><div class="l">核心主线</div></div>
-  <div class="it"><div class="n" style="color:#e67e22">{len(strong)}</div><div class="l">强势支线</div></div>
-  <div class="it"><div class="n" style="color:#f1c40f">{len(potential)}</div><div class="l">潜力支线</div></div>
-  <div class="it"><div class="n" style="color:#ff6b6b">{len(strategy_pool)}</div><div class="l">🎯 策略池</div></div>
-  <div class="it"><div class="n" style="color:#58a6ff">{count_5d}</div><div class="l">5日≥20%</div></div>
-  <div class="it"><div class="n" style="color:#58a6ff">{count_10d}</div><div class="l">10日≥35%</div></div>
-  <div class="it"><div class="n" style="color:#58a6ff">{count_20d}</div><div class="l">20日≥45%</div></div>
-  <div class="it"><div class="n" style="color:#58a6ff">{len(ranked)}</div><div class="l">分析总数</div></div>
-</div>
-
-<h2 class="sec stock">📦 股池 · 策略池1选股</h2>
-<p style="color:#8b949e;font-size:.85em;margin-bottom:12px">入选条件：<b style="color:#ff6b6b">5日≥20%</b> · <b style="color:#ff6b6b">10日≥35%</b> · <b style="color:#ff6b6b">20日≥45%</b> · 来自策略池板块 · <b style="color:#58a6ff">仅主板</b> · <b style="color:#27ae60">非ST</b></p>
-
-<div class="tabs" style="margin-bottom:0">
-  <div class="tab active" onclick="sw('s5')">📈 5日≥20%（{count_5d}）</div>
-  <div class="tab" onclick="sw('s10')">📈 10日≥35%（{count_10d}）</div>
-  <div class="tab" onclick="sw('s20')">📈 20日≥45%（{count_20d}）</div>
-</div>
-<div id="t-s5" class="tc active" style="border-top:none;border-radius:0 0 10px 10px">
-  <div class="stock-badge">📈 5日涨幅≥20% · 共 {count_5d} 只 · 主线 <b style="color:#ff6b6b">{core_5d}</b> 只 ⭐</div>
-  <table>{stock_thead}<tbody>{stock_5d_rows}</tbody></table>
-</div>
-<div id="t-s10" class="tc">
-  <div class="stock-badge">📈 10日涨幅≥35% · 共 {count_10d} 只 · 主线 <b style="color:#ff6b6b">{core_10d}</b> 只 ⭐</div>
-  <table>{stock_thead}<tbody>{stock_10d_rows}</tbody></table>
-</div>
-<div id="t-s20" class="tc">
-  <div class="stock-badge">📈 20日涨幅≥45% · 共 {count_20d} 只 · 主线 <b style="color:#ff6b6b">{core_20d}</b> 只 ⭐</div>
-  <table>{stock_thead}<tbody>{stock_20d_rows}</tbody></table>
-</div>
-
-<h2 class="sec pool">🎯 策略池 · 强势板块</h2>
-<p style="color:#8b949e;font-size:.85em;margin-bottom:12px">筛选条件：<b style="color:#ff6b6b">5日≥20%</b> · <b style="color:#ff6b6b">10日≥35%</b> · <b style="color:#ff6b6b">20日≥45%</b> · <b style="color:#27ae60">主力净流入>0</b></p>
-<div class="pool-badge">⚡ 符合条件: {len(strategy_pool)} 个板块</div>
-{pool_empty}
-<div class="pool-cards">{pool_cards}</div>
-
-{"<h2 class='sec'>🏆 核心主线 TOP 5</h2>" if core else ""}
-<div class="cards">{cards}</div>
-
-<h2 class="sec">📋 完整排名</h2>
+<!-- 股池 -->
+<h2 class="sec">股池 · 三维度选股</h2>
+<p style="font-size:.82em;color:#888;margin-bottom:8px">条件：来自策略池板块 · 仅主板 · 非ST · ⭐=核心主线板块</p>
 <div class="tabs">
-  <div class="tab active" onclick="sw('all')">全部 TOP50</div>
-  <div class="tab" onclick="sw('core')">核心主线</div>
-  <div class="tab" onclick="sw('strong')">强势支线</div>
-  <div class="tab" onclick="sw('pot')">潜力支线</div>
-  <div class="tab" onclick="sw('pool')" style="border-bottom:2px solid #e74c3c">🎯 策略池</div>
+  <div class="tab active" onclick="sw('s5')">5日≥20%（{count_5d}）</div>
+  <div class="tab" onclick="sw('s10')">10日≥35%（{count_10d}）</div>
+  <div class="tab" onclick="sw('s20')">20日≥45%（{count_20d}）</div>
 </div>
-<div id="t-all" class="tc active"><table>{thead}<tbody>{make_rows(ranked[:50])}</tbody></table></div>
-<div id="t-core" class="tc"><table>{thead}<tbody>{make_rows(core,'core')}</tbody></table></div>
-<div id="t-strong" class="tc"><table>{thead}<tbody>{make_rows(strong,'strong')}</tbody></table></div>
-<div id="t-pot" class="tc"><table>{thead}<tbody>{make_rows(potential,'pot')}</tbody></table></div>
-<div id="t-pool" class="tc"><table>{pool_thead}<tbody>{make_pool_rows(strategy_pool)}</tbody></table></div>
+<div id="t-s5" class="tc active"><table>{sth}<tbody>{stock_tbody(pool_5d)}</tbody></table></div>
+<div id="t-s10" class="tc"><table>{sth}<tbody>{stock_tbody(pool_10d)}</tbody></table></div>
+<div id="t-s20" class="tc"><table>{sth}<tbody>{stock_tbody(pool_20d)}</tbody></table></div>
+
+<!-- 策略池板块 -->
+<h2 class="sec">策略池 · 强势板块（{len(strategy_pool)}）</h2>
+<p style="font-size:.82em;color:#888;margin-bottom:8px">5日≥20% · 10日≥35% · 20日≥45% · 主力净流入>0</p>
+<table>{pth}<tbody>{pool_tbody()}</tbody></table>
 
 <div class="note">
-<h3 style="margin-bottom:8px">📐 分析方法</h3>
-<p><b>数据来源：</b>新浪财经板块资金流向 + 领涨股/成分股K线</p>
-<p><b>综合评分 =</b> 主力净流入排名分 × 0.4 + 5日涨幅排名分 × 0.3 + 10日涨幅排名分 × 0.3</p>
-<p><b>核心主线：</b>综合得分 TOP 5 · <b>强势支线：</b>6-12名 · <b>潜力支线：</b>13-20名</p>
-<p><b>🎯 策略池：</b>5日涨幅≥20% + 10日涨幅≥35% + 20日涨幅≥45% + 主力资金净流入>0</p>
-<p><b>📦 股池：</b>来自策略池板块的成分股，按涨幅维度分三列展示 · ⭐标记为核心主线板块股票 · 仅主板 · 排除ST</p>
-<p style="margin-top:6px">⚠️ 数据仅供参考，不构成投资建议。主线判定需结合政策面、消息面综合判断。</p>
+<b>评分方法：</b>主力净流入排名×0.4 + 5日涨幅排名×0.3 + 10日涨幅排名×0.3<br>
+<b>股池：</b>策略池板块成分股 · ⭐=核心主线板块 · 仅主板 · 非ST<br>
+⚠️ 数据仅供参考，不构成投资建议
 </div>
 </div>
 <script>
 function sw(n){{
-  var t=event.target;
-  var group=t.parentElement;
-  group.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
+  var t=event.target,grp=t.parentElement;
+  grp.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
   t.classList.add('active');
-  var container=group.nextElementSibling;
-  while(container&&container.classList.contains('tc')){{
-    container.classList.remove('active');
-    container=container.nextElementSibling;
-  }}
+  var c=grp.nextElementSibling;
+  while(c&&c.classList.contains('tc')){{c.classList.remove('active');c=c.nextElementSibling;}}
   document.getElementById('t-'+n).classList.add('active');
 }}
 </script>
