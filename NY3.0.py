@@ -618,7 +618,7 @@ async def _async_fetch_kline_120min_batch(codes: list[str]) -> dict:
     done_count = 0
     fail_count = 0
     t_start = time.time()
-    semaphore = asyncio.Semaphore(50)
+    semaphore = asyncio.Semaphore(15)
 
     class AdaptiveRateLimiter:
         def __init__(self, base_rate, name):
@@ -653,8 +653,8 @@ async def _async_fetch_kline_120min_batch(codes: list[str]) -> dict:
             if time.monotonic() > self.backoff_until:
                 self.current_rate = min(self.base_rate, self.current_rate * 1.05)
 
-    limiter = AdaptiveRateLimiter(base_rate=20, name="新浪120min")
-    conn = aiohttp.TCPConnector(limit=10, limit_per_host=10, ttl_dns_cache=300)
+    limiter = AdaptiveRateLimiter(base_rate=8, name="新浪120min")
+    conn = aiohttp.TCPConnector(limit=5, limit_per_host=5, ttl_dns_cache=300)
 
     async with aiohttp.ClientSession(connector=conn, timeout=timeout) as sess:
         async def _fetch_one(code):
@@ -664,38 +664,50 @@ async def _async_fetch_kline_120min_batch(codes: list[str]) -> dict:
             params = {"symbol": sym, "scale": "60", "ma": "no", "datalen": 120}
             headers = {"Referer": "https://finance.sina.com.cn/", "User-Agent": _random_ua(), "Accept": _random_accept()}
 
-            await limiter.acquire()
-            async with semaphore:
-                try:
-                    async with sess.get(url, params=params, headers=headers) as resp:
-                        if resp.status == 429:
-                            limiter.on_429()
-                            raise ConnectionAbortedError("429")
-                        if resp.status != 200:
-                            raise Exception(f"HTTP {resp.status}")
-                        text = await resp.text()
-                        if not text.strip() or text.strip() == "null":
-                            raise Exception("empty")
-                        m60 = json.loads(text)
-                        if not m60 or len(m60) < 2:
-                            raise Exception("too short")
-                        m120 = []
-                        for i in range(0, len(m60) - 1, 2):
-                            a, b = m60[i], m60[i + 1]
-                            m120.append({
-                                "day": b["day"],
-                                "open": a["open"],
-                                "close": b["close"],
-                                "high": str(max(float(a["high"]), float(b["high"]))),
-                                "low": str(min(float(a["low"]), float(b["low"]))),
-                                "volume": str(int(float(a.get("volume", 0)) + float(b.get("volume", 0)))),
-                            })
-                        results[code] = m120
-                        limiter.on_success()
-                except ConnectionAbortedError:
-                    fail_count += 1
-                except Exception:
-                    fail_count += 1
+            success = False
+            for attempt in range(3):
+                await limiter.acquire()
+                async with semaphore:
+                    try:
+                        async with sess.get(url, params=params, headers=headers) as resp:
+                            if resp.status == 429:
+                                limiter.on_429()
+                                await asyncio.sleep(3 + attempt * 3)
+                                continue
+                            if resp.status != 200:
+                                break
+                            text = await resp.text()
+                            if not text.strip() or text.strip() == "null":
+                                if attempt < 2:
+                                    await asyncio.sleep(1 + attempt)
+                                    continue
+                                break
+                            m60 = json.loads(text)
+                            if not m60 or len(m60) < 2:
+                                break
+                            m120 = []
+                            for i in range(0, len(m60) - 1, 2):
+                                a, b = m60[i], m60[i + 1]
+                                m120.append({
+                                    "day": b["day"],
+                                    "open": a["open"],
+                                    "close": b["close"],
+                                    "high": str(max(float(a["high"]), float(b["high"]))),
+                                    "low": str(min(float(a["low"]), float(b["low"]))),
+                                    "volume": str(int(float(a.get("volume", 0)) + float(b.get("volume", 0)))),
+                                })
+                            results[code] = m120
+                            limiter.on_success()
+                            success = True
+                            break
+                    except ConnectionAbortedError:
+                        if attempt < 2:
+                            await asyncio.sleep(3 + attempt * 3)
+                            continue
+                    except Exception:
+                        break
+            if not success:
+                fail_count += 1
 
             done_count += 1
             if done_count % 500 == 0:
@@ -1100,6 +1112,168 @@ def fetch_sector_kline(sector_code: str, days: int = 10, session: requests.Sessi
         return klines
     except Exception:
         return []
+
+
+def aggregate_sector_klines_from_stocks(sectors: dict, stock_klines_map: dict,
+                                         code_to_sector: dict = None,
+                                         weights: dict = None) -> dict:
+    """
+    从已有股票日K线数据聚合计算板块K线（零额外API请求）。
+    支持市值加权：传入 weights={code: market_cap} 时按市值加权，否则等权平均。
+
+    Args:
+        sectors: {sector_name: {"stocks": [...], ...}}
+        stock_klines_map: {stock_code: [kline_dicts]}
+        code_to_sector: {stock_code: sector_name} 映射，为None时自动构建
+        weights: {stock_code: float} 市值权重，为None时等权平均
+
+    Returns:
+        {sector_code: [aggregated_kline_dicts]}
+    """
+    if not code_to_sector:
+        code_to_sector = {}
+        for sn, sd in sectors.items():
+            for stk in sd.get("stocks", []):
+                code = stk.get("code", "")
+                if code:
+                    code_to_sector[code] = sn
+
+    use_weighted = weights is not None and len(weights) > 0
+
+    # 按板块+日期聚合
+    # {sector_name: {date: {open: [(val, weight), ...], close: [...], ...}}}
+    sector_daily = {}
+    for code, klines in stock_klines_map.items():
+        sn = code_to_sector.get(code)
+        if not sn or not klines:
+            continue
+        w = (weights or {}).get(code, 1.0) if use_weighted else 1.0
+        if w <= 0:
+            w = 1.0
+        if sn not in sector_daily:
+            sector_daily[sn] = {}
+        for k in klines:
+            day = k.get("day", "")
+            if not day:
+                continue
+            if day not in sector_daily[sn]:
+                sector_daily[sn][day] = {"open": [], "close": [], "high": [], "low": [], "volume": []}
+            try:
+                sector_daily[sn][day]["open"].append((float(k.get("open", 0)), w))
+                sector_daily[sn][day]["close"].append((float(k.get("close", 0)), w))
+                sector_daily[sn][day]["high"].append((float(k.get("high", 0)), w))
+                sector_daily[sn][day]["low"].append((float(k.get("low", 0)), w))
+                sector_daily[sn][day]["volume"].append((float(k.get("volume", 0)), w))
+            except (ValueError, TypeError):
+                continue
+
+    def _weighted_avg(pairs):
+        """加权平均，pairs = [(value, weight), ...]"""
+        total_w = sum(w for _, w in pairs)
+        if total_w <= 0:
+            return 0
+        return sum(v * w for v, w in pairs) / total_w
+
+    # 生成板块K线序列
+    sector_name_to_code = {sn: sd.get("code", "") for sn, sd in sectors.items() if sd.get("code")}
+    result = {}
+    for sn, daily in sector_daily.items():
+        scode = sector_name_to_code.get(sn, "")
+        if not scode:
+            continue
+        klines = []
+        for day in sorted(daily.keys()):
+            d = daily[day]
+            if not d["close"]:
+                continue
+            klines.append({
+                "day": day,
+                "open": str(round(_weighted_avg(d["open"]), 2)),
+                "close": str(round(_weighted_avg(d["close"]), 2)),
+                "high": str(round(_weighted_avg(d["high"]), 2)),
+                "low": str(round(_weighted_avg(d["low"]), 2)),
+                "volume": str(int(_weighted_avg(d["volume"]))),
+            })
+        if klines:
+            result[scode] = klines
+
+    return result
+
+
+def fetch_sector_klines_concurrent(sectors: dict, days: int = 60,
+                                    session: requests.Session = None,
+                                    max_workers: int = 5,
+                                    cooldown_sec: float = 3.0) -> dict:
+    """
+    并发获取板块K线（东财接口），自带自适应限速 + 失败快速跳过。
+    在大批量股票K线抓取后调用时，先冷却 cooldown_sec 秒避免撞限流。
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    if session is None:
+        session = _build_session()
+
+    # 冷却：给东财IP一个恢复窗口
+    if cooldown_sec > 0:
+        time.sleep(cooldown_sec)
+
+    sector_klines = {}
+    codes_to_fetch = [(sn, sd.get("code", "")) for sn, sd in sectors.items() if sd.get("code")]
+    if not codes_to_fetch:
+        return sector_klines
+
+    # 自适应限速器（线程安全）
+    class AdaptiveLimiter:
+        def __init__(self, base_interval=0.5):
+            self._interval = base_interval
+            self._lock = threading.Lock()
+            self._last_time = 0.0
+            self._consecutive_errors = 0
+
+        def wait(self):
+            with self._lock:
+                now = time.monotonic()
+                elapsed = now - self._last_time
+                if elapsed < self._interval:
+                    time.sleep(self._interval - elapsed)
+                self._last_time = time.monotonic()
+
+        def on_success(self):
+            with self._lock:
+                self._consecutive_errors = 0
+                self._interval = max(0.3, self._interval * 0.95)
+
+        def on_error(self):
+            with self._lock:
+                self._consecutive_errors += 1
+                # 指数退避，最多到 5 秒
+                self._interval = min(5.0, 0.5 * (1.5 ** self._consecutive_errors))
+
+    limiter = AdaptiveLimiter(base_interval=0.5)
+
+    def _fetch_one(sn, scode):
+        try:
+            limiter.wait()
+            sk = fetch_sector_kline(scode, days=days, session=session)
+            limiter.on_success()
+            return sn, scode, sk
+        except Exception:
+            limiter.on_error()
+            return sn, scode, []
+
+    print(f"    📦 并发获取 {len(codes_to_fetch)} 个板块K线...")
+    t0 = time.time()
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_fetch_one, sn, sc): sn for sn, sc in codes_to_fetch}
+        done = 0
+        for future in as_completed(futures):
+            sn, scode, sk = future.result()
+            done += 1
+            if sk:
+                sector_klines[scode] = sk
+
+    elapsed = time.time() - t0
+    print(f"    ✅ 板块K线完成: {len(sector_klines)}/{len(codes_to_fetch)} 有数据, 耗时{elapsed:.1f}s")
+    return sector_klines
 
 
 # ════════════════════════════════════════════════════
@@ -1686,10 +1860,11 @@ def close_auction_monitor(codes: list[str] = None, poll_interval: int = 10,
     now = _dt.now()
     target_start = now.replace(hour=14, minute=57, second=0, microsecond=0)
     target_end = now.replace(hour=15, minute=0, second=0, microsecond=0)
+    post_market = now >= target_end
 
-    if now >= target_end:
-        print(f"  ❌ 当前 {now.strftime('%H:%M')}，已过 15:00，收盘竞价已结束")
-        return []
+    if post_market:
+        print(f"  ℹ️  当前 {now.strftime('%H:%M')}，已过 15:00，使用收盘数据单次分析")
+
 
     if now < target_start:
         wait_sec = (target_start - now).total_seconds()
@@ -1698,18 +1873,14 @@ def close_auction_monitor(codes: list[str] = None, poll_interval: int = 10,
 
     print(f"  🚀 开始采集 @ {_dt.now().strftime('%H:%M:%S')}")
 
-    # ---- 采集快照 ----
+       # ---- 采集快照 ----
     all_snapshots: dict[str, list] = {c: [] for c in codes}
     session = _build_session()
 
-    while True:
-        now = _dt.now()
-        if now.hour >= 15:
-            break
-
+    if post_market:
+        # 收盘后：单次快照模式
         quotes = fetch_quotes_batch(codes, session=session)
-        ts = now.strftime('%H:%M:%S')
-
+        ts = _dt.now().strftime('%H:%M:%S')
         for code in codes:
             q = quotes.get(code, {})
             if not q:
@@ -1724,42 +1895,93 @@ def close_auction_monitor(codes: list[str] = None, poll_interval: int = 10,
                 "prev_close": float(q.get("prev_close", 0)),
                 "name": q.get("name", ""),
             })
+        snap_count = sum(1 for v in all_snapshots.values() if v)
+        print(f"  ✅ 收盘快照完成，共 {snap_count} 只有效数据")
+    else:
+        # 盘中：多轮采集模式
+        while True:
+            now = _dt.now()
+            if now.hour >= 15:
+                break
 
-        snap_count = len(all_snapshots[codes[0]]) if codes else 0
-        print(f"  ⏱ {ts} | 已采 {snap_count} 次快照")
-        _time.sleep(poll_interval)
+            quotes = fetch_quotes_batch(codes, session=session)
+            ts = now.strftime('%H:%M:%S')
+
+            for code in codes:
+                q = quotes.get(code, {})
+                if not q:
+                    continue
+                all_snapshots[code].append({
+                    "time": ts,
+                    "price": float(q.get("price", 0)),
+                    "bid1_v": int(q.get("bid1_v", 0)),
+                    "ask1_v": int(q.get("ask1_v", 0)),
+                    "volume": int(q.get("volume", 0)),
+                    "amount": float(q.get("amount", 0)),
+                    "prev_close": float(q.get("prev_close", 0)),
+                    "name": q.get("name", ""),
+                })
+
+            snap_count = len(all_snapshots[codes[0]]) if codes else 0
+            print(f"  ⏱ {ts} | 已采 {snap_count} 次快照")
+            _time.sleep(poll_interval)
+
 
     print(f"\n  ✅ 采集结束 @ {_dt.now().strftime('%H:%M:%S')}")
 
     # ---- 构建分析数据（与早盘流程一致）----
     print("📊 构建收盘竞价分析数据...")
+    print("  🔧 [v3.1] 板块K线改为市值加权聚合，零额外API请求")
 
-    # 获取K线（用于MACD和技术池）
+    # 1. 先获取板块数据（IP干净时成功率最高）
+    print("  🔧 [v3.1] 步骤1: 先获取板块列表（重排顺序，避免限流）")
+    sectors = fetch_sectors(session)
+
+    # 2. 获取K线（用于MACD和技术池）— 东财重负载请求
     print("📊 获取K线数据...")
     klines_map, kline120_map = fetch_all_klines_async(codes, days=1000, concurrency=100)
 
-    # 获取详情（市值/量比/换手率）
+    # 3. 获取详情（市值/量比/换手率）
     quotes_final = fetch_quotes_batch(codes, session=session)
     details = fetch_stock_details(codes, session, quotes_ref=quotes_final)
 
-    # 获取板块数据
-    sectors = fetch_sectors(session)
-    sector_klines = {}
-    for sname, sdata in sectors.items():
-        scode = sdata.get("code", "")
-        if scode:
-            try:
-                sk = fetch_sector_kline(scode, days=60, session=session)
-                if sk:
-                    sector_klines[scode] = sk
-            except Exception:
-                pass
+    # 4. 板块K线：优先从股票K线聚合（零额外请求），不够再用API补
+    code_to_sector_map = {}
+    for sn, sd in sectors.items():
+        for stk in sd.get("stocks", []):
+            c = stk.get("code", "")
+            if c:
+                code_to_sector_map[c] = sn
+
+    # 市值加权：用详情数据构建权重
+    cap_weights = {}
+    for code in codes:
+        em = details.get(code, {})
+        q = quotes_final.get(code, {})
+        cap = em.get("market_cap_yi", 0) or q.get("market_cap_yi", 0) or 0
+        if cap > 0:
+            cap_weights[code] = cap
+
+    sector_klines = aggregate_sector_klines_from_stocks(sectors, klines_map, code_to_sector_map,
+                                                         weights=cap_weights if cap_weights else None)
+
+    # 检查哪些板块缺少K线数据，用API补
+    missing_sectors = {sn: sd for sn, sd in sectors.items()
+                       if sd.get("code") and sd["code"] not in sector_klines}
+    if missing_sectors:
+        print(f"  📦 {len(missing_sectors)} 个板块无聚合数据，API补充...")
+        api_klines = fetch_sector_klines_concurrent(missing_sectors, days=60, session=session,
+                                                     max_workers=5, cooldown_sec=2.0)
+        sector_klines.update(api_klines)
+
+    print(f"  ✅ 板块K线: {len(sector_klines)}/{len(sectors)} 有数据")
 
     # 构建候选股票列表（模拟早盘的 all_candidates）
     all_candidates = []
+    min_snaps = 1 if post_market else 2  # 收盘后单次快照即可，盘中需要至少2次
     for code in codes:
         snaps = all_snapshots.get(code, [])
-        if len(snaps) < 2:
+        if len(snaps) < min_snaps:
             print(f"  ⚠️ {code} 快照不足（{len(snaps)}次），跳过")
             continue
 
@@ -3314,8 +3536,26 @@ def run_from_data_dir(data_dir: str, html_path: str = None, quiet: bool = False)
             kline120_map[code] = _load_json(kf)
         print(f"  ✅ 120分钟K线: {len(kline120_map)} 只")
 
-    # 板块K线（目前未提供，默认空）
-    sector_klines = {}
+    # 板块K线：从股票K线聚合（零额外请求）
+    code_to_sector_map = {}
+    for sn, sd in sectors.items():
+        for stk in sd.get("stocks", []):
+            c = stk.get("code", "")
+            if c:
+                code_to_sector_map[c] = sn
+
+    # 市值加权
+    cap_weights = {}
+    for code in kline_map:
+        em = details.get(code, {})
+        q = quotes.get(code, {})
+        cap = em.get("market_cap_yi", 0) or q.get("market_cap_yi", 0) or 0
+        if cap > 0:
+            cap_weights[code] = cap
+
+    sector_klines = aggregate_sector_klines_from_stocks(sectors, kline_map, code_to_sector_map,
+                                                         weights=cap_weights if cap_weights else None)
+    print(f"  ✅ 板块K线(聚合): {len(sector_klines)} 个")
 
     # ---- 6a. 主线板块排名（基于股票数据聚合）----
     main_line_sectors = []
