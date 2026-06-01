@@ -1609,56 +1609,11 @@ def tail_segment_verdict(gap: float, vol: int, buy_vol: int, sell_vol: int,
 # 收盘集合竞价监控（14:57-15:00）
 # ════════════════════════════════════════════════════
 
-@dataclass
-class CloseAuctionSnapshot:
-    """收盘竞价快照"""
-    time: str
-    price: float
-    bid1_v: int
-    ask1_v: int
-    volume: int
-    amount: float
-
-
-@dataclass
-class CloseAuctionResult:
-    """收盘竞价分析结果"""
-    code: str
-    name: str
-    prev_close: float
-    close_price: float
-    # 尾段增量（最后两次快照差值）
-    tail_bid_delta: int     # 尾段买一量变化
-    tail_ask_delta: int     # 尾段卖一量变化
-    tail_vol_delta: int     # 尾段搓合量变化
-    # 全程增量（14:57→15:00）
-    total_bid_delta: int    # 全程买一量变化
-    total_ask_delta: int    # 全程卖一量变化
-    total_vol_delta: int    # 全程搓合量变化
-    # 判定
-    gap: float              # 收盘相对昨收涨跌幅
-    tail_score: int
-    tail_verdict: str
-    tail_signals: list
-    snapshots: list         # 所有快照
-
-
 def close_auction_monitor(codes: list[str], poll_interval: int = 10,
-                          tail_window: int = 2, html_path: str = None) -> list[CloseAuctionResult]:
+                          tail_window: int = 2, html_path: str = None) -> list[dict]:
     """
-    收盘集合竞价监控（14:57-15:00）
-
-    在收盘竞价期间定时轮询腾讯接口，采集快照，
-    竞价结束后用最后 tail_window 次快照的差值作为"尾段数据"，
-    再调用 tail_segment_verdict 做判定。
-
-    参数:
-      codes: 股票代码列表
-      poll_interval: 采样间隔（秒），默认10秒
-      tail_window: 尾段窗口大小（取最后N次快照的差值），默认2
-
-    返回:
-      CloseAuctionResult 列表
+    收盘集合竞价监控 + 完整分析（14:57-15:00）
+    与早盘报告走完全一样的分析流程：策略池→频次→筹码判断→MACD→HTML报告
     """
     from datetime import datetime as _dt
     import time as _time
@@ -1666,7 +1621,6 @@ def close_auction_monitor(codes: list[str], poll_interval: int = 10,
     print(f"\n{'═'*56}")
     print(f"  📊 收盘集合竞价监控（14:57-15:00）")
     print(f"  监控 {len(codes)} 只股票，每 {poll_interval} 秒采样")
-    print(f"  尾段窗口: 最后 {tail_window} 次快照差值")
     print(f"{'═'*56}\n")
 
     # 检查时间窗口
@@ -1685,16 +1639,15 @@ def close_auction_monitor(codes: list[str], poll_interval: int = 10,
 
     print(f"  🚀 开始采集 @ {_dt.now().strftime('%H:%M:%S')}")
 
-    # 采集快照
-    all_snapshots: dict[str, list[CloseAuctionSnapshot]] = {c: [] for c in codes}
+    # ---- 采集快照 ----
+    all_snapshots: dict[str, list] = {c: [] for c in codes}
     session = _build_session()
 
     while True:
         now = _dt.now()
         if now.hour >= 15:
-            break  # 15:00 结束
+            break
 
-        # 批量获取行情
         quotes = fetch_quotes_batch(codes, session=session)
         ts = now.strftime('%H:%M:%S')
 
@@ -1702,67 +1655,276 @@ def close_auction_monitor(codes: list[str], poll_interval: int = 10,
             q = quotes.get(code, {})
             if not q:
                 continue
-            snap = CloseAuctionSnapshot(
-                time=ts,
-                price=float(q.get("price", 0)),
-                bid1_v=int(q.get("bid1_v", 0)),
-                ask1_v=int(q.get("ask1_v", 0)),
-                volume=int(q.get("volume", 0)),
-                amount=float(q.get("amount", 0)),
-            )
-            all_snapshots[code].append(snap)
+            all_snapshots[code].append({
+                "time": ts,
+                "price": float(q.get("price", 0)),
+                "bid1_v": int(q.get("bid1_v", 0)),
+                "ask1_v": int(q.get("ask1_v", 0)),
+                "volume": int(q.get("volume", 0)),
+                "amount": float(q.get("amount", 0)),
+                "prev_close": float(q.get("prev_close", 0)),
+                "name": q.get("name", ""),
+            })
 
-        print(f"  ⏱ {ts} | 已采 {len(all_snapshots[codes[0]])} 次快照")
+        snap_count = len(all_snapshots[codes[0]]) if codes else 0
+        print(f"  ⏱ {ts} | 已采 {snap_count} 次快照")
         _time.sleep(poll_interval)
 
     print(f"\n  ✅ 采集结束 @ {_dt.now().strftime('%H:%M:%S')}")
 
-    # 分析每个股票
-    results = []
+    # ---- 构建分析数据（与早盘流程一致）----
+    print("📊 构建收盘竞价分析数据...")
+
+    # 获取K线（用于MACD和技术池）
+    print("📊 获取K线数据...")
+    klines_map, kline120_map = fetch_all_klines_async(codes, days=1000, concurrency=100)
+
+    # 获取详情（市值/量比/换手率）
+    quotes_final = fetch_quotes_batch(codes, session=session)
+    details = fetch_stock_details(codes, session, quotes_ref=quotes_final)
+
+    # 获取板块数据
+    sectors = fetch_sectors(session)
+    sector_klines = {}
+    for sname, sdata in sectors.items():
+        scode = sdata.get("code", "")
+        if scode:
+            try:
+                sk = fetch_sector_kline(scode, days=60, session=session)
+                if sk:
+                    sector_klines[scode] = sk
+            except Exception:
+                pass
+
+    # 构建候选股票列表（模拟早盘的 all_candidates）
+    all_candidates = []
     for code in codes:
         snaps = all_snapshots.get(code, [])
         if len(snaps) < 2:
             print(f"  ⚠️ {code} 快照不足（{len(snaps)}次），跳过")
             continue
 
-        # 尾段 = 最后 tail_window 次快照的差值
-        tail_snaps = snaps[-tail_window:]
-        tail_bid_delta = tail_snaps[-1].bid1_v - tail_snaps[0].bid1_v
-        tail_ask_delta = tail_snaps[-1].ask1_v - tail_snaps[0].ask1_v
-        tail_vol_delta = tail_snaps[-1].volume - tail_snaps[0].volume
+        last = snaps[-1]
+        first = snaps[0]
+        prev_close = last["prev_close"]
+        close_price = last["price"]
+        if prev_close <= 0 or close_price <= 0:
+            continue
 
-        # 全程 = 第一次 → 最后一次
-        total_bid_delta = snaps[-1].bid1_v - snaps[0].bid1_v
-        total_ask_delta = snaps[-1].ask1_v - snaps[0].ask1_v
-        total_vol_delta = snaps[-1].volume - snaps[0].volume
+        gap = (close_price - prev_close) / prev_close * 100
+        close_auction_vol = max(last["volume"] - first["volume"], 0)
+        bid1_v = last["bid1_v"]
+        ask1_v = last["ask1_v"]
 
-        # 收盘价涨跌幅
-        close_price = snaps[-1].price
-        # 从腾讯接口拿昨收
-        quotes = fetch_quotes_batch([code], session=session)
-        q = quotes.get(code, {})
-        prev_close = float(q.get("prev_close", 0))
-        gap = (close_price - prev_close) / prev_close * 100 if prev_close > 0 else 0
+        # 查板块信息
+        sname = "未知"
+        limit_cnt = 0
+        for sn, sd in sectors.items():
+            members = sd.get("members", [])
+            if code in members:
+                sname = sn
+                limit_cnt = sd.get("limit_count", 0)
+                break
 
-        # 尾段判定：用尾段买一量增量作为 buy_vol，卖一量增量作为 sell_vol
-        # 增量为正说明尾段在加仓/加卖，为负说明在撤单
-        buy_vol = max(tail_bid_delta, 0)   # 尾段买一增加量
-        sell_vol = max(tail_ask_delta, 0)  # 尾段卖一增加量
-        is_limit_up = gap >= 9.5
+        q = quotes_final.get(code, {})
+        em = details.get(code, {})
 
-        # vol = 收盘竞价期间搓合量增量（14:57→15:00 的成交量）
-        close_auction_vol = max(snaps[-1].volume - snaps[0].volume, 0)
+        all_candidates.append({
+            "code": code,
+            "name": last["name"] or q.get("name", ""),
+            "symbol": ("sh" if code.startswith(("6", "9")) else "sz") + code,
+            "price": close_price,
+            "prev_close": prev_close,
+            "open_price": close_price,  # 收盘竞价用收盘价替代开盘价
+            "auction_gain": round(gap, 2),
+            "auction_vol": close_auction_vol,
+            "volume": close_auction_vol,
+            "volume_shares": q.get("volume", 0) * 100 if q.get("volume", 0) else 0,
+            "market_cap_yi": em.get("market_cap_yi", 0) or q.get("market_cap_yi", 0),
+            "turnover_sina": q.get("turnover", 0),
+            "sector": sname,
+            "sector_code": "",
+            "sector_limit_count": limit_cnt,
+            # 收盘竞价特有数据
+            "bid1_v": bid1_v,
+            "ask1_v": ask1_v,
+            "tail_bid_delta": snaps[-1]["bid1_v"] - snaps[-tail_window]["bid1_v"] if len(snaps) >= tail_window else 0,
+            "tail_ask_delta": snaps[-1]["ask1_v"] - snaps[-tail_window]["ask1_v"] if len(snaps) >= tail_window else 0,
+            "total_bid_delta": snaps[-1]["bid1_v"] - snaps[0]["bid1_v"],
+            "total_ask_delta": snaps[-1]["ask1_v"] - snaps[0]["ask1_v"],
+        })
 
+    if not all_candidates:
+        print("❌ 无有效候选股票")
+        return []
+
+    print(f"  候选股票: {len(all_candidates)} 只")
+
+    # ---- 构建 tencent_map ----
+    tencent_map = {}
+    for c in all_candidates:
+        code = c["code"]
+        q = quotes_final.get(code, {})
+        em = details.get(code, {})
+        tencent_map[code] = {
+            "volume": c["auction_vol"],
+            "buy_vol": q.get("buy_vol", 0),
+            "sell_vol": q.get("sell_vol", 0),
+            "bid1_v": c["bid1_v"],
+            "ask1_v": c["ask1_v"],
+            "amount": q.get("amount", 0),
+            "turnover": q.get("turnover", 0),
+            "amplitude": q.get("amplitude", 0),
+            "market_cap_yi": em.get("market_cap_yi", 0) or q.get("market_cap_yi", 0),
+            "volume_ratio_api": q.get("volume_ratio_api", 0) or em.get("volume_ratio", 0),
+        }
+
+    # ---- 策略池筛选（与早盘一致）----
+    print("📊 执行策略池筛选...")
+    final = []
+    for c in all_candidates:
+        code = c["code"]
+        klines = klines_map.get(code, [])
+        tc = tencent_map.get(code, {})
+        em = details.get(code, {})
+
+        # 量价池
+        ok_vp, reason_vp = pool_volume_price(c, tc, em, klines=klines)
+        # 趋势池
+        ok_trend, reason_trend = pool_trend(c, klines, tc=tc, em=em)
+        # 技术池
+        ok_tech, reason_tech = pool_technical(code, klines, name=c.get("name", ""),
+                                              price=c["price"], market_cap_yi=c.get("market_cap_yi", 0),
+                                              sector=c.get("sector", ""), sector_code=c.get("sector_code", ""),
+                                              kline120_map=kline120_map, sector_klines=sector_klines)
+
+        passed_pools = []
+        if ok_vp:
+            passed_pools.append("量价池")
+        if ok_trend:
+            passed_pools.append("趋势池")
+        if ok_tech:
+            passed_pools.append("技术池")
+
+        if not passed_pools:
+            continue
+
+        c["passed_pools"] = passed_pools
+        c["change_pct"] = c["auction_gain"]
+        c["tech_pool_pass"] = ok_tech
+        c["tech_pool_reason"] = reason_tech if not ok_tech else ""
+        c["trend_pool_pass"] = ok_trend
+        c["vp_pool_pass"] = ok_vp
+
+        # MACD技术指标
+        if klines and len(klines) >= 60:
+            try:
+                closes = [float(k.get("close", 0)) for k in klines]
+                ema12 = _ema(closes, 12)
+                ema26 = _ema(closes, 26)
+                dif = [a - b for a, b in zip(ema12, ema26)]
+                dea = _ema(dif, 9)
+                macd_bar = [(d - e) * 2 for d, e in zip(dif, dea)]
+                c["macd_dif"] = round(dif[-1], 3) if dif else 0
+                c["macd_dea"] = round(dea[-1], 3) if dea else 0
+                c["macd_bar"] = round(macd_bar[-1], 3) if macd_bar else 0
+                c["macd_trend"] = "↑" if len(macd_bar) >= 2 and macd_bar[-1] > macd_bar[-2] else "↓"
+            except Exception:
+                pass
+
+        final.append(c)
+
+    if not final:
+        print("❌ 策略池过滤后无股票剩余")
+        return []
+
+    print(f"  初选池: {len(final)} 只")
+
+    # ---- 抢筹/出货深度分析 + 频次统计（与早盘一致）----
+    print("📊 执行抢筹/出货深度分析...")
+    for c in final:
+        code = c["code"]
+        tc = tencent_map.get(code, {})
+        em = details.get(code, {})
+
+        c["auction_price"] = c["prev_close"]
+        c["price_0926"] = c["price"]  # 收盘价
+        base_price = c["prev_close"]
+        c["chg_0926"] = round((c["price"] - base_price) / base_price * 100, 2) if base_price > 0 else 0
+
+        auction_vol = c.get("auction_vol", c["volume"])
+        yesterday_vol = c.get("volume_shares", 0) // 100 if c.get("volume_shares", 0) > 0 else 1
+        c["comp_ratio"] = round(auction_vol / yesterday_vol * 100, 1) if yesterday_vol > 0 else 0
+
+        buy_vol = c.get("bid1_v", 0)
+        sell_vol = c.get("ask1_v", 0)
+        c["remaining_rate"] = round(buy_vol / (buy_vol + sell_vol) * 100, 1) if (buy_vol + sell_vol) > 0 else 50.0
+
+        chg = c["auction_gain"]
+        vr = c.get("volume_ratio", 0)
+        rr = c["remaining_rate"]
+        cr = c.get("comp_ratio", 0)
+
+        # 频次分析（与早盘一致）
+        freq_signals = []
+        freq = 0
+        if vr >= 8:
+            freq += 1; freq_signals.append("量比≥8")
+        if chg >= 7:
+            freq += 1; freq_signals.append("涨幅≥7%")
+        if rr >= 70:
+            freq += 1; freq_signals.append("剩余率≥70%")
+        if cr >= 5:
+            freq += 1; freq_signals.append("竞昨比≥5%")
+        if c.get("sector_limit_count", 0) >= 5:
+            freq += 1; freq_signals.append("板块涨停≥5")
+        if len(c.get("passed_pools", [])) >= 3:
+            freq += 1; freq_signals.append("多池共振")
+
+        c["frequency"] = freq
+        c["freq_signals"] = freq_signals
+
+        # 抢筹/出货综合判断（与早盘一致）
+        score = 0
+        if chg >= 9.5: score += 3
+        elif chg >= 7: score += 2
+        elif chg >= 5: score += 1
+        if vr >= 15: score += 3
+        elif vr >= 10: score += 2
+        elif vr >= 8: score += 1
+        if rr >= 75: score += 3
+        elif rr >= 65: score += 2
+        elif rr >= 55: score += 1
+        elif rr < 35: score -= 2
+        elif rr < 45: score -= 1
+        if cr >= 10: score += 2
+        elif cr >= 7: score += 1
+        if freq >= 5: score += 3
+        elif freq >= 4: score += 2
+        elif freq >= 3: score += 1
+        if len(c.get("passed_pools", [])) >= 4: score += 2
+        elif len(c.get("passed_pools", [])) >= 3: score += 1
+        if chg >= 9.5:
+            if vr < 5: score -= 3
+            if rr < 50: score -= 2
+            if freq < 2: score -= 2
+
+        c["verdict"] = "真实抢筹" if score >= 9 else ("疑似出货" if score <= 0 else "正常")
+
+        # 尾段竞价判定（与早盘一致，用收盘竞价数据）
+        is_limit_up = chg >= 9.5
         ts_score, ts_verdict, ts_signals = tail_segment_verdict(
-            gap=gap,
-            vol=close_auction_vol,
-            vol_min=500,  # 收盘竞价3分钟，阈值降低到500手
-            buy_vol=buy_vol,
-            sell_vol=sell_vol,
+            gap=chg, vol=auction_vol,
+            buy_vol=buy_vol, sell_vol=sell_vol,
             is_limit_up=is_limit_up,
+            vol_min=500,
         )
 
-        # 补充额外信号
+        # 补充收盘竞价特有信号
+        tail_bid_delta = c.get("tail_bid_delta", 0)
+        tail_ask_delta = c.get("tail_ask_delta", 0)
+        total_bid_delta = c.get("total_bid_delta", 0)
+        total_ask_delta = c.get("total_ask_delta", 0)
         if tail_bid_delta < 0:
             ts_signals.append(f"⚠️ 尾段买一撤单 {tail_bid_delta}手")
         if tail_ask_delta < 0:
@@ -1772,130 +1934,62 @@ def close_auction_monitor(codes: list[str], poll_interval: int = 10,
         elif total_ask_delta > total_bid_delta * 2:
             ts_signals.append(f"🔴 全程卖盘主导 (卖+{total_ask_delta} vs 买+{total_bid_delta})")
 
-        result = CloseAuctionResult(
-            code=code,
-            name=q.get("name", code),
-            prev_close=prev_close,
-            close_price=close_price,
-            tail_bid_delta=tail_bid_delta,
-            tail_ask_delta=tail_ask_delta,
-            tail_vol_delta=tail_vol_delta,
-            total_bid_delta=total_bid_delta,
-            total_ask_delta=total_ask_delta,
-            total_vol_delta=total_vol_delta,
-            gap=round(gap, 2),
-            tail_score=ts_score,
-            tail_verdict=ts_verdict,
-            tail_signals=ts_signals,
-            snapshots=snaps,
-        )
-        results.append(result)
+        c["tail_score"] = ts_score
+        c["tail_verdict"] = ts_verdict
+        c["tail_signals"] = ts_signals
 
-    # 输出结果
-    print(f"\n{'─'*72}")
-    print(f"  📊 收盘竞价尾段判定结果")
-    print(f"{'─'*72}")
-    print(f"  {'代码':<8} {'名称':<8} {'收盘':>7} {'涨幅':>7} {'尾段买':>8} {'尾段卖':>8} {'全程买':>8} {'全程卖':>8} {'判定':<8} {'得分':>4}")
-    print(f"  {'─'*8} {'─'*8} {'─'*7} {'─'*7} {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*4}")
-    for r in results:
-        icon = "🟢" if r.tail_verdict == "看多" else "🔴"
-        print(f"  {r.code:<8} {r.name:<8} {r.close_price:>7.2f} {r.gap:>+6.2f}% {r.tail_bid_delta:>+8} {r.tail_ask_delta:>+8} {r.total_bid_delta:>+8} {r.total_ask_delta:>+8} {icon}{r.tail_verdict:<6} {r.tail_score:>4}")
-        for sig in r.tail_signals:
+        c["strategy"] = _compute_screen_strategy(c)
+
+    # ---- 按频次排序，保留前10 ----
+    final.sort(key=lambda x: (
+        -x.get("frequency", 0),
+        -x.get("auction_gain", 0),
+        -x.get("sector_limit_count", 0),
+    ))
+    if len(final) > 10:
+        final = final[:10]
+
+    # ---- 龙头股识别 ----
+    sector_groups = {}
+    for c in final:
+        sn = c.get("sector", "未知")
+        sector_groups.setdefault(sn, []).append(c)
+
+    leader_codes = set()
+    for sn, stocks in sector_groups.items():
+        best = max(stocks, key=lambda s: (s.get("frequency", 0), s.get("auction_gain", 0)))
+        best["is_leader"] = True
+        best["leader_count"] = len(stocks)
+        leader_codes.add(best["code"])
+    for c in final:
+        if c["code"] not in leader_codes:
+            c["is_leader"] = False
+            c["leader_count"] = 0
+
+    # ---- 输出结果（与早盘格式一致）----
+    print(f"\n{'─'*90}")
+    print(f"  📊 收盘竞价分析结果")
+    print(f"{'─'*90}")
+    for i, s in enumerate(final, 1):
+        chg = s.get("auction_gain", 0)
+        ts_icon = "🟢" if s.get("tail_verdict") == "看多" else "🔴"
+        pools = "/".join(s.get("passed_pools", []))
+        print(f"  {i:>2}. {s['code']} {s['name']:<8} {s.get('sector',''):<8} "
+              f"涨幅:{chg:+.2f}% 剩余率:{s.get('remaining_rate',0):.1f}% "
+              f"筹码:{s.get('verdict','正常'):<6} 频次:{s.get('frequency',0)} "
+              f"尾段:{ts_icon}{s.get('tail_verdict','')}{s.get('tail_score',0):+d} "
+              f"策略池:[{pools}] 策略:{s.get('strategy','')}")
+        for sig in s.get("tail_signals", []):
             print(f"    {sig}")
-    print(f"{'─'*72}")
+    print(f"{'─'*90}")
 
-    # 生成 HTML 报告
+    # ---- 生成HTML报告（复用早盘的 save_screen_html）----
     if not html_path:
         html_path = "close_auction_report.html"
-    save_close_auction_html(results, html_path)
-    print(f"\n📄 报告: {html_path}")
+    path = save_screen_html(final, [], html_path)
+    print(f"\n📄 报告: {path}")
 
-    return results
-
-
-def save_close_auction_html(results: list[CloseAuctionResult], path: str) -> str:
-    """保存收盘竞价尾段判定HTML报告"""
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    rows = ""
-    for i, r in enumerate(results, 1):
-        chg_color = "#f85149" if r.gap > 0 else ("#3fb950" if r.gap < 0 else "#c9d1d9")
-
-        # 尾段判定颜色
-        if r.tail_verdict == "看多":
-            ts_color = "#f85149"
-            ts_verdict_html = "🟢看多"
-        else:
-            ts_color = "#3fb950"
-            ts_verdict_html = "🔴不看多"
-
-        # 尾段买/卖颜色
-        bid_color = "#f85149" if r.tail_bid_delta > 0 else ("#3fb950" if r.tail_bid_delta < 0 else "#c9d1d9")
-        ask_color = "#3fb950" if r.tail_ask_delta > 0 else ("#f85149" if r.tail_ask_delta < 0 else "#c9d1d9")
-        total_bid_color = "#f85149" if r.total_bid_delta > 0 else ("#3fb950" if r.total_bid_delta < 0 else "#c9d1d9")
-        total_ask_color = "#3fb950" if r.total_ask_delta > 0 else ("#f85149" if r.total_ask_delta < 0 else "#c9d1d9")
-
-        # 信号列表
-        sigs_html = "<br>".join(html_module.escape(s) for s in r.tail_signals)
-
-        rows += f"""<tr>
-<td>{i}</td>
-<td>{html_module.escape(r.code)}</td>
-<td style="text-align:left;font-weight:600">{html_module.escape(r.name)}</td>
-<td>{r.prev_close:.2f}</td>
-<td>{r.close_price:.2f}</td>
-<td style="color:{chg_color};font-weight:600">{r.gap:+.2f}%</td>
-<td style="color:{bid_color};font-weight:600">{r.tail_bid_delta:+d}</td>
-<td style="color:{ask_color};font-weight:600">{r.tail_ask_delta:+d}</td>
-<td style="color:{total_bid_color}">{r.total_bid_delta:+d}</td>
-<td style="color:{total_ask_color}">{r.total_ask_delta:+d}</td>
-<td style="color:{ts_color};font-weight:700">{ts_verdict_html}</td>
-<td style="font-weight:700">{r.tail_score}</td>
-<td style="text-align:left;font-size:11px;line-height:1.6">{sigs_html}</td>
-</tr>"""
-
-    html = f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>收盘竞价 - 尾段判定报告</title>
-<style>
-*{{margin:0;padding:0;box-sizing:border-box}}
-body{{font-family:"Microsoft YaHei","PingFang SC",sans-serif;background:#0d1117;color:#c9d1d9;padding:16px}}
-.hd{{text-align:center;padding:16px 0}}
-.hd h1{{font-size:20px;color:#58a6ff}}
-.hd .t{{color:#8b949e;font-size:12px;margin-top:4px}}
-.tbl-wrap{{overflow-x:auto;margin:0 auto;max-width:1400px}}
-table{{width:100%;border-collapse:collapse;font-size:13px;white-space:nowrap}}
-th{{background:#161b22;color:#8b949e;font-weight:600;padding:8px 10px;text-align:center;border-bottom:2px solid #30363d;position:sticky;top:0}}
-td{{padding:6px 10px;text-align:center;border-bottom:1px solid #21262d}}
-tr:hover{{background:rgba(88,166,255,.06)}}
-.legend{{text-align:center;margin:12px 0;font-size:12px;color:#8b949e}}
-.legend span{{margin:0 8px}}
-</style></head><body>
-<div class="hd">
-<h1>📊 收盘集合竞价 · 尾段判定报告</h1>
-<div class="t">{now} · 监控 {len(results)} 只股票 · 14:57-15:00 采集</div>
-</div>
-<div class="legend">
-<span>🟢看多 = 尾段买盘增强</span>
-<span>🔴不看多 = 尾段卖盘增强或数据异常</span>
-<span style="color:#58a6ff">尾段 = 最后两次快照差值</span>
-<span style="color:#f0883e">全程 = 14:57→15:00 总差值</span>
-</div>
-<div class="tbl-wrap">
-<table>
-<tr>
-<th>#</th><th>代码</th><th>名称</th><th>昨收</th><th>收盘</th><th>涨幅</th>
-<th>尾段买</th><th>尾段卖</th><th>全程买</th><th>全程卖</th>
-<th>判定</th><th>得分</th><th>信号</th>
-</tr>
-{rows}
-</table>
-</div>
-</body></html>"""
-
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(html)
-    return path
+    return final
 
 
 def analyze(code: str, quote: dict, hist: list[dict]) -> Optional[AuctionResult]:
