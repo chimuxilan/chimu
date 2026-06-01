@@ -1543,7 +1543,7 @@ def tail_segment_verdict(gap: float, vol: int, buy_vol: int, sell_vol: int,
         return -5, "不看多", signals
 
     # 6. jzb指标维度：jzb < 2% → "无人气"
-    if jzb < 2:
+    if jzb is not None and jzb < 2:
         signals.append(f"❌ 无人气 (jzb={jzb:.1f}%<2%)")
         return -6, "不看多", signals
 
@@ -1590,7 +1590,7 @@ def tail_segment_verdict(gap: float, vol: int, buy_vol: int, sell_vol: int,
         signals.append(f"✅ vol={vol:,}>5万 → +1")
 
     # 5. jzb指标计分：3% ≤ jzb ≤ 20%
-    if 3 <= jzb <= 20:
+    if jzb is not None and 3 <= jzb <= 20:
         score += 1
         signals.append(f"✅ jzb={jzb:.1f}%∈[3%,20%] → +1")
 
@@ -1667,9 +1667,15 @@ def close_auction_monitor(codes: list[str], poll_interval: int = 10,
     print(f"  尾段窗口: 最后 {tail_window} 次快照差值")
     print(f"{'═'*56}\n")
 
-    # 等待 14:57 到来
+    # 检查时间窗口
     now = _dt.now()
     target_start = now.replace(hour=14, minute=57, second=0, microsecond=0)
+    target_end = now.replace(hour=15, minute=0, second=0, microsecond=0)
+
+    if now >= target_end:
+        print(f"  ❌ 当前 {now.strftime('%H:%M')}，已过 15:00，收盘竞价已结束")
+        return []
+
     if now < target_start:
         wait_sec = (target_start - now).total_seconds()
         print(f"  ⏳ 等待 14:57 开始...（{int(wait_sec)}秒后启动）")
@@ -1683,7 +1689,7 @@ def close_auction_monitor(codes: list[str], poll_interval: int = 10,
 
     while True:
         now = _dt.now()
-        if now.hour >= 15 and now.minute >= 0:
+        if now.hour >= 15:
             break  # 15:00 结束
 
         # 批量获取行情
@@ -1738,14 +1744,16 @@ def close_auction_monitor(codes: list[str], poll_interval: int = 10,
 
         # 尾段判定：用尾段买一量增量作为 buy_vol，卖一量增量作为 sell_vol
         # 增量为正说明尾段在加仓/加卖，为负说明在撤单
-        # 取绝对值作为量，符号决定方向
         buy_vol = max(tail_bid_delta, 0)   # 尾段买一增加量
         sell_vol = max(tail_ask_delta, 0)  # 尾段卖一增加量
         is_limit_up = gap >= 9.5
 
+        # vol 用全程搓合量（收盘竞价总量），不用尾段差值
+        total_auction_vol = snaps[-1].volume - snaps[0].volume if snaps[-1].volume > snaps[0].volume else snaps[-1].volume
+
         ts_score, ts_verdict, ts_signals = tail_segment_verdict(
             gap=gap,
-            vol=abs(tail_vol_delta),
+            vol=max(total_auction_vol, 0),
             buy_vol=buy_vol,
             sell_vol=sell_vol,
             is_limit_up=is_limit_up,
