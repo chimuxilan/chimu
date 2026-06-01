@@ -178,9 +178,25 @@ def build_stock_pool(strategy_pool, core_sectors):
 
         for stock in stocks:
             sym = stock["symbol"]
+            name = stock["name"]
             if sym in seen:
                 continue
             seen.add(sym)
+
+            # ---- 主板过滤：只保留沪深主板，排除创业板/科创板/北交所 ----
+            # 主板: sh60xxxx(沪主板) sz000xxx/sz001xxx(深主板) sz002xxx/sz003xxx(中小板已并入主板)
+            # 排除: sz300xxx/sz301xxx(创业板) sh688xxx/sh689xxx(科创板) bj8xxxxx/bj4xxxxx(北交所)
+            code = sym.replace("sh", "").replace("sz", "").replace("bj", "")
+            is_main_board = (
+                (sym.startswith("sh") and code.startswith("6")) or      # 沪主板 60xxxx
+                (sym.startswith("sz") and code.startswith("00"))        # 深主板+中小板 000-003
+            )
+            if not is_main_board:
+                continue
+
+            # ---- ST过滤：排除ST、*ST股票 ----
+            if "ST" in name.upper() or "*ST" in name:
+                continue
 
             # 获取K线计算涨幅
             closes = get_stock_kline(sym, datalen=25)
@@ -562,7 +578,7 @@ tr:hover{{background:rgba(255,255,255,.02)}}
 </div>
 
 <h2 class="sec stock">📦 股池 · 策略池1选股</h2>
-<p style="color:#8b949e;font-size:.85em;margin-bottom:12px">入选条件：<b style="color:#ff6b6b">5日≥20%</b> · <b style="color:#ff6b6b">10日≥35%</b> · <b style="color:#ff6b6b">20日≥45%</b> · 来自策略池板块</p>
+<p style="color:#8b949e;font-size:.85em;margin-bottom:12px">入选条件：<b style="color:#ff6b6b">5日≥20%</b> · <b style="color:#ff6b6b">10日≥35%</b> · <b style="color:#ff6b6b">20日≥45%</b> · 来自策略池板块 · <b style="color:#58a6ff">仅主板</b> · <b style="color:#27ae60">非ST</b></p>
 <div class="stock-badge">📦 共 {stock_count} 只 · 其中主线板块 <b style="color:#ff6b6b">{core_stock_count}</b> 只 ⭐</div>
 
 <div class="tabs" style="margin-bottom:0">
@@ -601,7 +617,7 @@ tr:hover{{background:rgba(255,255,255,.02)}}
 <p><b>综合评分 =</b> 主力净流入排名分 × 0.4 + 5日涨幅排名分 × 0.3 + 10日涨幅排名分 × 0.3</p>
 <p><b>核心主线：</b>综合得分 TOP 5 · <b>强势支线：</b>6-12名 · <b>潜力支线：</b>13-20名</p>
 <p><b>🎯 策略池：</b>5日涨幅≥20% + 10日涨幅≥35% + 20日涨幅≥45% + 主力资金净流入>0</p>
-<p><b>📦 股池：</b>来自策略池板块的成分股，满足策略池1条件即入选 · ⭐标记为核心主线板块股票</p>
+<p><b>📦 股池：</b>来自策略池板块的成分股，满足策略池1条件即入选 · ⭐标记为核心主线板块股票 · 仅主板 · 排除ST</p>
 <p style="margin-top:6px">⚠️ 数据仅供参考，不构成投资建议。主线判定需结合政策面、消息面综合判断。</p>
 </div>
 </div>
