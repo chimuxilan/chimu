@@ -1921,8 +1921,10 @@ def close_auction_monitor(codes: list[str] = None, poll_interval: int = 10,
 
     # ---- 构建分析数据（与早盘流程一致）----
     print("📊 构建收盘竞价分析数据...")
+    print("  🔧 [v3.1] 板块K线改为市值加权聚合，零额外API请求")
 
     # 1. 先获取板块数据（IP干净时成功率最高）
+    print("  🔧 [v3.1] 步骤1: 先获取板块列表（重排顺序，避免限流）")
     sectors = fetch_sectors(session)
 
     # 2. 获取K线（用于MACD和技术池）— 东财重负载请求
