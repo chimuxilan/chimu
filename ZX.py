@@ -156,14 +156,15 @@ def filter_strategy_pool(ranked):
 
 def build_stock_pool(strategy_pool, core_sectors):
     """
-    从策略池板块中提取成分股，筛选满足策略池1条件的个股
-    优选标记主线板块的股票
+    从策略池板块中提取成分股，按三个涨幅维度分别筛选：
+    - pool_5d:  5日涨幅 ≥ 20%
+    - pool_10d: 10日涨幅 ≥ 35%
+    - pool_20d: 20日涨幅 ≥ 45%
+    仅保留主板、非ST
     """
-    seen = set()  # 去重用
-    stock_pool = []
+    seen = set()
+    all_stocks = []
     core_sector_names = {s["name"] for s in core_sectors}
-    # 同时把策略池板块也作为"强势板块"标记
-    strategy_sector_names = {s["name"] for s in strategy_pool}
 
     total = len(strategy_pool)
     print(f"\n📡 正在从 {total} 个策略池板块中提取成分股...")
@@ -183,38 +184,25 @@ def build_stock_pool(strategy_pool, core_sectors):
                 continue
             seen.add(sym)
 
-            # ---- 主板过滤：只保留沪深主板，排除创业板/科创板/北交所 ----
-            # 主板: sh60xxxx(沪主板) sz000xxx/sz001xxx(深主板) sz002xxx/sz003xxx(中小板已并入主板)
-            # 排除: sz300xxx/sz301xxx(创业板) sh688xxx/sh689xxx(科创板) bj8xxxxx/bj4xxxxx(北交所)
+            # ---- 主板过滤 ----
             code = sym.replace("sh", "").replace("sz", "").replace("bj", "")
             is_main_board = (
-                (sym.startswith("sh") and code.startswith("6")) or      # 沪主板 60xxxx
-                (sym.startswith("sz") and code.startswith("00"))        # 深主板+中小板 000-003
+                (sym.startswith("sh") and code.startswith("6")) or
+                (sym.startswith("sz") and code.startswith("00"))
             )
             if not is_main_board:
                 continue
 
-            # ---- ST过滤：排除ST、*ST股票 ----
+            # ---- ST过滤 ----
             if "ST" in name.upper() or "*ST" in name:
                 continue
 
-            # 获取K线计算涨幅
             closes = get_stock_kline(sym, datalen=25)
             chg_5d, chg_10d, chg_20d = calc_changes(closes)
 
-            if chg_5d is None or chg_10d is None:
+            if chg_5d is None:
                 continue
 
-            # 策略池1条件：5日≥20% & 10日≥35% & 20日≥45%
-            # 个股用板块领涨股的阈值略有放宽，因为个股波动更大
-            # 但用户要求"满足策略池1就入选"，所以严格按条件
-            if chg_5d < 20 or chg_10d < 35:
-                continue
-            if chg_20d is not None and chg_20d < 45:
-                continue
-
-            # 资金流入判断：用成交额正向代理（板块已满足净流入条件）
-            # 个股当日涨幅>0视为有资金推动
             stock_info = {
                 "symbol": sym,
                 "name": stock["name"],
@@ -231,21 +219,26 @@ def build_stock_pool(strategy_pool, core_sectors):
                 "is_core": is_core,
                 "sector_score": sector.get("total_score", 0),
             }
-            stock_pool.append(stock_info)
+            all_stocks.append(stock_info)
 
-        # 控制频率
         if (idx + 1) % 5 == 0:
             time.sleep(0.5)
 
-    # 排序：主线板块优先 → 综合涨幅（5日*0.3+10日*0.3+20日*0.4）降序
-    for s in stock_pool:
-        chg_20d_val = s["chg_20d"] if s["chg_20d"] is not None else 0
-        s["composite"] = round(
-            s["chg_5d"] * 0.3 + s["chg_10d"] * 0.3 + chg_20d_val * 0.4, 2
-        )
-    stock_pool.sort(key=lambda x: (x["is_core"], x["composite"]), reverse=True)
+    # 按三个维度分别筛选，每个维度独立排序
+    def sort_pool(lst):
+        for s in lst:
+            c20 = s["chg_20d"] if s["chg_20d"] is not None else 0
+            s["composite"] = round(s["chg_5d"] * 0.3 + s["chg_10d"] * 0.3 + c20 * 0.4, 2)
+        lst.sort(key=lambda x: (x["is_core"], x["composite"]), reverse=True)
+        return lst
 
-    return stock_pool
+    pool_5d = sort_pool([s for s in all_stocks if s["chg_5d"] >= 20])
+    pool_10d = sort_pool([s for s in all_stocks if s["chg_10d"] is not None and s["chg_10d"] >= 35])
+    pool_20d = sort_pool([s for s in all_stocks if s["chg_20d"] is not None and s["chg_20d"] >= 45])
+
+    print(f"  ✅ 5日≥20%: {len(pool_5d)} 只 | 10日≥35%: {len(pool_10d)} 只 | 20日≥45%: {len(pool_20d)} 只")
+
+    return pool_5d, pool_10d, pool_20d
 
 
 def analyze():
@@ -329,12 +322,11 @@ def analyze():
     strategy_pool = filter_strategy_pool(ranked)
     print(f"  ✅ 策略池入选: {len(strategy_pool)} 个板块")
 
-    # 6. 构建股池
+    # 6. 构建股池（三个维度）
     core_sectors = [s for s in ranked if s["level"] == "🔴 核心主线"]
-    stock_pool = build_stock_pool(strategy_pool, core_sectors)
-    print(f"\n  ✅ 股池入选: {len(stock_pool)} 只股票")
+    pool_5d, pool_10d, pool_20d = build_stock_pool(strategy_pool, core_sectors)
 
-    return ranked, strategy_pool, stock_pool
+    return ranked, strategy_pool, pool_5d, pool_10d, pool_20d
 
 
 def fmt_amount(val):
@@ -358,7 +350,7 @@ def fmt_mktcap(val):
         return f"{val:.0f}"
 
 
-def generate_html(ranked, strategy_pool, stock_pool, output_path):
+def generate_html(ranked, strategy_pool, pool_5d, pool_10d, pool_20d, output_path):
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     core = [s for s in ranked if s["level"] == "🔴 核心主线"]
     strong = [s for s in ranked if s["level"] == "🟠 强势支线"]
@@ -449,7 +441,14 @@ def generate_html(ranked, strategy_pool, stock_pool, output_path):
 <th>来源板块</th><th>综合分</th>
 </tr></thead>"""
 
-    stock_rows = make_stock_rows(stock_pool) if stock_pool else '<tr><td colspan="11" style="text-align:center;padding:20px;color:#8b949e">暂无符合条件的股票</td></tr>'
+    def make_stock_table(items, empty_msg="暂无符合条件的股票"):
+        if not items:
+            return f'<tr><td colspan="11" style="text-align:center;padding:20px;color:#8b949e">{empty_msg}</td></tr>'
+        return make_stock_rows(items)
+
+    stock_5d_rows = make_stock_table(pool_5d, "暂无5日涨幅≥20%的股票")
+    stock_10d_rows = make_stock_table(pool_10d, "暂无10日涨幅≥35%的股票")
+    stock_20d_rows = make_stock_table(pool_20d, "暂无20日涨幅≥45%的股票")
 
     # ---- 板块排名表 ----
     def make_rows(items, cls=""):
@@ -498,8 +497,12 @@ def generate_html(ranked, strategy_pool, stock_pool, output_path):
 <th>净占比</th><th>领涨股</th><th>流入#</th>
 </tr></thead>"""
 
-    stock_count = len(stock_pool)
-    core_stock_count = len([s for s in stock_pool if s["is_core"]])
+    count_5d = len(pool_5d)
+    count_10d = len(pool_10d)
+    count_20d = len(pool_20d)
+    core_5d = len([s for s in pool_5d if s["is_core"]])
+    core_10d = len([s for s in pool_10d if s["is_core"]])
+    core_20d = len([s for s in pool_20d if s["is_core"]])
 
     html = f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -573,20 +576,32 @@ tr:hover{{background:rgba(255,255,255,.02)}}
   <div class="it"><div class="n" style="color:#e67e22">{len(strong)}</div><div class="l">强势支线</div></div>
   <div class="it"><div class="n" style="color:#f1c40f">{len(potential)}</div><div class="l">潜力支线</div></div>
   <div class="it"><div class="n" style="color:#ff6b6b">{len(strategy_pool)}</div><div class="l">🎯 策略池</div></div>
-  <div class="it"><div class="n" style="color:#58a6ff">{stock_count}</div><div class="l">📦 股池</div></div>
+  <div class="it"><div class="n" style="color:#58a6ff">{count_5d}</div><div class="l">5日≥20%</div></div>
+  <div class="it"><div class="n" style="color:#58a6ff">{count_10d}</div><div class="l">10日≥35%</div></div>
+  <div class="it"><div class="n" style="color:#58a6ff">{count_20d}</div><div class="l">20日≥45%</div></div>
   <div class="it"><div class="n" style="color:#58a6ff">{len(ranked)}</div><div class="l">分析总数</div></div>
 </div>
 
 <h2 class="sec stock">📦 股池 · 策略池1选股</h2>
 <p style="color:#8b949e;font-size:.85em;margin-bottom:12px">入选条件：<b style="color:#ff6b6b">5日≥20%</b> · <b style="color:#ff6b6b">10日≥35%</b> · <b style="color:#ff6b6b">20日≥45%</b> · 来自策略池板块 · <b style="color:#58a6ff">仅主板</b> · <b style="color:#27ae60">非ST</b></p>
-<div class="stock-badge">📦 共 {stock_count} 只 · 其中主线板块 <b style="color:#ff6b6b">{core_stock_count}</b> 只 ⭐</div>
 
 <div class="tabs" style="margin-bottom:0">
-  <div class="tab active" onclick="sw('stock')">📦 股池（{stock_count}）</div>
-  <div class="tab" onclick="sw('stock-core')">⭐ 主线股（{core_stock_count}）</div>
+  <div class="tab active" onclick="sw('s5')">📈 5日≥20%（{count_5d}）</div>
+  <div class="tab" onclick="sw('s10')">📈 10日≥35%（{count_10d}）</div>
+  <div class="tab" onclick="sw('s20')">📈 20日≥45%（{count_20d}）</div>
 </div>
-<div id="t-stock" class="tc active" style="border-top:none;border-radius:0 0 10px 10px"><table>{stock_thead}<tbody>{stock_rows}</tbody></table></div>
-<div id="t-stock-core" class="tc"><table>{stock_thead}<tbody>{make_stock_rows([s for s in stock_pool if s['is_core']])}</tbody></table></div>
+<div id="t-s5" class="tc active" style="border-top:none;border-radius:0 0 10px 10px">
+  <div class="stock-badge">📈 5日涨幅≥20% · 共 {count_5d} 只 · 主线 <b style="color:#ff6b6b">{core_5d}</b> 只 ⭐</div>
+  <table>{stock_thead}<tbody>{stock_5d_rows}</tbody></table>
+</div>
+<div id="t-s10" class="tc">
+  <div class="stock-badge">📈 10日涨幅≥35% · 共 {count_10d} 只 · 主线 <b style="color:#ff6b6b">{core_10d}</b> 只 ⭐</div>
+  <table>{stock_thead}<tbody>{stock_10d_rows}</tbody></table>
+</div>
+<div id="t-s20" class="tc">
+  <div class="stock-badge">📈 20日涨幅≥45% · 共 {count_20d} 只 · 主线 <b style="color:#ff6b6b">{core_20d}</b> 只 ⭐</div>
+  <table>{stock_thead}<tbody>{stock_20d_rows}</tbody></table>
+</div>
 
 <h2 class="sec pool">🎯 策略池 · 强势板块</h2>
 <p style="color:#8b949e;font-size:.85em;margin-bottom:12px">筛选条件：<b style="color:#ff6b6b">5日≥20%</b> · <b style="color:#ff6b6b">10日≥35%</b> · <b style="color:#ff6b6b">20日≥45%</b> · <b style="color:#27ae60">主力净流入>0</b></p>
@@ -617,19 +632,23 @@ tr:hover{{background:rgba(255,255,255,.02)}}
 <p><b>综合评分 =</b> 主力净流入排名分 × 0.4 + 5日涨幅排名分 × 0.3 + 10日涨幅排名分 × 0.3</p>
 <p><b>核心主线：</b>综合得分 TOP 5 · <b>强势支线：</b>6-12名 · <b>潜力支线：</b>13-20名</p>
 <p><b>🎯 策略池：</b>5日涨幅≥20% + 10日涨幅≥35% + 20日涨幅≥45% + 主力资金净流入>0</p>
-<p><b>📦 股池：</b>来自策略池板块的成分股，满足策略池1条件即入选 · ⭐标记为核心主线板块股票 · 仅主板 · 排除ST</p>
+<p><b>📦 股池：</b>来自策略池板块的成分股，按涨幅维度分三列展示 · ⭐标记为核心主线板块股票 · 仅主板 · 排除ST</p>
 <p style="margin-top:6px">⚠️ 数据仅供参考，不构成投资建议。主线判定需结合政策面、消息面综合判断。</p>
 </div>
 </div>
 <script>
-function sw(n){{
-  var tabs=event.target.parentElement.querySelectorAll('.tab');
-  tabs.forEach(t=>t.classList.remove('active'));
-  event.target.classList.add('active');
-  var p=event.target.parentElement;
-  while(p&&p.className!=='wrap')p=p.parentElement;
-  if(p){{p.querySelectorAll('.tc').forEach(t=>{{if(t.id==='t-'+n)t.classList.add('active');else t.classList.remove('active');}})}}
-}}
+function sw(n){
+  var t=event.target;
+  var group=t.parentElement;
+  group.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
+  t.classList.add('active');
+  var container=group.nextElementSibling;
+  while(container&&container.classList.contains('tc')){
+    container.classList.remove('active');
+    container=container.nextElementSibling;
+  }
+  document.getElementById('t-'+n).classList.add('active');
+}
 </script>
 </body>
 </html>"""
@@ -639,7 +658,7 @@ function sw(n){{
 
 
 def main():
-    ranked, strategy_pool, stock_pool = analyze()
+    ranked, strategy_pool, pool_5d, pool_10d, pool_20d = analyze()
     if not ranked:
         print("❌ 分析失败")
         return
@@ -665,22 +684,27 @@ def main():
     else:
         print("\n⚠️ 策略池无符合条件的板块")
 
-    if stock_pool:
-        print("\n" + "=" * 60)
-        print(f"📦 股池入选股票（共 {len(stock_pool)} 只）:")
-        print("=" * 60)
-        for i, s in enumerate(stock_pool):
-            core_mark = "⭐" if s["is_core"] else "  "
-            chg_20d_str = f" | 20日:{s['chg_20d']:+6.2f}%" if s.get("chg_20d") is not None else ""
-            print(f"  {core_mark}#{i+1:2d} {s['name']:8s} {s['symbol']:8s} | "
-                  f"5日:{s['chg_5d']:+6.2f}% | 10日:{s['chg_10d']:+6.2f}%{chg_20d_str} | "
-                  f"现价:{s['trade']:.2f} | 来源:{s['from_sector']}")
-    else:
-        print("\n⚠️ 股池无符合条件的股票")
+    def print_stock_pool(title, pool):
+        if pool:
+            print(f"\n{'=' * 60}")
+            print(f"📦 {title}（共 {len(pool)} 只）:")
+            print("=" * 60)
+            for i, s in enumerate(pool):
+                core_mark = "⭐" if s["is_core"] else "  "
+                chg_20d_str = f" | 20日:{s['chg_20d']:+6.2f}%" if s.get("chg_20d") is not None else ""
+                print(f"  {core_mark}#{i+1:2d} {s['name']:8s} {s['symbol']:8s} | "
+                      f"5日:{s['chg_5d']:+6.2f}% | 10日:{s['chg_10d']:+6.2f}%{chg_20d_str} | "
+                      f"现价:{s['trade']:.2f} | 来源:{s['from_sector']}")
+        else:
+            print(f"\n⚠️ {title} 无符合条件的股票")
+
+    print_stock_pool("5日涨幅≥20%", pool_5d)
+    print_stock_pool("10日涨幅≥35%", pool_10d)
+    print_stock_pool("20日涨幅≥45%", pool_20d)
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     output = os.path.join(script_dir, "sector_analysis.html")
-    generate_html(ranked, strategy_pool, stock_pool, output)
+    generate_html(ranked, strategy_pool, pool_5d, pool_10d, pool_20d, output)
     print(f"\n✅ HTML报告已生成: {output}")
 
 
