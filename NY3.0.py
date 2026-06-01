@@ -611,7 +611,8 @@ async def _async_fetch_kline_batch(codes: list[str], days: int = 1000,
 async def _async_fetch_kline_120min_batch(codes: list[str]) -> dict:
     """
     异步批量120分钟K线抓取（与日K线并行，独立session+独立限速器）
-    新浪60分钟K线 → 每2根合并为1根120分钟K线
+    使用东财API直接获取120分钟K线（klt=120），无需从60分钟合并
+    东财限流比新浪宽松，作为主源；新浪作为备源
     """
     timeout = aiohttp.ClientTimeout(total=15, connect=5)
     results = {}
@@ -653,16 +654,23 @@ async def _async_fetch_kline_120min_batch(codes: list[str]) -> dict:
             if time.monotonic() > self.backoff_until:
                 self.current_rate = min(self.base_rate, self.current_rate * 1.05)
 
-    limiter = AdaptiveRateLimiter(base_rate=20, name="新浪120min")
+    limiter = AdaptiveRateLimiter(base_rate=20, name="东财120min")
     conn = aiohttp.TCPConnector(limit=10, limit_per_host=10, ttl_dns_cache=300)
 
     async with aiohttp.ClientSession(connector=conn, timeout=timeout) as sess:
         async def _fetch_one(code):
             nonlocal done_count, fail_count
-            sym = f"sh{code}" if code.startswith("6") else f"sz{code}"
-            url = "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData"
-            params = {"symbol": sym, "scale": "60", "ma": "no", "datalen": 120}
-            headers = {"Referer": "https://finance.sina.com.cn/", "User-Agent": _random_ua(), "Accept": _random_accept()}
+            market = "1" if code.startswith("6") else "0"
+            url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+            params = {
+                "secid": f"{market}.{code}",
+                "fields1": "f1,f2,f3,f4,f5,f6",
+                "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+                "klt": "120", "fqt": "1",
+                "lmt": "60", "end": "20500101",
+                "ut": "fa5fd1943c7b386f172d6893dbbd4dc0",
+            }
+            headers = {"Referer": "https://quote.eastmoney.com/", "User-Agent": _random_ua()}
 
             await limiter.acquire()
             async with semaphore:
@@ -673,24 +681,20 @@ async def _async_fetch_kline_120min_batch(codes: list[str]) -> dict:
                             raise ConnectionAbortedError("429")
                         if resp.status != 200:
                             raise Exception(f"HTTP {resp.status}")
-                        text = await resp.text()
-                        if not text.strip() or text.strip() == "null":
+                        data = await resp.json(content_type=None)
+                        klines_raw = data.get("data", {}).get("klines", [])
+                        if not klines_raw:
                             raise Exception("empty")
-                        m60 = json.loads(text)
-                        if not m60 or len(m60) < 2:
-                            raise Exception("too short")
-                        m120 = []
-                        for i in range(0, len(m60) - 1, 2):
-                            a, b = m60[i], m60[i + 1]
-                            m120.append({
-                                "day": b["day"],
-                                "open": a["open"],
-                                "close": b["close"],
-                                "high": str(max(float(a["high"]), float(b["high"]))),
-                                "low": str(min(float(a["low"]), float(b["low"]))),
-                                "volume": str(int(float(a.get("volume", 0)) + float(b.get("volume", 0)))),
-                            })
-                        results[code] = m120
+                        result = []
+                        for line in klines_raw:
+                            parts = line.split(",")
+                            if len(parts) >= 6:
+                                result.append({
+                                    "day": parts[0], "open": parts[1],
+                                    "close": parts[2], "high": parts[3],
+                                    "low": parts[4], "volume": parts[5],
+                                })
+                        results[code] = result
                         limiter.on_success()
                 except ConnectionAbortedError:
                     fail_count += 1
@@ -708,8 +712,52 @@ async def _async_fetch_kline_120min_batch(codes: list[str]) -> dict:
         for coro in asyncio.as_completed(tasks):
             await coro
 
+    # 东财失败的股票，用新浪补救
+    sina_fallback_codes = [c for c in codes if c not in results]
+    if sina_fallback_codes:
+        print(f"    🔄 东财未覆盖 {len(sina_fallback_codes)} 只，新浪补救中...")
+        sina_limiter = AdaptiveRateLimiter(base_rate=3, name="新浪120min补救")
+        conn2 = aiohttp.TCPConnector(limit=5, limit_per_host=5)
+        async with aiohttp.ClientSession(connector=conn2, timeout=timeout) as sess2:
+            async def _fetch_sina_fallback(code):
+                nonlocal done_count
+                sym = f"sh{code}" if code.startswith("6") else f"sz{code}"
+                url = "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData"
+                params = {"symbol": sym, "scale": "60", "ma": "no", "datalen": 120}
+                headers = {"Referer": "https://finance.sina.com.cn/", "User-Agent": _random_ua()}
+                await sina_limiter.acquire()
+                try:
+                    async with sess2.get(url, params=params, headers=headers) as resp:
+                        if resp.status == 429:
+                            sina_limiter.on_429()
+                            return
+                        if resp.status != 200:
+                            return
+                        text = await resp.text()
+                        if not text.strip() or text.strip() == "null":
+                            return
+                        m60 = json.loads(text)
+                        if not m60 or len(m60) < 2:
+                            return
+                        m120 = []
+                        for i in range(0, len(m60) - 1, 2):
+                            a, b = m60[i], m60[i + 1]
+                            m120.append({
+                                "day": b["day"], "open": a["open"], "close": b["close"],
+                                "high": str(max(float(a["high"]), float(b["high"]))),
+                                "low": str(min(float(a["low"]), float(b["low"]))),
+                                "volume": str(int(float(a.get("volume", 0)) + float(b.get("volume", 0)))),
+                            })
+                        results[code] = m120
+                except Exception:
+                    pass
+
+            fallback_tasks = [_fetch_sina_fallback(c) for c in sina_fallback_codes]
+            for coro in asyncio.as_completed(fallback_tasks):
+                await coro
+
     elapsed = time.time() - t_start
-    print(f"    📊 120min异步完成: {len(results)}/{len(codes)} 有数据, 失败{fail_count}, 耗时{elapsed:.1f}s ({len(codes)/elapsed:.0f}只/秒)")
+    print(f"    📊 120min完成: {len(results)}/{len(codes)} 有数据, 失败{fail_count}, 耗时{elapsed:.1f}s ({len(codes)/elapsed:.0f}只/秒)")
     return results
 
 
@@ -760,16 +808,66 @@ def fetch_all_klines_async(codes: list[str], days: int = 1000,
         return daily, {}
 
 
+def fetch_kline_120min_eastmoney(code: str, count: int = 60, session: requests.Session = None) -> list[dict]:
+    """
+    东财120分钟K线（直接获取，无需从60分钟合并）
+    东财API支持 klt=120 直接返回120分钟K线，限流比新浪宽松
+    """
+    if session is None:
+        session = _build_session()
+
+    market = "1" if code.startswith("6") else "0"
+    r = safe_request(
+        "https://push2his.eastmoney.com/api/qt/stock/kline/get",
+        _limiter_eastmoney, session,
+        params={
+            "secid": f"{market}.{code}",
+            "fields1": "f1,f2,f3,f4,f5,f6",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+            "klt": "120", "fqt": "1",
+            "lmt": str(count), "end": "20500101",
+            "ut": "fa5fd1943c7b386f172d6893dbbd4dc0",
+        },
+        headers={"Referer": "https://quote.eastmoney.com/"},
+    )
+    if not r:
+        return []
+
+    try:
+        data = r.json().get("data", {})
+        klines_raw = data.get("klines", [])
+        if not klines_raw:
+            return []
+        result = []
+        for line in klines_raw:
+            parts = line.split(",")
+            if len(parts) >= 6:
+                result.append({
+                    "day": parts[0], "open": parts[1],
+                    "close": parts[2], "high": parts[3],
+                    "low": parts[4], "volume": parts[5],
+                })
+        return result
+    except Exception:
+        return []
+
+
 def fetch_kline_120min(code: str, count: int = 60, session: requests.Session = None,
                        limiter: RateLimiter = None) -> list[dict]:
     """
-    获取120分钟K线数据（新浪60分钟K线每2根合并为1根）
+    获取120分钟K线数据：东财为主（直接klt=120），新浪为备（60分钟合并）
     用于分析脚本的 pool_technical (120分钟MACD检查)
     返回: [{"day", "open", "close", "high", "low", "volume"}, ...]
     """
     if session is None:
         session = _build_session()
 
+    # 优先用东财直接获取120分钟K线
+    result = fetch_kline_120min_eastmoney(code, count=count, session=session)
+    if result:
+        return result
+
+    # 东财失败，新浪兜底
     sym = f"sh{code}" if code.startswith("6") else f"sz{code}"
     r = safe_request(
         "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData",
