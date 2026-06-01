@@ -470,8 +470,8 @@ function sw(n){{
   var t=event.target,grp=t.parentElement;
   grp.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
   t.classList.add('active');
-  var c=grp.nextElementSibling;
-  while(c&&c.classList.contains('tc')){{c.classList.remove('active');c=c.nextElementSibling;}}
+  var p=grp.parentElement;
+  p.querySelectorAll('.tc').forEach(x=>x.classList.remove('active'));
   document.getElementById('t-'+n).classList.add('active');
 }}
 </script>
