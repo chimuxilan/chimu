@@ -610,81 +610,57 @@ async def _async_fetch_kline_batch(codes: list[str], days: int = 1000,
 
 async def _async_fetch_kline_120min_batch(codes: list[str]) -> dict:
     """
-    异步批量120分钟K线抓取（与日K线并行，独立session+独立限速器）
-    新浪60分钟K线 → 每2根合并为1根120分钟K线
+    异步批量120分钟K线抓取（腾讯代理API，稳定高成功率）
+    腾讯60分钟K线 → 每2根合并为1根120分钟K线
     """
     timeout = aiohttp.ClientTimeout(total=15, connect=5)
     results = {}
     done_count = 0
     fail_count = 0
     t_start = time.time()
-    semaphore = asyncio.Semaphore(15)
+    semaphore = asyncio.Semaphore(10)
+    delay_lock = asyncio.Lock()
 
-    class AdaptiveRateLimiter:
-        def __init__(self, base_rate, name):
-            self.base_rate = base_rate
-            self.current_rate = base_rate
-            self.name = name
-            self.tokens = base_rate
-            self.last_time = time.monotonic()
-            self.lock = asyncio.Lock()
-            self.backoff_until = 0.0
-
-        async def acquire(self):
-            while True:
-                async with self.lock:
-                    now = time.monotonic()
-                    elapsed = now - self.last_time
-                    self.tokens = min(self.current_rate, self.tokens + elapsed * self.current_rate)
-                    self.last_time = now
-                    if self.tokens >= 1:
-                        self.tokens -= 1
-                        jitter = random.uniform(0.7, 1.3)
-                        await asyncio.sleep(0.01 * jitter)
-                        return
-                await asyncio.sleep(0.03)
-
-        def on_429(self):
-            self.current_rate = max(2.0, self.current_rate * 0.5)
-            self.backoff_until = time.monotonic() + 5
-            print(f"    ⚠ {self.name} 120min被限流，降速到 {self.current_rate:.0f} req/s")
-
-        def on_success(self):
-            if time.monotonic() > self.backoff_until:
-                self.current_rate = min(self.base_rate, self.current_rate * 1.05)
-
-    limiter = AdaptiveRateLimiter(base_rate=8, name="新浪120min")
-    conn = aiohttp.TCPConnector(limit=5, limit_per_host=5, ttl_dns_cache=300)
+    conn = aiohttp.TCPConnector(limit=10, limit_per_host=5, ttl_dns_cache=300)
 
     async with aiohttp.ClientSession(connector=conn, timeout=timeout) as sess:
         async def _fetch_one(code):
             nonlocal done_count, fail_count
             sym = f"sh{code}" if code.startswith("6") else f"sz{code}"
-            url = "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData"
-            params = {"symbol": sym, "scale": "60", "ma": "no", "datalen": 120}
-            headers = {"Referer": "https://finance.sina.com.cn/", "User-Agent": _random_ua(), "Accept": _random_accept()}
+            url = f"https://proxy.finance.qq.com/ifzqgtimg/appstock/app/kline/mkline"
+            params = {"param": f"{sym},m60,,120"}
 
-            success = False
-            for attempt in range(3):
-                await limiter.acquire()
+            for attempt in range(2):
                 async with semaphore:
                     try:
-                        async with sess.get(url, params=params, headers=headers) as resp:
-                            if resp.status == 429:
-                                limiter.on_429()
-                                await asyncio.sleep(3 + attempt * 3)
-                                continue
+                        async with sess.get(url, params=params) as resp:
                             if resp.status != 200:
                                 break
                             text = await resp.text()
-                            if not text.strip() or text.strip() == "null":
-                                if attempt < 2:
-                                    await asyncio.sleep(1 + attempt)
+                            if not text.strip():
+                                break
+                            data = json.loads(text)
+                            stock_data = data.get("data", {}).get(sym, {})
+                            m60_raw = stock_data.get("m60", stock_data.get("qfqm60", []))
+                            if not m60_raw or len(m60_raw) < 2:
+                                break
+                            # 解析: [datetime, open, close, high, low, volume, {}, amount]
+                            m60 = []
+                            for item in m60_raw:
+                                try:
+                                    m60.append({
+                                        "day": str(item[0]),
+                                        "open": str(item[1]),
+                                        "close": str(item[2]),
+                                        "high": str(item[3]),
+                                        "low": str(item[4]),
+                                        "volume": str(int(float(item[5]) * 100)),  # 手→股
+                                    })
+                                except (IndexError, ValueError, TypeError):
                                     continue
+                            if len(m60) < 2:
                                 break
-                            m60 = json.loads(text)
-                            if not m60 or len(m60) < 2:
-                                break
+                            # 合并为120min: 每2根60min → 1根120min
                             m120 = []
                             for i in range(0, len(m60) - 1, 2):
                                 a, b = m60[i], m60[i + 1]
@@ -694,22 +670,22 @@ async def _async_fetch_kline_120min_batch(codes: list[str]) -> dict:
                                     "close": b["close"],
                                     "high": str(max(float(a["high"]), float(b["high"]))),
                                     "low": str(min(float(a["low"]), float(b["low"]))),
-                                    "volume": str(int(float(a.get("volume", 0)) + float(b.get("volume", 0)))),
+                                    "volume": str(int(float(a["volume"]) + float(b["volume"]))),
                                 })
                             results[code] = m120
-                            limiter.on_success()
-                            success = True
                             break
-                    except ConnectionAbortedError:
-                        if attempt < 2:
-                            await asyncio.sleep(3 + attempt * 3)
-                            continue
                     except Exception:
-                        break
-            if not success:
+                        if attempt < 1:
+                            await asyncio.sleep(0.5)
+                            continue
+            else:
                 fail_count += 1
 
             done_count += 1
+            # 控制请求节奏：每只间隔约50ms
+            async with delay_lock:
+                await asyncio.sleep(0.05)
+
             if done_count % 500 == 0:
                 elapsed = time.time() - t_start
                 speed = done_count / elapsed if elapsed > 0 else 0
