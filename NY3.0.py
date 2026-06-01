@@ -610,79 +610,137 @@ async def _async_fetch_kline_batch(codes: list[str], days: int = 1000,
 
 async def _async_fetch_kline_120min_batch(codes: list[str]) -> dict:
     """
-    异步批量120分钟K线抓取（腾讯代理API，稳定高成功率）
+    异步批量120分钟K线抓取（腾讯代理主源 + 新浪备用源）
     腾讯60分钟K线 → 每2根合并为1根120分钟K线
+    腾讯无数据的股票（ST/退市/冷门）自动降级到新浪
     """
     timeout = aiohttp.ClientTimeout(total=15, connect=5)
     results = {}
     done_count = 0
+    tencent_count = 0
+    sina_count = 0
     fail_count = 0
     t_start = time.time()
     semaphore = asyncio.Semaphore(10)
     delay_lock = asyncio.Lock()
 
+    def _parse_tencent_m60(m60_raw: list) -> list:
+        """解析腾讯60min K线格式: [datetime, open, close, high, low, volume, {}, amount]"""
+        m60 = []
+        for item in m60_raw:
+            try:
+                m60.append({
+                    "day": str(item[0]),
+                    "open": str(item[1]),
+                    "close": str(item[2]),
+                    "high": str(item[3]),
+                    "low": str(item[4]),
+                    "volume": str(int(float(item[5]) * 100)),  # 手→股
+                })
+            except (IndexError, ValueError, TypeError):
+                continue
+        return m60
+
+    def _parse_sina_m60(m60_raw: list) -> list:
+        """解析新浪60min K线格式: [{day, open, close, high, low, volume}, ...]"""
+        m60 = []
+        for item in m60_raw:
+            try:
+                m60.append({
+                    "day": str(item.get("day", "")),
+                    "open": str(item.get("open", 0)),
+                    "close": str(item.get("close", 0)),
+                    "high": str(item.get("high", 0)),
+                    "low": str(item.get("low", 0)),
+                    "volume": str(int(float(item.get("volume", 0)))),
+                })
+            except (ValueError, TypeError):
+                continue
+        return m60
+
+    def _merge_120min(m60: list) -> list:
+        """60min → 120min: 每2根合并为1根"""
+        m120 = []
+        for i in range(0, len(m60) - 1, 2):
+            a, b = m60[i], m60[i + 1]
+            m120.append({
+                "day": b["day"],
+                "open": a["open"],
+                "close": b["close"],
+                "high": str(max(float(a["high"]), float(b["high"]))),
+                "low": str(min(float(a["low"]), float(b["low"]))),
+                "volume": str(int(float(a["volume"]) + float(b["volume"]))),
+            })
+        return m120
+
     conn = aiohttp.TCPConnector(limit=10, limit_per_host=5, ttl_dns_cache=300)
 
     async with aiohttp.ClientSession(connector=conn, timeout=timeout) as sess:
-        async def _fetch_one(code):
-            nonlocal done_count, fail_count
+        async def _fetch_tencent(code) -> list:
+            """腾讯代理获取60min K线"""
             sym = f"sh{code}" if code.startswith("6") else f"sz{code}"
-            url = f"https://proxy.finance.qq.com/ifzqgtimg/appstock/app/kline/mkline"
+            url = "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/kline/mkline"
             params = {"param": f"{sym},m60,,120"}
+            try:
+                async with sess.get(url, params=params) as resp:
+                    if resp.status != 200:
+                        return []
+                    text = await resp.text()
+                    if not text.strip():
+                        return []
+                    data = json.loads(text)
+                    stock_data = data.get("data", {}).get(sym, {})
+                    m60_raw = stock_data.get("m60", stock_data.get("qfqm60", []))
+                    return _parse_tencent_m60(m60_raw)
+            except Exception:
+                return []
 
-            for attempt in range(2):
-                async with semaphore:
-                    try:
-                        async with sess.get(url, params=params) as resp:
-                            if resp.status != 200:
-                                break
-                            text = await resp.text()
-                            if not text.strip():
-                                break
-                            data = json.loads(text)
-                            stock_data = data.get("data", {}).get(sym, {})
-                            m60_raw = stock_data.get("m60", stock_data.get("qfqm60", []))
-                            if not m60_raw or len(m60_raw) < 2:
-                                break
-                            # 解析: [datetime, open, close, high, low, volume, {}, amount]
-                            m60 = []
-                            for item in m60_raw:
-                                try:
-                                    m60.append({
-                                        "day": str(item[0]),
-                                        "open": str(item[1]),
-                                        "close": str(item[2]),
-                                        "high": str(item[3]),
-                                        "low": str(item[4]),
-                                        "volume": str(int(float(item[5]) * 100)),  # 手→股
-                                    })
-                                except (IndexError, ValueError, TypeError):
-                                    continue
-                            if len(m60) < 2:
-                                break
-                            # 合并为120min: 每2根60min → 1根120min
-                            m120 = []
-                            for i in range(0, len(m60) - 1, 2):
-                                a, b = m60[i], m60[i + 1]
-                                m120.append({
-                                    "day": b["day"],
-                                    "open": a["open"],
-                                    "close": b["close"],
-                                    "high": str(max(float(a["high"]), float(b["high"]))),
-                                    "low": str(min(float(a["low"]), float(b["low"]))),
-                                    "volume": str(int(float(a["volume"]) + float(b["volume"]))),
-                                })
-                            results[code] = m120
-                            break
-                    except Exception:
-                        if attempt < 1:
-                            await asyncio.sleep(0.5)
-                            continue
-            else:
-                fail_count += 1
+        async def _fetch_sina(code) -> list:
+            """新浪备用获取60min K线"""
+            sym = f"sh{code}" if code.startswith("6") else f"sz{code}"
+            url = "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData"
+            params = {"symbol": sym, "scale": "60", "ma": "no", "datalen": 120}
+            headers = {"Referer": "https://finance.sina.com.cn/", "User-Agent": _random_ua()}
+            try:
+                async with sess.get(url, params=params, headers=headers) as resp:
+                    if resp.status != 200:
+                        return []
+                    text = await resp.text()
+                    if not text.strip() or text.strip() == "null":
+                        return []
+                    data = json.loads(text)
+                    return _parse_sina_m60(data)
+            except Exception:
+                return []
+
+        async def _fetch_one(code):
+            nonlocal done_count, tencent_count, sina_count, fail_count
+
+            async with semaphore:
+                # 主源：腾讯代理
+                source = "tencent"
+                m60 = await _fetch_tencent(code)
+
+                # 备用源：新浪（腾讯无数据时降级）
+                if len(m60) < 2:
+                    m60 = await _fetch_sina(code)
+                    source = "sina"
+
+                # 合并为120min
+                if len(m60) >= 2:
+                    m120 = _merge_120min(m60)
+                    if m120:
+                        results[code] = m120
+                        if source == "tencent":
+                            tencent_count += 1
+                        else:
+                            sina_count += 1
+                    else:
+                        fail_count += 1
+                else:
+                    fail_count += 1
 
             done_count += 1
-            # 控制请求节奏：每只间隔约50ms
             async with delay_lock:
                 await asyncio.sleep(0.05)
 
@@ -697,7 +755,7 @@ async def _async_fetch_kline_120min_batch(codes: list[str]) -> dict:
             await coro
 
     elapsed = time.time() - t_start
-    print(f"    📊 120min异步完成: {len(results)}/{len(codes)} 有数据, 失败{fail_count}, 耗时{elapsed:.1f}s ({len(codes)/elapsed:.0f}只/秒)")
+    print(f"    📊 120min异步完成: {len(results)}/{len(codes)} 有数据, 腾讯{tencent_count} 新浪备用{sina_count} 失败{fail_count}, 耗时{elapsed:.1f}s")
     return results
 
 
