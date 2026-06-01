@@ -1,0 +1,350 @@
+#!/usr/bin/env python3
+"""
+A股板块主线分析器 v2
+数据来源：新浪财经
+分析维度：主力资金净流入 + 5日涨幅 + 10日涨幅
+输出：HTML报告
+"""
+
+import json
+import re
+import datetime
+import os
+import time
+from urllib.request import urlopen, Request
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+    "Referer": "https://finance.sina.com.cn/",
+}
+
+
+def fetch_json(url, encoding="utf-8"):
+    req = Request(url, headers=HEADERS)
+    with urlopen(req, timeout=15) as resp:
+        text = resp.read().decode(encoding)
+    return json.loads(text)
+
+
+def get_sector_flow(fenlei=0, num=100):
+    """
+    获取板块资金流向
+    fenlei=0: 行业板块, fenlei=1: 概念板块
+    """
+    url = (
+        f"https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+        f"MoneyFlow.ssl_bkzj_bk?page=1&num={num}&sort=netamount&asc=0&fenlei={fenlei}"
+    )
+    data = fetch_json(url, encoding="gbk")
+    sectors = []
+    for d in data:
+        sectors.append({
+            "category": "行业板块" if fenlei == 0 else "概念板块",
+            "code": d["category"],
+            "name": d["name"],
+            "main_net": float(d["netamount"]),          # 主力净流入（元）
+            "in_amount": float(d["inamount"]),           # 流入额
+            "out_amount": float(d["outamount"]),          # 流出额
+            "net_ratio": float(d["ratioamount"]),         # 净占比
+            "turnover": float(d["turnover"]),             # 换手率
+            "pct_chg": float(d["avg_changeratio"]) * 100, # 今日涨幅%
+            "leading_symbol": d["ts_symbol"],              # 领涨股代码
+            "leading_name": d["ts_name"],                  # 领涨股名称
+        })
+    return sectors
+
+
+def get_stock_kline(symbol, datalen=15):
+    """获取个股K线数据（日线）"""
+    url = (
+        f"https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+        f"CN_MarketData.getKLineData?symbol={symbol}&scale=240&ma=no&datalen={datalen}"
+    )
+    try:
+        data = fetch_json(url)
+        if not data:
+            return None
+        return [float(k["close"]) for k in data]
+    except Exception:
+        return None
+
+
+def calc_changes(closes):
+    """从收盘价序列计算5日和10日涨幅"""
+    chg_5d = None
+    chg_10d = None
+    if closes and len(closes) >= 6:
+        chg_5d = round((closes[-1] - closes[-6]) / closes[-6] * 100, 2)
+    if closes and len(closes) >= 11:
+        chg_10d = round((closes[-1] - closes[-11]) / closes[-11] * 100, 2)
+    return chg_5d, chg_10d
+
+
+def analyze():
+    print("=" * 60)
+    print("🔥 A股板块主线分析器 v2")
+    print("=" * 60)
+
+    # 1. 获取行业板块
+    print("\n📡 获取行业板块资金流向...")
+    industry = get_sector_flow(fenlei=0, num=100)
+    print(f"  ✅ 行业板块: {len(industry)} 个")
+
+    # 2. 获取概念板块
+    print("📡 获取概念板块资金流向...")
+    concept = get_sector_flow(fenlei=1, num=100)
+    print(f"  ✅ 概念板块: {len(concept)} 个")
+
+    all_sectors = industry + concept
+
+    # 3. 获取各板块领涨股K线，计算5/10日涨幅
+    print(f"\n📊 正在获取 {len(all_sectors)} 个板块的K线数据...")
+    valid = []
+    for i, s in enumerate(all_sectors):
+        sym = s["leading_symbol"]
+        closes = get_stock_kline(sym, datalen=15)
+        chg_5d, chg_10d = calc_changes(closes)
+
+        if chg_5d is not None and chg_10d is not None:
+            s["chg_5d"] = chg_5d
+            s["chg_10d"] = chg_10d
+            valid.append(s)
+
+        if (i + 1) % 20 == 0:
+            print(f"  已处理 {i + 1}/{len(all_sectors)}...")
+        # 控制请求频率
+        if (i + 1) % 10 == 0:
+            time.sleep(0.3)
+
+    print(f"  ✅ 有效数据: {len(valid)} 个板块")
+
+    # 4. 排名评分
+    n = len(valid)
+    if n == 0:
+        print("❌ 无有效数据")
+        return []
+
+    # 主力净流入排名
+    by_flow = sorted(valid, key=lambda x: x["main_net"], reverse=True)
+    for rank, s in enumerate(by_flow):
+        s["flow_rank"] = rank + 1
+
+    # 5日涨幅排名
+    by_5d = sorted(valid, key=lambda x: x["chg_5d"], reverse=True)
+    for rank, s in enumerate(by_5d):
+        s["rank_5d"] = rank + 1
+
+    # 10日涨幅排名
+    by_10d = sorted(valid, key=lambda x: x["chg_10d"], reverse=True)
+    for rank, s in enumerate(by_10d):
+        s["rank_10d"] = rank + 1
+
+    # 综合得分 = 流入排名分×0.4 + 5日排名分×0.3 + 10日排名分×0.3
+    for s in valid:
+        s["flow_score"] = round((1 - s["flow_rank"] / (n + 1)) * 100, 1)
+        s["score_5d"] = round((1 - s["rank_5d"] / (n + 1)) * 100, 1)
+        s["score_10d"] = round((1 - s["rank_10d"] / (n + 1)) * 100, 1)
+        s["total_score"] = round(
+            s["flow_score"] * 0.4 + s["score_5d"] * 0.3 + s["score_10d"] * 0.3, 1
+        )
+
+    ranked = sorted(valid, key=lambda x: x["total_score"], reverse=True)
+
+    # 标记级别
+    for i, s in enumerate(ranked):
+        if i < 5:
+            s["level"] = "🔴 核心主线"
+        elif i < 12:
+            s["level"] = "🟠 强势支线"
+        elif i < 20:
+            s["level"] = "🟡 潜力支线"
+        else:
+            s["level"] = ""
+
+    return ranked
+
+
+def fmt_amount(val):
+    """格式化金额（亿元）"""
+    abs_val = abs(val)
+    if abs_val >= 1e8:
+        return f"{val / 1e8:+.2f}亿"
+    elif abs_val >= 1e4:
+        return f"{val / 1e4:+.2f}万"
+    else:
+        return f"{val:+.0f}"
+
+
+def generate_html(ranked, output_path):
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    core = [s for s in ranked if s["level"] == "🔴 核心主线"]
+    strong = [s for s in ranked if s["level"] == "🟠 强势支线"]
+    potential = [s for s in ranked if s["level"] == "🟡 潜力支线"]
+
+    def color(val):
+        return "#e74c3c" if val > 0 else "#27ae60" if val < 0 else "#999"
+
+    def make_card(s, idx):
+        return f"""
+    <div class="card">
+      <div class="card-head">
+        <span class="r">#{idx}</span>
+        <span class="nm">{s['name']}</span>
+        <span class="tag">{s['category']}</span>
+      </div>
+      <div class="card-grid">
+        <div><small>综合得分</small><b class="gold">{s['total_score']}</b></div>
+        <div><small>主力净流入</small><b style="color:{color(s['main_net'])}">{fmt_amount(s['main_net'])}</b></div>
+        <div><small>今日涨幅</small><b style="color:{color(s['pct_chg'])}">{s['pct_chg']:+.2f}%</b></div>
+        <div><small>5日涨幅</small><b style="color:{color(s['chg_5d'])}">{s['chg_5d']:+.2f}%</b></div>
+        <div><small>10日涨幅</small><b style="color:{color(s['chg_10d'])}">{s['chg_10d']:+.2f}%</b></div>
+        <div><small>领涨股</small><b>{s['leading_name']}</b></div>
+      </div>
+      <div class="card-foot">
+        <span>流入#{s['flow_rank']}</span><span>5日#{s['rank_5d']}</span><span>10日#{s['rank_10d']}</span>
+      </div>
+    </div>"""
+
+    cards = "".join(make_card(s, i + 1) for i, s in enumerate(core))
+
+    def make_rows(items, cls=""):
+        rows = ""
+        for s in items:
+            rows += f"""<tr class="{cls}">
+<td>{s['level']}</td><td><b>{s['name']}</b></td><td>{s['category']}</td>
+<td class="gold">{s['total_score']}</td>
+<td style="color:{color(s['main_net'])}">{fmt_amount(s['main_net'])}</td>
+<td style="color:{color(s['pct_chg'])}">{s['pct_chg']:+.2f}%</td>
+<td style="color:{color(s['chg_5d'])}">{s['chg_5d']:+.2f}%</td>
+<td style="color:{color(s['chg_10d'])}">{s['chg_10d']:+.2f}%</td>
+<td>{s['net_ratio']:.2f}%</td>
+<td>{s['leading_name']}</td>
+<td>{s['flow_rank']}</td><td>{s['rank_5d']}</td><td>{s['rank_10d']}</td></tr>"""
+        return rows
+
+    thead = """<thead><tr>
+<th>级别</th><th>板块</th><th>分类</th><th>综合分</th>
+<th>主力净流入</th><th>今日</th><th>5日</th><th>10日</th>
+<th>净占比</th><th>领涨股</th><th>流入#</th><th>5日#</th><th>10日#</th>
+</tr></thead>"""
+
+    html = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>A股板块主线分析 {now}</title>
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;background:#0d1117;color:#c9d1d9;line-height:1.6;padding:16px}}
+.wrap{{max-width:1400px;margin:0 auto}}
+h1{{text-align:center;font-size:1.8em;margin:16px 0 4px;background:linear-gradient(90deg,#e74c3c,#f1c40f,#e74c3c);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}}
+.sub{{text-align:center;color:#8b949e;font-size:.85em;margin-bottom:20px}}
+.bar{{display:flex;justify-content:center;gap:16px;flex-wrap:wrap;margin:16px 0 24px}}
+.bar .it{{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:12px 20px;text-align:center;min-width:140px}}
+.bar .it .n{{font-size:1.8em;font-weight:700}}
+.bar .it .l{{color:#8b949e;font-size:.8em}}
+.sec{{font-size:1.3em;margin:24px 0 12px;padding-left:10px;border-left:4px solid #f1c40f}}
+.cards{{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px;margin:12px 0}}
+.card{{background:#161b22;border:1px solid #30363d;border-radius:10px;overflow:hidden;transition:.2s}}
+.card:hover{{transform:translateY(-2px);box-shadow:0 6px 20px rgba(231,76,60,.12)}}
+.card-head{{padding:10px 14px;background:linear-gradient(135deg,rgba(231,76,60,.1),rgba(241,196,15,.06));display:flex;align-items:center;gap:6px}}
+.r{{font-size:1.2em;font-weight:700;color:#f1c40f;min-width:28px}}
+.nm{{font-weight:700;font-size:1.05em;flex:1}}
+.tag{{font-size:.7em;background:rgba(56,139,253,.15);color:#58a6ff;padding:2px 7px;border-radius:8px}}
+.card-grid{{padding:10px 14px;display:grid;grid-template-columns:1fr 1fr;gap:6px}}
+.card-grid div{{display:flex;flex-direction:column}}
+.card-grid small{{font-size:.7em;color:#8b949e}}
+.card-grid b{{font-size:.95em}}
+.gold{{color:#f1c40f!important}}
+.card-foot{{padding:6px 14px;background:rgba(0,0,0,.25);display:flex;justify-content:space-between;font-size:.7em;color:#8b949e}}
+.tabs{{display:flex;gap:0;margin:20px 0 0}}
+.tab{{padding:8px 20px;background:#161b22;border:1px solid #30363d;cursor:pointer;border-radius:8px 8px 0 0;color:#8b949e;font-weight:500;font-size:.9em;transition:.2s}}
+.tab.active{{background:#30363d;color:#c9d1d9;border-bottom-color:#30363d}}
+.tc{{display:none;background:#161b22;border:1px solid #30363d;border-top:none;border-radius:0 0 10px 10px;padding:12px;overflow-x:auto}}
+.tc.active{{display:block}}
+table{{width:100%;border-collapse:collapse;font-size:.82em}}
+th{{background:#0d1117;padding:8px 6px;text-align:left;border-bottom:2px solid #30363d;position:sticky;top:0;white-space:nowrap}}
+td{{padding:6px;border-bottom:1px solid #21262d;white-space:nowrap}}
+tr:hover{{background:rgba(255,255,255,.02)}}
+.core{{background:rgba(231,76,60,.06)}}
+.strong{{background:rgba(230,126,34,.04)}}
+.pot{{background:rgba(241,196,15,.02)}}
+.note{{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:16px;margin:20px 0;font-size:.85em;color:#8b949e}}
+.note b{{color:#c9d1d9}}
+@media(max-width:768px){{.cards{{grid-template-columns:1fr}}.bar{{gap:8px}}.bar .it{{min-width:110px;padding:8px 12px}}}}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>🔥 A股板块主线分析</h1>
+<p class="sub">{now} · 数据来源：新浪财经 · 领涨股5/10日涨幅作为板块趋势代理</p>
+
+<div class="bar">
+  <div class="it"><div class="n" style="color:#e74c3c">{len(core)}</div><div class="l">核心主线</div></div>
+  <div class="it"><div class="n" style="color:#e67e22">{len(strong)}</div><div class="l">强势支线</div></div>
+  <div class="it"><div class="n" style="color:#f1c40f">{len(potential)}</div><div class="l">潜力支线</div></div>
+  <div class="it"><div class="n" style="color:#58a6ff">{len(ranked)}</div><div class="l">分析总数</div></div>
+</div>
+
+<h2 class="sec">🏆 核心主线 TOP 5</h2>
+<div class="cards">{cards}</div>
+
+<h2 class="sec">📋 完整排名</h2>
+<div class="tabs">
+  <div class="tab active" onclick="sw('all')">全部 TOP50</div>
+  <div class="tab" onclick="sw('core')">核心主线</div>
+  <div class="tab" onclick="sw('strong')">强势支线</div>
+  <div class="tab" onclick="sw('pot')">潜力支线</div>
+</div>
+<div id="t-all" class="tc active"><table>{thead}<tbody>{make_rows(ranked[:50])}</tbody></table></div>
+<div id="t-core" class="tc"><table>{thead}<tbody>{make_rows(core,'core')}</tbody></table></div>
+<div id="t-strong" class="tc"><table>{thead}<tbody>{make_rows(strong,'strong')}</tbody></table></div>
+<div id="t-pot" class="tc"><table>{thead}<tbody>{make_rows(potential,'pot')}</tbody></table></div>
+
+<div class="note">
+<h3 style="margin-bottom:8px">📐 分析方法</h3>
+<p><b>数据来源：</b>新浪财经板块资金流向 + 领涨股K线</p>
+<p><b>综合评分 =</b> 主力净流入排名分 × 0.4 + 5日涨幅排名分 × 0.3 + 10日涨幅排名分 × 0.3</p>
+<p><b>核心主线：</b>综合得分 TOP 5 · <b>强势支线：</b>6-12名 · <b>潜力支线：</b>13-20名</p>
+<p><b>5/10日涨幅：</b>取各板块领涨股的K线数据作为板块趋势代理指标</p>
+<p style="margin-top:6px">⚠️ 数据仅供参考，不构成投资建议。主线判定需结合政策面、消息面综合判断。</p>
+</div>
+</div>
+<script>
+function sw(n){{
+  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+  document.querySelectorAll('.tc').forEach(t=>t.classList.remove('active'));
+  event.target.classList.add('active');
+  document.getElementById('t-'+n).classList.add('active');
+}}
+</script>
+</body>
+</html>"""
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(html)
+
+
+def main():
+    ranked = analyze()
+    if not ranked:
+        print("❌ 分析失败")
+        return
+
+    print("\n" + "=" * 60)
+    print("🏆 核心主线 TOP 5:")
+    print("=" * 60)
+    for i, s in enumerate(ranked[:5]):
+        print(f"  #{i+1} {s['name']:10s} | 得分:{s['total_score']:5.1f} | "
+              f"主力:{fmt_amount(s['main_net']):>8s} | 5日:{s['chg_5d']:+6.2f}% | "
+              f"10日:{s['chg_10d']:+6.2f}% | 领涨:{s['leading_name']}")
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    output = os.path.join(script_dir, "sector_analysis.html")
+    generate_html(ranked, output)
+    print(f"\n✅ HTML报告已生成: {output}")
+
+
+if __name__ == "__main__":
+    main()
