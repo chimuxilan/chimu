@@ -1484,7 +1484,8 @@ class AuctionResult:
 def tail_segment_verdict(gap: float, vol: int, buy_vol: int, sell_vol: int,
                          is_limit_up: bool = False,
                          mid_buy_all: bool = False,
-                         mid_sell_vol: float = 0, tail_sell_vol: float = 0) -> tuple[int, str, list]:
+                         mid_sell_vol: float = 0, tail_sell_vol: float = 0,
+                         vol_min: int = 5000) -> tuple[int, str, list]:
     """
     尾段竞价判定规则（新规则三维评分）
     ─────────────────────────────────────
@@ -1501,6 +1502,7 @@ def tail_segment_verdict(gap: float, vol: int, buy_vol: int, sell_vol: int,
       mid_buy_all: 中段是否全买单
       mid_sell_vol: 中段卖量（手）
       tail_sell_vol: 尾段卖量（手）（用于计算中→尾卖盘变化）
+      vol_min: 成交量最低阈值（手），开盘竞价默认5000，收盘竞价用500
 
     返回:
       (score, verdict, signals)
@@ -1514,8 +1516,8 @@ def tail_segment_verdict(gap: float, vol: int, buy_vol: int, sell_vol: int,
     # 硬否决规则（任一触发→直接判定"不看多"）
     # ═══════════════════════════════════════════
 
-    # 1. 成交量维度：vol < 5000手 → "量太小"
-    if vol < 5000:
+    # 1. 成交量维度：vol < vol_min → "量太小"
+    if vol < vol_min:
         signals.append("❌ 量太小 (<5000手)")
         return -1, "不看多", signals
 
@@ -1748,12 +1750,13 @@ def close_auction_monitor(codes: list[str], poll_interval: int = 10,
         sell_vol = max(tail_ask_delta, 0)  # 尾段卖一增加量
         is_limit_up = gap >= 9.5
 
-        # vol 用全程搓合量（收盘竞价总量），不用尾段差值
-        total_auction_vol = snaps[-1].volume - snaps[0].volume if snaps[-1].volume > snaps[0].volume else snaps[-1].volume
+        # vol = 收盘竞价期间搓合量增量（14:57→15:00 的成交量）
+        close_auction_vol = max(snaps[-1].volume - snaps[0].volume, 0)
 
         ts_score, ts_verdict, ts_signals = tail_segment_verdict(
             gap=gap,
-            vol=max(total_auction_vol, 0),
+            vol=close_auction_vol,
+            vol_min=500,  # 收盘竞价3分钟，阈值降低到500手
             buy_vol=buy_vol,
             sell_vol=sell_vol,
             is_limit_up=is_limit_up,
