@@ -1070,12 +1070,29 @@ def fetch_all_stock_codes_em(session: requests.Session = None) -> tuple[list[str
         if price is None or price == "-":
             continue
         codes.append(code)
+
+        def _safe_float(v, default=0.0):
+            if v is None or v == "-" or v == "":
+                return default
+            try:
+                return float(v)
+            except (ValueError, TypeError):
+                return default
+
+        def _safe_int(v, default=0):
+            if v is None or v == "-" or v == "":
+                return default
+            try:
+                return int(float(v))
+            except (ValueError, TypeError):
+                return default
+
         stock_info[code] = {
             "name": str(item.get("f14", "")),
-            "price": float(price) if price else 0,
-            "change_pct": float(item.get("f3", 0) or 0),
-            "market_cap": float(item.get("f115", 0) or 0),   # 流通市值(元)
-            "volume": int(item.get("f128", 0) or 0),          # 成交量(手)
+            "price": _safe_float(price),
+            "change_pct": _safe_float(item.get("f3")),
+            "market_cap": _safe_float(item.get("f115")),      # 流通市值(元)
+            "volume": _safe_int(item.get("f128")),             # 成交量(手)
             "industry": str(item.get("f100", "")),             # 行业分类
         }
 
