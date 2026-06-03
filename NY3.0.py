@@ -1041,10 +1041,10 @@ def _safe_int(v, default=0):
 
 def fetch_all_stock_codes_em(session: requests.Session = None) -> tuple[list[str], dict]:
     """
-    东财 push2 单次请求获取全A股列表 + 行业分类。
-    ────────────────────────────────────────────────
+    东财 push2 获取全A股列表 + 行业分类（走 em_get 统一限流）。
+    ──────────────────────────────────────────────────────────────
     替代 fetch_all_stock_codes()（新浪串行分页）+ fetch_sectors()（~200次新浪API）。
-    单次 HTTP 请求拿到全部数据，耗时 ~2-3s vs 原方案 ~20-30s。
+    与仓库 a-stock-data 保持一致：所有 eastmoney.com 端点一律走 em_get()，不另建 session。
 
     返回: (codes, stock_info)
       codes: 主板股票代码列表 (60xx/00xx)
@@ -1056,16 +1056,6 @@ def fetch_all_stock_codes_em(session: requests.Session = None) -> tuple[list[str
     page_size = 5000
     max_retries = 3
 
-    # push2 端点需要独立 session + 正确 Referer，不能复用 em_get 的 _EM_SESSION
-    _push2_session = requests.Session()
-    _push2_session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-        "Referer": "https://quote.eastmoney.com/",
-        "Accept": "*/*",
-        "Accept-Encoding": "gzip, deflate",
-        "Connection": "keep-alive",
-    })
-
     while True:
         params = {
             "pn": str(page), "pz": str(page_size), "po": "1", "np": "1",
@@ -1073,16 +1063,17 @@ def fetch_all_stock_codes_em(session: requests.Session = None) -> tuple[list[str
             "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",  # 沪深A股
             "fields": "f2,f3,f12,f13,f14,f100,f115,f128",
         }
+        # 与仓库一致：走 em_get()，传 per-request headers
+        headers = {"Referer": "https://quote.eastmoney.com/"}
         success = False
         for attempt in range(max_retries):
             try:
-                r = _push2_session.get(url, params=params, timeout=20)
+                r = em_get(url, params=params, headers=headers, timeout=20)
                 d = r.json()
                 items = d.get("data", {}).get("diff", [])
                 if not items and page == 1:
-                    # 第1页就空数据，可能是返回格式异常，重试
                     print(f"    ⚠ 东财股票列表第{page}页返回空，重试({attempt+1}/{max_retries})...")
-                    time.sleep(1 + random.uniform(0.5, 1.5))
+                    time.sleep(2 ** attempt + random.uniform(0.5, 1.5))
                     continue
                 success = True
                 break
