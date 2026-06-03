@@ -3092,9 +3092,15 @@ def pool_volume_price(c: dict, tc: dict, em: dict, klines: list = None, close_au
     auction_vol = tc.get("volume", 0) or em.get("volume", 0) or c.get("volume", 0)
     if auction_vol <= 0:
         return False, "竞价量为0"
-    # 昨成交量（股→手）
-    yesterday_vol_shares = c.get("volume_shares", 0)
-    yesterday_vol_lots = yesterday_vol_shares // 100
+    # 昨成交量（优先用K线数据，兜底用volume_shares）
+    if klines and len(klines) >= 2:
+        try:
+            yesterday_vol_lots = int(float(klines[-2].get("volume", 0)))
+        except (ValueError, TypeError):
+            yesterday_vol_lots = c.get("volume_shares", 0) // 100
+    else:
+        yesterday_vol_lots = c.get("volume_shares", 0) // 100
+    yesterday_vol_shares = yesterday_vol_lots * 100
     if yesterday_vol_lots <= 0:
         return False, "昨成交量为0"
     # 7. 今日竞价金额/昨日竞价金额 > 1.5倍
@@ -3200,8 +3206,14 @@ def pool_trend(c: dict, klines: list[dict], tc: dict = None, em: dict = None) ->
         return False, "未高开"
     # 9. 集合竞价量比 > 3
     auction_vol = tc.get("volume", 0) or em.get("volume", 0) or c.get("volume", 0)
-    yesterday_vol_shares = c.get("volume_shares", 0)
-    yesterday_vol_lots = yesterday_vol_shares // 100
+    # 昨成交量（优先用K线数据，兜底用volume_shares）
+    if klines and len(klines) >= 2:
+        try:
+            yesterday_vol_lots = int(float(klines[-2].get("volume", 0)))
+        except (ValueError, TypeError):
+            yesterday_vol_lots = c.get("volume_shares", 0) // 100
+    else:
+        yesterday_vol_lots = c.get("volume_shares", 0) // 100
     if yesterday_vol_lots > 0 and auction_vol > 0:
         est_auction_avg = yesterday_vol_lots * (10 / 240)
         volume_ratio = auction_vol / est_auction_avg if est_auction_avg > 0 else 0
