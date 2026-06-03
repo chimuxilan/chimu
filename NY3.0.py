@@ -1935,23 +1935,18 @@ def close_auction_monitor(codes: list[str] = None, poll_interval: int = 10,
         session = _build_session()
 
         # 1. 获取全部主板A股代码
-        print("  📋 [1/4] 获取全部主板A股代码...")
+        print("  📋 [1/3] 获取全部主板A股代码...")
         all_codes = fetch_all_stock_codes(session)
         mainboard_codes = [c for c in all_codes if c.startswith(("60", "00"))]
         print(f"    ✅ 共 {len(mainboard_codes)} 只主板A股")
 
-        # 2. 批量获取实时行情
-        print(f"  📊 [2/4] 批量获取实时行情 ({len(mainboard_codes)} 只)...")
+        # 2. 批量获取实时行情（已含 market_cap_yi，预筛选够用）
+        print(f"  📊 [2/3] 批量获取实时行情 ({len(mainboard_codes)} 只)...")
         quotes = fetch_quotes_batch(mainboard_codes, session)
         print(f"    ✅ 获取到 {len(quotes)} 只行情数据")
 
-        # 3. 获取股票详情（市值/量比/换手率）
-        print(f"  📊 [3/4] 获取股票详情（市值/量比/换手率）...")
-        details = fetch_stock_details(mainboard_codes, session, quotes_ref=quotes)
-        print(f"    ✅ 获取到 {len(details)} 只详情数据")
-
-        # 4. 预筛选：基础池条件（非K线部分）
-        print(f"  📊 [4/4] 执行基础池预筛选...")
+        # 3. 预筛选：基础池条件（用行情数据的 market_cap_yi，跳过全量详情请求）
+        print(f"  📊 [3/3] 执行基础池预筛选...")
         pre_codes = []
         for code in mainboard_codes:
             q = quotes.get(code, {})
@@ -1968,9 +1963,8 @@ def close_auction_monitor(codes: list[str] = None, poll_interval: int = 10,
             # 股价 < 60（基础池条件）
             if price >= 60:
                 continue
-            # 流通市值范围
-            em = details.get(code, {})
-            market_cap_yi = em.get("market_cap_yi", 0) or q.get("market_cap_yi", 0)
+            # 流通市值范围（直接用行情接口的 market_cap_yi）
+            market_cap_yi = float(q.get("market_cap_yi", 0) or 0)
             if market_cap_yi <= 35.99 or market_cap_yi >= 999.99:
                 continue
             pre_codes.append(code)
@@ -2009,8 +2003,7 @@ def close_auction_monitor(codes: list[str] = None, poll_interval: int = 10,
     session = _build_session()
 
     if post_market:
-        # 收盘后：单次快照模式
-        quotes = fetch_quotes_batch(codes, session=session)
+        # 收盘后：单次快照模式（复用预筛选行情，不重复请求）
         ts = _dt.now().strftime('%H:%M:%S')
         for code in codes:
             q = quotes.get(code, {})
