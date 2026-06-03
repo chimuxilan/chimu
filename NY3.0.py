@@ -2465,6 +2465,19 @@ def close_auction_monitor(codes: list[str] = None, poll_interval: int = 10,
 
     print(f"  初选池: {len(final)} 只")
 
+    # ---- 补充新浪1000天K线（仅入选股票，~4s）----
+    final_codes = [c["code"] for c in final]
+    sina_supplement_codes = [c for c in final_codes if len(klines_map.get(c, [])) < 500]
+    if sina_supplement_codes:
+        print(f"  📦 补充新浪1000天K线: {len(sina_supplement_codes)} 只入选股票...")
+        sina_sup_map = fetch_kline_batch(sina_supplement_codes, days=1000, max_workers=16, session=session)
+        supplemented = 0
+        for code, sina_klines in sina_sup_map.items():
+            if sina_klines and len(sina_klines) > len(klines_map.get(code, [])):
+                klines_map[code] = sina_klines
+                supplemented += 1
+        print(f"  ✅ 新浪补充完成: {supplemented} 只获得1000天数据")
+
     # ---- 抢筹/出货深度分析 + 频次统计（与早盘一致）----
     print("📊 执行抢筹/出货深度分析...")
     for c in final:
