@@ -53,6 +53,14 @@ try:
 except ImportError:
     _HAS_AIOHTTP = False
 
+try:
+    from mootdx.quotes import Quotes as _MootdxQuotes
+    _MOOTDX_CLIENT = _MootdxQuotes.factory(market='std')
+    _HAS_MOOTDX = True
+except Exception:
+    _HAS_MOOTDX = False
+    _MOOTDX_CLIENT = None
+
 
 # ════════════════════════════════════════════════════
 # NYLO — A股数据爬虫模块
@@ -148,7 +156,29 @@ class RateLimiter:
 # 每个域名独立限速
 _limiter_sina = RateLimiter(0.3)      # 新浪：~3次/秒
 _limiter_tencent = RateLimiter(0.2)   # 腾讯：~5次/秒
-_limiter_eastmoney = RateLimiter(0.5)  # 东财：~2次/秒（防封核心）
+_limiter_eastmoney = RateLimiter(1.0)  # 东财：~1次/秒（严格防封）
+
+# ── 东财统一限流入口（em_get）── 比 safe_request 更严格
+# 东财风控：>5次/秒封、并发≥10封、1分钟≥200次封
+# 所有 eastmoney.com 请求走 em_get()：串行限流 + 会话复用 + 默认 UA
+_EM_SESSION = requests.Session()
+_EM_SESSION.headers.update({
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Referer": "https://quote.eastmoney.com/",
+})
+_EM_MIN_INTERVAL = 1.0
+_em_last_call = [0.0]
+
+def em_get(url: str, params: dict = None, headers: dict = None,
+           timeout: int = 15, **kwargs):
+    """东财统一请求入口：串行限流（≥1s+随机抖动）+ 复用 Keep-Alive 会话"""
+    wait = _EM_MIN_INTERVAL - (time.time() - _em_last_call[0])
+    if wait > 0:
+        time.sleep(wait + random.uniform(0.1, 0.5))
+    try:
+        return _EM_SESSION.get(url, params=params, headers=headers, timeout=timeout, **kwargs)
+    finally:
+        _em_last_call[0] = time.time()
 
 
 def safe_request(url: str, limiter: RateLimiter, session: requests.Session = None,
@@ -333,9 +363,15 @@ def fetch_quotes_batch(codes: list[str], session: requests.Session = None) -> di
                 "low": _v(34),
                 "amount": _v(37),           # 成交额（万元）
                 "turnover": _v(38),         # 换手率%
+                "pe_ttm": _v(39),           # PE(TTM) — 腾讯独有，不封IP
                 "amplitude": _v(43),        # 振幅%
+                "total_mcap_yi": _v(44),    # 总市值（亿）
                 "market_cap_yi": _v(45),    # 流通市值（亿）
+                "pb": _v(46),               # PB(市净率) — 腾讯独有
+                "limit_up": _v(47),         # 涨停价
+                "limit_down": _v(48),       # 跌停价
                 "volume_ratio_api": _v(49), # 量比
+                "pe_static": _v(52),        # PE(静)
                 "quote_time": fields[31] if len(fields) > 31 else "",
             }
 
@@ -347,8 +383,46 @@ def fetch_quotes_batch(codes: list[str], session: requests.Session = None) -> di
 
 
 # ════════════════════════════════════════════════════
-# 3. 日K线历史（新浪 + 东财双源）
+# 3. 日K线历史（mootdx主源 + 新浪 + 腾讯备用）
 # ════════════════════════════════════════════════════
+
+def fetch_kline_mootdx(code: str, days: int = 800) -> list[dict]:
+    """
+    通达信TCP协议获取日K线 — 不封IP，可高频调用。
+    mootdx 单次最多返回 800 条，支持分页获取更多。
+    category/frequency: 4=日线, 5=周线, 6=月线, 7=1分钟, 8=5分钟, 9=15分钟, 10=30分钟, 11=60分钟
+    返回格式与新浪/腾讯一致: [{"day","open","close","high","low","volume","amount"}, ...]
+    """
+    if not _HAS_MOOTDX or _MOOTDX_CLIENT is None:
+        return []
+    try:
+        result = []
+        remaining = min(days, 2400)  # mootdx 最多分3页取2400条
+        start = 0
+        while remaining > 0:
+            count = min(remaining, 800)
+            klines = _MOOTDX_CLIENT.bars(symbol=code, frequency=4, start=start, offset=count)
+            if klines is None or klines.empty:
+                break
+            for _, row in klines.iterrows():
+                result.append({
+                    "day": str(row.get("datetime", "")),
+                    "open": str(row.get("open", 0)),
+                    "close": str(row.get("close", 0)),
+                    "high": str(row.get("high", 0)),
+                    "low": str(row.get("low", 0)),
+                    "volume": str(int(row.get("vol", 0))),
+                    "amount": str(row.get("amount", 0)),
+                })
+            fetched = len(klines)
+            if fetched < count:
+                break  # 没有更多数据了
+            start += fetched
+            remaining -= fetched
+        return result
+    except Exception:
+        return []
+
 
 def fetch_kline_sina(code: str, days: int = 10, session: requests.Session = None) -> list[dict]:
     """新浪日K线（快速，适合少量请求）"""
@@ -417,10 +491,15 @@ def fetch_kline_batch(codes: list[str], days: int = 1000, max_workers: int = 4,
     results = {}
 
     def _fetch_one(code):
-        # 新浪K线（快速，支持最多约1024条）
-        klines = fetch_kline_sina(code, days=min(days, 1000), session=session)
+        # 优先：mootdx TCP（不封IP，最安全最快，最多2400条）
+        klines = fetch_kline_mootdx(code, days=min(days, 2400))
+        # 如果 mootdx 数据不足且需要更多天数，用 HTTP 源补充
+        if len(klines) < days:
+            sina_klines = fetch_kline_sina(code, days=min(days, 1000), session=session)
+            if len(sina_klines) > len(klines):
+                klines = sina_klines
         if not klines:
-            # 腾讯K线备用
+            # 备用：腾讯K线
             klines = fetch_kline_tencent(code, days=min(days, 300), session=session)
         return code, klines
 
@@ -503,7 +582,7 @@ async def _async_fetch_kline_tencent(session, code: str,
 
 
 async def _async_fetch_kline_batch(codes: list[str], days: int = 1000,
-                                    concurrency: int = 100) -> dict:
+                                    concurrency: int = 25) -> dict:
     """
     异步批量K线抓取（双域名分流 + 自适应限速）
     ───────────────────────────────────────────
@@ -568,16 +647,33 @@ async def _async_fetch_kline_batch(codes: list[str], days: int = 1000,
     async with aiohttp.ClientSession(connector=sina_conn, timeout=timeout) as sina_sess, \
                aiohttp.ClientSession(connector=tencent_conn, timeout=timeout) as tencent_sess:
 
+        loop = asyncio.get_event_loop()
+
         async def _fetch_one(code):
             nonlocal done_count, fail_count
 
-            await sina_limiter.acquire()
-            try:
-                klines = await _async_fetch_kline_sina(sina_sess, code, min(days, 1000), semaphore)
-            except Exception:
-                klines = []
-                sina_limiter.on_429()
+            # 优先：mootdx TCP（不封IP，同步调用放线程池避免阻塞事件循环）
+            klines = []
+            if _HAS_MOOTDX:
+                try:
+                    klines = await loop.run_in_executor(None, fetch_kline_mootdx, code, min(days, 2400))
+                except Exception:
+                    klines = []
 
+            # 如果 mootdx 数据不足，用新浪补充（取更多天数的那个）
+            if len(klines) < days:
+                await sina_limiter.acquire()
+                try:
+                    sina_klines = await _async_fetch_kline_sina(sina_sess, code, min(days, 1000), semaphore)
+                except Exception:
+                    sina_klines = []
+                    sina_limiter.on_429()
+                if len(sina_klines) > len(klines):
+                    klines = sina_klines
+                elif sina_klines:
+                    sina_limiter.on_success()
+
+            # mootdx 和新浪都没有数据，试腾讯
             if not klines:
                 await tencent_limiter.acquire()
                 try:
@@ -588,7 +684,6 @@ async def _async_fetch_kline_batch(codes: list[str], days: int = 1000,
             done_count += 1
             if klines:
                 results[code] = klines
-                sina_limiter.on_success()
             else:
                 fail_count += 1
 
@@ -596,7 +691,8 @@ async def _async_fetch_kline_batch(codes: list[str], days: int = 1000,
                 elapsed = time.time() - t_start
                 speed = done_count / elapsed if elapsed > 0 else 0
                 eta = (len(codes) - done_count) / speed if speed > 0 else 0
-                print(f"    进度: {done_count}/{len(codes)} ({len(results)}有数据) | {speed:.0f}只/秒 | 剩余{eta:.0f}s | 新浪{sina_limiter.current_rate:.0f}/s 腾讯{tencent_limiter.current_rate:.0f}/s")
+                src = "mootdx(TCP)" if _HAS_MOOTDX else "HTTP"
+                print(f"    进度: {done_count}/{len(codes)} ({len(results)}有数据) | {speed:.0f}只/秒 | 剩余{eta:.0f}s | 源:{src}")
             return code, klines
 
         tasks = [_fetch_one(c) for c in codes]
@@ -760,7 +856,7 @@ async def _async_fetch_kline_120min_batch(codes: list[str]) -> dict:
 
 
 async def _async_fetch_all_klines(codes: list[str], days: int = 1000,
-                                   concurrency: int = 100) -> tuple[dict, dict]:
+                                   concurrency: int = 25) -> tuple[dict, dict]:
     """
     并行抓取日K线 + 120分钟K线（共享事件循环，独立限速器）
     返回: (daily_klines, kline_120min_map)
@@ -772,7 +868,7 @@ async def _async_fetch_all_klines(codes: list[str], days: int = 1000,
 
 
 def fetch_kline_batch_async(codes: list[str], days: int = 1000,
-                             concurrency: int = 100) -> dict:
+                             concurrency: int = 25) -> dict:
     """同步包装：调用异步批量K线抓取（无aiohttp时降级为多线程）"""
     if _HAS_AIOHTTP:
         print(f"    📦 异步批量获取K线: {len(codes)} 只, {days}天, {concurrency}并发, 双域名分流...")
@@ -788,7 +884,7 @@ def fetch_kline_batch_async(codes: list[str], days: int = 1000,
 
 
 def fetch_all_klines_async(codes: list[str], days: int = 1000,
-                            concurrency: int = 100) -> tuple[dict, dict]:
+                            concurrency: int = 25) -> tuple[dict, dict]:
     """
     同步包装：并行抓取日K线 + 120分钟K线
     返回: (daily_klines, kline_120min_map)
@@ -804,49 +900,6 @@ def fetch_all_klines_async(codes: list[str], days: int = 1000,
     else:
         daily = fetch_kline_batch_async(codes, days, concurrency)
         return daily, {}
-
-
-def fetch_kline_1min(code: str, count: int = 10, session: requests.Session = None,
-                     limiter: RateLimiter = None) -> list[dict]:
-    """
-    获取1分钟K线数据（腾讯接口）
-    用于收盘竞价模式获取14:56的价格作为竞价基准价
-    返回: [{"day", "open", "close", "high", "low", "volume"}, ...]
-    """
-    if session is None:
-        session = _build_session()
-
-    sym = f"sh{code}" if code.startswith("6") else f"sz{code}"
-    url = f"https://web.ifzq.gtimg.cn/appstock/app/minute/query?_var=min_data&code={sym}"
-    try:
-        r = safe_request(url, limiter or _limiter_tencent, session)
-        text = r.text
-        # 响应格式: min_data={...}
-        m = re.search(r'min_data\s*=\s*(\{.*\})', text, re.S)
-        if not m:
-            return []
-        data = json.loads(m.group(1))
-        # data.data.{sym}.data = ["时间 开盘价 当前价 最高价 最低价 成交量", ...]
-        # data.data.{sym}.m1 或 data 字段
-        stock_data = data.get("data", {}).get(sym, {})
-        lines = stock_data.get("data", []) or stock_data.get("m1", [])
-        if not lines:
-            return []
-        bars = []
-        for line in lines[-count:]:
-            parts = str(line).strip().split()
-            if len(parts) >= 6:
-                bars.append({
-                    "day": parts[0],
-                    "open": parts[1],
-                    "close": parts[2],
-                    "high": parts[3],
-                    "low": parts[4],
-                    "volume": parts[5],
-                })
-        return bars
-    except Exception:
-        return []
 
 
 def fetch_kline_120min(code: str, count: int = 60, session: requests.Session = None,
@@ -1086,7 +1139,7 @@ def fetch_sectors(session: requests.Session = None) -> dict:
 def fetch_stock_details(codes: list[str], session: requests.Session = None,
                         quotes_ref: dict = None) -> dict:
     """
-    批量获取股票详情（市值/量比/换手率/成交额）
+    批量获取股票详情（市值/PE/PB/量比/换手率/涨跌停价）
     直接使用腾讯行情数据（稳定可靠，无封IP风险）
     """
     results = {}
@@ -1098,10 +1151,16 @@ def fetch_stock_details(codes: list[str], session: requests.Session = None,
             q = quotes_ref[code]
             results[code] = {
                 "market_cap_yi": round(float(q.get("market_cap_yi", 0) or 0), 2),
+                "total_mcap_yi": round(float(q.get("total_mcap_yi", 0) or 0), 2),
                 "volume_ratio": round(float(q.get("volume_ratio_api", 0) or 0), 2),
                 "turnover": round(float(q.get("turnover", 0) or 0), 4),
                 "amount": round(float(q.get("amount", 0) or 0), 2),
                 "volume": int(q.get("volume", 0) or 0),
+                "pe_ttm": round(float(q.get("pe_ttm", 0) or 0), 2),
+                "pe_static": round(float(q.get("pe_static", 0) or 0), 2),
+                "pb": round(float(q.get("pb", 0) or 0), 2),
+                "limit_up": round(float(q.get("limit_up", 0) or 0), 2),
+                "limit_down": round(float(q.get("limit_down", 0) or 0), 2),
             }
 
     print(f"    ✅ 腾讯行情数据: {len(results)} 只")
@@ -1156,13 +1215,9 @@ def fetch_indices(session: requests.Session = None) -> list[dict]:
 # ════════════════════════════════════════════════════
 
 def fetch_sector_kline(sector_code: str, days: int = 10, session: requests.Session = None) -> list[dict]:
-    """获取板块日K线"""
-    if session is None:
-        session = _build_session()
-
-    r = safe_request(
+    """获取板块日K线（走 em_get 严格限流）"""
+    r = em_get(
         "https://push2his.eastmoney.com/api/qt/stock/kline/get",
-        _limiter_eastmoney, session,
         params={
             "secid": f"90.{sector_code}",
             "fields1": "f1,f2,f3,f4,f5,f6",
@@ -1171,7 +1226,6 @@ def fetch_sector_kline(sector_code: str, days: int = 10, session: requests.Sessi
             "lmt": str(days), "end": "20500101",
             "ut": "fa5fd1943c7b386f172d6893dbbd4dc0",
         },
-        headers={"Referer": "https://quote.eastmoney.com/center/boardlist.html"},
     )
     if not r:
         return []
@@ -1618,7 +1672,7 @@ def scrape_all(output_dir: str = "stock_data", target_codes: list[str] = None):
             kline_codes = target_codes
 
         print(f"\n📊 [6/6] 并行抓取日K线+120minK线 ({len(kline_codes)} 只主板, 1000天)...")
-        klines, klines_120 = fetch_all_klines_async(kline_codes, days=1000, concurrency=100)
+        klines, klines_120 = fetch_all_klines_async(kline_codes, days=1000, concurrency=25)
         klines = supplement_kline_amount(klines, quotes)
 
         kline_dir = f"{output_dir}/klines"
@@ -2016,7 +2070,7 @@ def close_auction_monitor(codes: list[str] = None, poll_interval: int = 10,
 
     # 2. 获取K线（用于MACD和技术池）— 东财重负载请求
     print("📊 获取K线数据...")
-    klines_map, kline120_map = fetch_all_klines_async(codes, days=1000, concurrency=100)
+    klines_map, kline120_map = fetch_all_klines_async(codes, days=1000, concurrency=25)
 
     # 3. 获取详情（市值/量比/换手率）
     quotes_final = fetch_quotes_batch(codes, session=session)
@@ -2053,48 +2107,6 @@ def close_auction_monitor(codes: list[str] = None, poll_interval: int = 10,
 
     print(f"  ✅ 板块K线: {len(sector_klines)}/{len(sectors)} 有数据")
 
-    # ---- 收盘竞价基准价获取（14:57的价格）----
-    # 盘中模式：第一个快照就是14:57的价格
-    # 收盘后模式：需要通过1分钟K线获取14:56的收盘价作为基准
-    auction_base_price: dict[str, float] = {}  # code → 14:57基准价
-
-    if post_market:
-        print("  📊 收盘后模式：批量获取1分钟K线以取得14:56基准价...")
-        base_limiter = RateLimiter(min_interval=0.15)
-        base_session = _build_session()
-
-        def _get_1456_price(code: str) -> float:
-            bars = fetch_kline_1min(code, count=10, session=base_session, limiter=base_limiter)
-            if not bars:
-                return 0
-            # 找14:56的bar（格式: "HH:MM" 或类似）
-            for bar in reversed(bars):
-                day_str = str(bar.get("day", ""))
-                # 腾讯1分钟K线时间格式: "1456" 或 "14:56" 或包含日期
-                if "14:56" in day_str or "1456" in day_str or day_str.endswith("1456"):
-                    return float(bar.get("close", 0))
-            # 找不到精确的14:56，取倒数第二个bar（最后一根是15:00收盘）
-            if len(bars) >= 2:
-                return float(bars[-2].get("close", 0))
-            return 0
-
-        with ThreadPoolExecutor(max_workers=20) as pool:
-            futures = {pool.submit(_get_1456_price, c): c for c in codes}
-            done_count = 0
-            for fut in as_completed(futures):
-                code = futures[fut]
-                done_count += 1
-                try:
-                    p = fut.result()
-                    if p > 0:
-                        auction_base_price[code] = p
-                except Exception:
-                    pass
-                if done_count % 500 == 0:
-                    print(f"    进度: {done_count}/{len(codes)}")
-
-        print(f"  ✅ 获取到 {len(auction_base_price)} 只股票的14:56基准价")
-
     # 构建候选股票列表（模拟早盘的 all_candidates）
     all_candidates = []
     min_snaps = 1 if post_market else 2  # 收盘后单次快照即可，盘中需要至少2次
@@ -2111,19 +2123,7 @@ def close_auction_monitor(codes: list[str] = None, poll_interval: int = 10,
         if prev_close <= 0 or close_price <= 0:
             continue
 
-        # ---- [v3.2] 收盘竞价用14:57价格作为基准，而非昨收 ----
-        if post_market:
-            base_price = auction_base_price.get(code, 0)
-        else:
-            # 盘中模式：第一个快照就是14:57的价格
-            base_price = first["price"]
-
-        if base_price > 0:
-            gap = (close_price - base_price) / base_price * 100
-        else:
-            # 回退：无基准价时用昨收（准确性降低）
-            gap = (close_price - prev_close) / prev_close * 100
-
+        gap = (close_price - prev_close) / prev_close * 100
         close_auction_vol = max(last["volume"] - first["volume"], 0)
         bid1_v = last["bid1_v"]
         ask1_v = last["ask1_v"]
@@ -2149,7 +2149,6 @@ def close_auction_monitor(codes: list[str] = None, poll_interval: int = 10,
             "prev_close": prev_close,
             "open_price": close_price,  # 收盘竞价用收盘价替代开盘价
             "auction_gain": round(gap, 2),
-            "auction_base_price": base_price,  # 14:57基准价
             "auction_vol": close_auction_vol,
             "volume": close_auction_vol,
             "volume_shares": q.get("volume", 0) * 100 if q.get("volume", 0) else 0,
@@ -4250,7 +4249,7 @@ def run_oneclick():
 
         # ---- 5. K线（并行抓取日K线+120minK线）----
         print(f"\n📊 并行获取K线 ({len(codes)} 只)...")
-        klines, klines_120 = fetch_all_klines_async(codes, days=1000, concurrency=100)
+        klines, klines_120 = fetch_all_klines_async(codes, days=1000, concurrency=25)
         klines = supplement_kline_amount(klines, quotes)
         kline_dir = f"{data_dir}/klines"
         os.makedirs(kline_dir, exist_ok=True)
