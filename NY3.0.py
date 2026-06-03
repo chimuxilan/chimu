@@ -1019,6 +1019,26 @@ def fetch_all_stock_codes(session: requests.Session = None) -> list[str]:
 # 4a. 东财全量A股列表（单次请求替代新浪串行分页）
 # ════════════════════════════════════════════════════
 
+def _safe_float(v, default=0.0):
+    """安全转 float，处理东财返回的 None/"-"/"" 等非数值"""
+    if v is None or v == "-" or v == "":
+        return default
+    try:
+        return float(v)
+    except (ValueError, TypeError):
+        return default
+
+
+def _safe_int(v, default=0):
+    """安全转 int，处理东财返回的 None/"-"/""/"123.0" 等"""
+    if v is None or v == "-" or v == "":
+        return default
+    try:
+        return int(float(v))
+    except (ValueError, TypeError):
+        return default
+
+
 def fetch_all_stock_codes_em(session: requests.Session = None) -> tuple[list[str], dict]:
     """
     东财 push2 单次请求获取全A股列表 + 行业分类。
@@ -1034,6 +1054,7 @@ def fetch_all_stock_codes_em(session: requests.Session = None) -> tuple[list[str
     all_rows = []
     page = 1
     page_size = 5000
+    max_retries = 3
 
     # push2 端点需要独立 session + 正确 Referer，不能复用 em_get 的 _EM_SESSION
     _push2_session = requests.Session()
@@ -1052,25 +1073,35 @@ def fetch_all_stock_codes_em(session: requests.Session = None) -> tuple[list[str
             "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",  # 沪深A股
             "fields": "f2,f3,f12,f13,f14,f100,f115,f128",
         }
-        try:
-            # 东财限流：与 em_get 共享时间戳，避免并发撞限流
-            wait = _EM_MIN_INTERVAL - (time.time() - _em_last_call[0])
-            if wait > 0:
-                time.sleep(wait + random.uniform(0.1, 0.3))
-            r = _push2_session.get(url, params=params, timeout=20)
-            _em_last_call[0] = time.time()
-            d = r.json()
-            items = d.get("data", {}).get("diff", [])
-            if not items:
+        success = False
+        for attempt in range(max_retries):
+            try:
+                r = _push2_session.get(url, params=params, timeout=20)
+                d = r.json()
+                items = d.get("data", {}).get("diff", [])
+                if not items and page == 1:
+                    # 第1页就空数据，可能是返回格式异常，重试
+                    print(f"    ⚠ 东财股票列表第{page}页返回空，重试({attempt+1}/{max_retries})...")
+                    time.sleep(1 + random.uniform(0.5, 1.5))
+                    continue
+                success = True
                 break
-            all_rows.extend(items)
-            total = d.get("data", {}).get("total", 0)
-            if len(all_rows) >= total or len(items) < page_size:
-                break
-            page += 1
-        except Exception as e:
-            print(f"    ⚠ 东财股票列表第{page}页失败: {e}")
+            except Exception as e:
+                print(f"    ⚠ 东财股票列表第{page}页失败({attempt+1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt + random.uniform(0.5, 1.5))
+
+        if not success:
+            print(f"    ❌ 东财股票列表第{page}页放弃")
             break
+
+        if not items:
+            break
+        all_rows.extend(items)
+        total = d.get("data", {}).get("total", 0)
+        if len(all_rows) >= total or len(items) < page_size:
+            break
+        page += 1
 
     codes = []
     stock_info = {}
@@ -1085,23 +1116,6 @@ def fetch_all_stock_codes_em(session: requests.Session = None) -> tuple[list[str
         if price is None or price == "-":
             continue
         codes.append(code)
-
-        def _safe_float(v, default=0.0):
-            if v is None or v == "-" or v == "":
-                return default
-            try:
-                return float(v)
-            except (ValueError, TypeError):
-                return default
-
-        def _safe_int(v, default=0):
-            if v is None or v == "-" or v == "":
-                return default
-            try:
-                return int(float(v))
-            except (ValueError, TypeError):
-                return default
-
         stock_info[code] = {
             "name": str(item.get("f14", "")),
             "price": _safe_float(price),
@@ -1780,6 +1794,10 @@ def scrape_all(output_dir: str = "stock_data", target_codes: list[str] = None):
         else:
             print(f"\n📋 [2/5] 东财单次请求获取全A股+行业分类...")
             all_codes, stock_info = fetch_all_stock_codes_em(session)
+            if len(all_codes) < 100:
+                print("    ⚠ 东财数据不足，回退新浪...")
+                all_codes = fetch_all_stock_codes(session)
+                stock_info = {}
             _save_json(all_codes, f"{output_dir}/all_codes_{timestamp}.json")
 
         # ── 2. 腾讯行情（与东财股票列表并行时已部分完成，此处补充完整行情）──
@@ -2072,9 +2090,13 @@ def close_auction_monitor(codes: list[str] = None, poll_interval: int = 10,
 
         session = _build_session()
 
-        # 1. 获取全部主板A股代码（东货行情+行业分类单次请求）
-        print("  📋 [1/3] 获取全部主板A股代码（东货行情+行业分类）...")
+        # 1. 获取全部主板A股代码（东货行情+行业分类单次请求，失败回退新浪）
+        print("  📋 [1/3] 获取全部主板A股代码...")
         all_codes, stock_info_em = fetch_all_stock_codes_em(session)
+        if len(all_codes) < 100:
+            print("    ⚠ 东财数据不足，回退新浪...")
+            all_codes = fetch_all_stock_codes(session)
+            stock_info_em = {}
         mainboard_codes = [c for c in all_codes if c.startswith(("60", "00"))]
         print(f"    ✅ 共 {len(mainboard_codes)} 只主板A股")
 
@@ -4392,18 +4414,24 @@ def run_oneclick():
             quotes = fetch_quotes_batch(codes, session)
             sectors = {}
         else:
-            # 东财单次请求获取全A股+行业分类（替代新浪~200次API）
+            # 东货行情+行业分类单次请求（替代新浪~200次API，失败回退新浪）
             print("\n📊 东货行情 + 行业分类（单次请求）...")
             all_codes, stock_info = fetch_all_stock_codes_em(session)
+            if len(all_codes) < 100:
+                print("    ⚠ 东财数据不足，回退新浪...")
+                all_codes = fetch_all_stock_codes(session)
+                stock_info = {}
             codes = all_codes
 
             print(f"\n📊 腾讯批量行情 ({len(codes)} 只)...")
             quotes = fetch_quotes_batch(codes, session)
 
-            # 板块从股票数据构建（零API请求）
-            sectors = fetch_sectors_fast(stock_info)
+            # 板块从股票数据构建（零API请求），东财无数据时回退新浪
+            if stock_info:
+                sectors = fetch_sectors_fast(stock_info)
+            else:
+                sectors = fetch_sectors(session)
             _save_json(sectors, f"{data_dir}/sectors_{timestamp}.json")
-
         print(f"  ✅ 行情: {len(quotes)} 只")
         _save_json(quotes, f"{data_dir}/quotes_{timestamp}.json")
 
