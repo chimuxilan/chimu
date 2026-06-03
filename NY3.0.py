@@ -673,17 +673,16 @@ async def _async_fetch_kline_batch(codes: list[str], days: int = 1000,
                 elif tencent_klines:
                     tencent_limiter.on_success()
 
-            # 腾讯数据不足且需要更多天数，用新浪补充（最多1000天）
-            if len(klines) < min(days, 500):
+            # 腾讯无数据的冷门股才走新浪（腾讯有数据就不补充，避免被新浪限速拖慢）
+            if not klines:
                 await sina_limiter.acquire()
                 try:
                     sina_klines = await _async_fetch_kline_sina(sina_sess, code, min(days, 1000), semaphore)
                 except Exception:
                     sina_klines = []
                     sina_limiter.on_429()
-                if len(sina_klines) > len(klines):
+                if sina_klines:
                     klines = sina_klines
-                elif sina_klines:
                     sina_limiter.on_success()
 
             done_count += 1
