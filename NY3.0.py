@@ -2107,6 +2107,30 @@ def close_auction_monitor(codes: list[str] = None, poll_interval: int = 10,
 
     print(f"  ✅ 板块K线: {len(sector_klines)}/{len(sectors)} 有数据")
 
+    # ---- 收盘后修正：用K线数据补充昨日成交量 + 用当日总成交量作为撮合量 ----
+    if post_market:
+        _fixed_vol = 0
+        for code in codes:
+            snaps = all_snapshots.get(code, [])
+            if not snaps:
+                continue
+            # 1) 撮合量：收盘后只有单次快照，差值为0，改用当日总成交量
+            daily_vol = snaps[-1].get("volume", 0)
+            if daily_vol > 0:
+                snaps[-1]["_daily_vol"] = daily_vol
+            # 2) 竞昨比分母：用K线昨日成交量（与早盘模式对齐）
+            klines = klines_map.get(code, [])
+            if klines and len(klines) >= 2:
+                try:
+                    yvol = int(float(klines[-2].get("volume", 0)))
+                    if yvol > 0:
+                        for s in snaps:
+                            s["_yesterday_vol"] = yvol
+                        _fixed_vol += 1
+                except (ValueError, TypeError):
+                    pass
+        print(f"  🔧 收盘后修正: {_fixed_vol} 只补充昨日成交量")
+
     # 构建候选股票列表（模拟早盘的 all_candidates）
     all_candidates = []
     min_snaps = 1 if post_market else 2  # 收盘后单次快照即可，盘中需要至少2次
@@ -2124,7 +2148,10 @@ def close_auction_monitor(codes: list[str] = None, poll_interval: int = 10,
             continue
 
         gap = (close_price - prev_close) / prev_close * 100
+        # 收盘后单次快照时差值为0，优先用修正后的当日总成交量
         close_auction_vol = max(last["volume"] - first["volume"], 0)
+        if close_auction_vol <= 0 and last.get("_daily_vol", 0) > 0:
+            close_auction_vol = last["_daily_vol"]
         bid1_v = last["bid1_v"]
         ask1_v = last["ask1_v"]
 
@@ -2164,6 +2191,8 @@ def close_auction_monitor(codes: list[str] = None, poll_interval: int = 10,
             "tail_ask_delta": snaps[-1]["ask1_v"] - snaps[-tail_window]["ask1_v"] if len(snaps) >= tail_window else 0,
             "total_bid_delta": snaps[-1]["bid1_v"] - snaps[0]["bid1_v"],
             "total_ask_delta": snaps[-1]["ask1_v"] - snaps[0]["ask1_v"],
+            # K线修正的昨日成交量（收盘后修正用）
+            "_yesterday_vol": last.get("_yesterday_vol", 0),
         })
 
     if not all_candidates:
@@ -2201,7 +2230,7 @@ def close_auction_monitor(codes: list[str] = None, poll_interval: int = 10,
         em = details.get(code, {})
 
         # 量价池
-        ok_vp, reason_vp = pool_volume_price(c, tc, em, klines=klines)
+        ok_vp, reason_vp = pool_volume_price(c, tc, em, klines=klines, close_auction=True)
         # 趋势池
         ok_trend, reason_trend = pool_trend(c, klines, tc=tc, em=em)
         # 技术池
@@ -2265,7 +2294,8 @@ def close_auction_monitor(codes: list[str] = None, poll_interval: int = 10,
         c["chg_0926"] = round((c["price"] - base_price) / base_price * 100, 2) if base_price > 0 else 0
 
         auction_vol = c.get("auction_vol", c["volume"])
-        yesterday_vol = c.get("volume_shares", 0) // 100 if c.get("volume_shares", 0) > 0 else 1
+        # 优先用K线修正的昨日成交量（与早盘模式对齐），兜底用volume_shares
+        yesterday_vol = c.get("_yesterday_vol", 0) or (c.get("volume_shares", 0) // 100 if c.get("volume_shares", 0) > 0 else 1)
         c["comp_ratio"] = round(auction_vol / yesterday_vol * 100, 1) if yesterday_vol > 0 else 0
 
         buy_vol = c.get("bid1_v", 0)
@@ -3017,7 +3047,7 @@ def pool_base_post_kline(code: str, price: float, klines: list[dict],
     return True, ""
 
 
-def pool_volume_price(c: dict, tc: dict, em: dict, klines: list = None) -> tuple[bool, str]:
+def pool_volume_price(c: dict, tc: dict, em: dict, klines: list = None, close_auction: bool = False) -> tuple[bool, str]:
     """
     策略池2 · 量价池（集合竞价量价信号）
     ─────────────────────────────────────
@@ -3101,8 +3131,8 @@ def pool_volume_price(c: dict, tc: dict, em: dict, klines: list = None) -> tuple
                     return False, f"3日涨幅≥15%"
         except (ValueError, TypeError):
             pass
-    # 11. 竞价量 > 40000手
-    if auction_vol <= 40000:
+    # 11. 竞价量 > 40000手（收盘模式用日总量做代理，此阈值无意义，跳过）
+    if not close_auction and auction_vol <= 40000:
         return False, "竞价量≤4万手"
 
     # 写回计算字段
