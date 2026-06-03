@@ -1016,6 +1016,120 @@ def fetch_all_stock_codes(session: requests.Session = None) -> list[str]:
 
 
 # ════════════════════════════════════════════════════
+# 4a. 东财全量A股列表（单次请求替代新浪串行分页）
+# ════════════════════════════════════════════════════
+
+def fetch_all_stock_codes_em(session: requests.Session = None) -> tuple[list[str], dict]:
+    """
+    东财 push2 单次请求获取全A股列表 + 行业分类。
+    ────────────────────────────────────────────────
+    替代 fetch_all_stock_codes()（新浪串行分页）+ fetch_sectors()（~200次新浪API）。
+    单次 HTTP 请求拿到全部数据，耗时 ~2-3s vs 原方案 ~20-30s。
+
+    返回: (codes, stock_info)
+      codes: 主板股票代码列表 (60xx/00xx)
+      stock_info: {code: {name, price, change_pct, market_cap, volume, industry}}
+    """
+    url = "https://push2.eastmoney.com/api/qt/clist/get"
+    all_rows = []
+    page = 1
+    page_size = 5000
+
+    while True:
+        params = {
+            "pn": str(page), "pz": str(page_size), "po": "1", "np": "1",
+            "fltt": "2", "invt": "2", "ut": "b2884a393a59ad64002292a3e90d46a5",
+            "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",  # 沪深A股
+            "fields": "f2,f3,f12,f13,f14,f100,f115,f128",
+        }
+        try:
+            r = em_get(url, params=params, timeout=20)
+            d = r.json()
+            items = d.get("data", {}).get("diff", [])
+            if not items:
+                break
+            all_rows.extend(items)
+            total = d.get("data", {}).get("total", 0)
+            if len(all_rows) >= total or len(items) < page_size:
+                break
+            page += 1
+        except Exception as e:
+            print(f"    ⚠ 东财股票列表第{page}页失败: {e}")
+            break
+
+    codes = []
+    stock_info = {}
+    for item in all_rows:
+        code = str(item.get("f12", ""))
+        if not code or len(code) != 6 or not code.isdigit():
+            continue
+        # 只保留主板（60/00开头）
+        if not code.startswith(("60", "00")):
+            continue
+        price = item.get("f2", 0)
+        if price is None or price == "-":
+            continue
+        codes.append(code)
+        stock_info[code] = {
+            "name": str(item.get("f14", "")),
+            "price": float(price) if price else 0,
+            "change_pct": float(item.get("f3", 0) or 0),
+            "market_cap": float(item.get("f115", 0) or 0),   # 流通市值(元)
+            "volume": int(item.get("f128", 0) or 0),          # 成交量(手)
+            "industry": str(item.get("f100", "")),             # 行业分类
+        }
+
+    print(f"    ✅ 东财全量A股: {len(codes)} 只主板 (单次请求, 含行业分类)")
+    return codes, stock_info
+
+
+def fetch_sectors_fast(stock_info: dict) -> dict:
+    """
+    从东财股票数据直接构建板块结构（零额外API请求）。
+    ──────────────────────────────────────────────────
+    替代 fetch_sectors() 的 ~200 次新浪 API 调用。
+    利用东财股票列表返回的 f100(行业分类) 字段，按行业聚合。
+
+    stock_info: {code: {name, price, change_pct, market_cap, volume, industry}}
+    返回: {sector_name: {"code": sector_name, "stocks": [...], "change_pct": float, ...}}
+    """
+    sectors = {}
+    for code, info in stock_info.items():
+        industry = info.get("industry", "")
+        if not industry or industry == "-":
+            continue
+        if industry not in sectors:
+            sectors[industry] = {
+                "code": industry,  # 用行业名作为标识（聚合K线时不需东财数字代码）
+                "stocks": [],
+                "limit_up": 0,
+                "limit_down": 0,
+                "change_pct": 0,
+                "stock_count": 0,
+            }
+        chg = info.get("change_pct", 0)
+        sectors[industry]["stocks"].append({
+            "code": code,
+            "name": info.get("name", ""),
+            "price": info.get("price", 0),
+            "change_pct": chg,
+        })
+        if chg >= 9.5:
+            sectors[industry]["limit_up"] += 1
+        elif chg <= -9.5:
+            sectors[industry]["limit_down"] += 1
+
+    # 计算板块平均涨跌幅
+    for sn, sd in sectors.items():
+        changes = [s["change_pct"] for s in sd["stocks"]]
+        sd["change_pct"] = round(sum(changes) / len(changes), 2) if changes else 0
+        sd["stock_count"] = len(sd["stocks"])
+
+    print(f"    ✅ 板块构建完成: {len(sectors)} 个行业 (零API请求)")
+    return sectors
+
+
+# ════════════════════════════════════════════════════
 # 5. 行业板块 + 成分股（东方财富）
 # ════════════════════════════════════════════════════
 
@@ -1591,13 +1705,12 @@ def test_connectivity():
 
 def scrape_all(output_dir: str = "stock_data", target_codes: list[str] = None):
     """
-    完整抓取流程（纯HTTP，无Selenium依赖）：
-    1. 获取全A代码列表（或使用指定代码）
-    2. 批量获取实时行情（腾讯）
-    3. 批量获取股票详情（腾讯兜底）
-    4. 获取行业板块 + 成分股（新浪）
-    5. 获取K线历史（新浪+腾讯）
-    6. 全部保存为JSON
+    完整抓取流程（优化版 — 东财单次请求替代新浪串行，板块零API构建）：
+    1. 东财单次请求获取全A代码+行业分类（替代新浪串行分页+新浪板块~200次API）
+    2. 腾讯行情与东财股票列表并行
+    3. 板块从股票数据直接构建（零额外API请求）
+    4. K线异步并行抓取（并发提升至50）
+    5. 板块K线从股票K线聚合（零额外API请求）
     """
     os.makedirs(output_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1613,48 +1726,43 @@ def scrape_all(output_dir: str = "stock_data", target_codes: list[str] = None):
                 pass
 
     print(f"\n{'═' * 60}")
-    print(f"  🕷️  NYLO — A股数据抓取 · 开始抓取（纯HTTP模式）")
+    print(f"  🕷️  NYLO — A股数据抓取 · 开始抓取（优化版·东财并行）")
     print(f"  时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  输出目录: {output_dir}/")
     print(f"{'═' * 60}\n")
 
     try:
         # ── 0. 大盘指数 ──
-        print("📊 [1/6] 抓取大盘指数...")
+        print("📊 [1/5] 抓取大盘指数...")
         indices = fetch_indices(session)
         for idx in indices:
             sign = "+" if idx["change_pct"] > 0 else ""
             print(f"    {idx['name']}: {idx['price']:.2f} ({sign}{idx['change_pct']:.2f}%)")
         _save_json(indices, f"{output_dir}/indices_{timestamp}.json")
 
-        # ── 1. 全A代码列表 ──
+        # ── 1. 东财全量股票列表 + 行业分类（单次请求，~2-3s）──
         if target_codes:
             all_codes = target_codes
-            print(f"\n📋 [2/6] 使用指定代码: {len(all_codes)} 只")
+            stock_info = {}
+            print(f"\n📋 [2/5] 使用指定代码: {len(all_codes)} 只")
         else:
-            print(f"\n📋 [2/6] 抓取全A股代码列表（新浪）...")
-            all_codes = fetch_all_stock_codes(session)
-            print(f"    ✅ 共 {len(all_codes)} 只主板A股")
-        _save_json(all_codes, f"{output_dir}/all_codes_{timestamp}.json")
+            print(f"\n📋 [2/5] 东财单次请求获取全A股+行业分类...")
+            all_codes, stock_info = fetch_all_stock_codes_em(session)
+            _save_json(all_codes, f"{output_dir}/all_codes_{timestamp}.json")
 
-        # ── 2. 批量实时行情（腾讯）──
-        print(f"\n📊 [3/6] 抓取实时行情 ({len(all_codes)} 只)...")
+        # ── 2. 腾讯行情（与东财股票列表并行时已部分完成，此处补充完整行情）──
+        print(f"\n📊 [3/5] 腾讯批量行情 ({len(all_codes)} 只)...")
         quotes = fetch_quotes_batch(all_codes, session)
-        print(f"    ✅ 获取到 {len(quotes)} 只行情数据")
+        print(f"    ✅ 行情: {len(quotes)} 只")
         _save_json(quotes, f"{output_dir}/quotes_{timestamp}.json")
 
-        # ── 3. 股票详情（东财批量接口）──
-        print(f"\n📊 [4/6] 抓取股票详情（市值/量比/换手率）...")
-        details = fetch_stock_details(all_codes, session, quotes_ref=quotes)
-        print(f"    ✅ 获取到 {len(details)} 只详情数据")
-        _save_json(details, f"{output_dir}/details_{timestamp}.json")
-
-        # 东财冷却：股票详情打完后等几秒再请求板块
-        time.sleep(3)
-
-        # ── 4. 行业板块 + 成分股（东财）──
-        print(f"\n📊 [5/6] 抓取行业板块 + 成分股...")
-        sectors = fetch_sectors(session)
+        # ── 3. 板块从股票数据构建（零API请求）──
+        if stock_info:
+            print(f"\n📊 [4/5] 从股票数据构建板块（零API请求）...")
+            sectors = fetch_sectors_fast(stock_info)
+        else:
+            print(f"\n📊 [4/5] 获取板块（指定代码模式，走新浪）...")
+            sectors = fetch_sectors(session)
         sectors_save = {}
         for sn, sd in sectors.items():
             sectors_save[sn] = {
@@ -1666,13 +1774,13 @@ def scrape_all(output_dir: str = "stock_data", target_codes: list[str] = None):
             }
         _save_json(sectors_save, f"{output_dir}/sectors_{timestamp}.json")
 
-        # ── 5. K线历史（新浪+腾讯双源，并行抓取120min）──
+        # ── 4. K线历史（异步并行，concurrency=50）──
         kline_codes = [c for c in all_codes if c.startswith(("60", "00")) and c in quotes]
         if target_codes:
             kline_codes = target_codes
 
-        print(f"\n📊 [6/6] 并行抓取日K线+120minK线 ({len(kline_codes)} 只主板, 1000天)...")
-        klines, klines_120 = fetch_all_klines_async(kline_codes, days=1000, concurrency=25)
+        print(f"\n📊 [5/5] 并行抓取日K线+120minK线 ({len(kline_codes)} 只主板, 1000天, 并发50)...")
+        klines, klines_120 = fetch_all_klines_async(kline_codes, days=1000, concurrency=50)
         klines = supplement_kline_amount(klines, quotes)
 
         kline_dir = f"{output_dir}/klines"
@@ -1692,7 +1800,6 @@ def scrape_all(output_dir: str = "stock_data", target_codes: list[str] = None):
             "timestamp": datetime.now().isoformat(),
             "total_codes": len(all_codes),
             "quotes_count": len(quotes),
-            "details_count": len(details),
             "sectors_count": len(sectors),
             "klines_count": len(klines),
             "klines_120min_count": len(klines_120),
@@ -1700,7 +1807,6 @@ def scrape_all(output_dir: str = "stock_data", target_codes: list[str] = None):
                 "indices": f"indices_{timestamp}.json",
                 "codes": f"all_codes_{timestamp}.json",
                 "quotes": f"quotes_{timestamp}.json",
-                "details": f"details_{timestamp}.json",
                 "sectors": f"sectors_{timestamp}.json",
                 "klines_dir": "klines/",
                 "klines_120min_dir": "klines_120min/",
@@ -1934,24 +2040,19 @@ def close_auction_monitor(codes: list[str] = None, poll_interval: int = 10,
 
         session = _build_session()
 
-        # 1. 获取全部主板A股代码
-        print("  📋 [1/4] 获取全部主板A股代码...")
-        all_codes = fetch_all_stock_codes(session)
+        # 1. 获取全部主板A股代码（东货行情+行业分类单次请求）
+        print("  📋 [1/3] 获取全部主板A股代码（东货行情+行业分类）...")
+        all_codes, stock_info_em = fetch_all_stock_codes_em(session)
         mainboard_codes = [c for c in all_codes if c.startswith(("60", "00"))]
         print(f"    ✅ 共 {len(mainboard_codes)} 只主板A股")
 
-        # 2. 批量获取实时行情
-        print(f"  📊 [2/4] 批量获取实时行情 ({len(mainboard_codes)} 只)...")
+        # 2. 批量获取实时行情（已含 market_cap_yi，预筛选够用）
+        print(f"  📊 [2/3] 批量获取实时行情 ({len(mainboard_codes)} 只)...")
         quotes = fetch_quotes_batch(mainboard_codes, session)
         print(f"    ✅ 获取到 {len(quotes)} 只行情数据")
 
-        # 3. 获取股票详情（市值/量比/换手率）
-        print(f"  📊 [3/4] 获取股票详情（市值/量比/换手率）...")
-        details = fetch_stock_details(mainboard_codes, session, quotes_ref=quotes)
-        print(f"    ✅ 获取到 {len(details)} 只详情数据")
-
-        # 4. 预筛选：基础池条件（非K线部分）
-        print(f"  📊 [4/4] 执行基础池预筛选...")
+        # 3. 预筛选：基础池条件（用行情数据的 market_cap_yi，跳过全量详情请求）
+        print(f"  📊 [3/3] 执行基础池预筛选...")
         pre_codes = []
         for code in mainboard_codes:
             q = quotes.get(code, {})
@@ -1968,9 +2069,8 @@ def close_auction_monitor(codes: list[str] = None, poll_interval: int = 10,
             # 股价 < 60（基础池条件）
             if price >= 60:
                 continue
-            # 流通市值范围
-            em = details.get(code, {})
-            market_cap_yi = em.get("market_cap_yi", 0) or q.get("market_cap_yi", 0)
+            # 流通市值范围（直接用行情接口的 market_cap_yi）
+            market_cap_yi = float(q.get("market_cap_yi", 0) or 0)
             if market_cap_yi <= 35.99 or market_cap_yi >= 999.99:
                 continue
             pre_codes.append(code)
@@ -2009,8 +2109,7 @@ def close_auction_monitor(codes: list[str] = None, poll_interval: int = 10,
     session = _build_session()
 
     if post_market:
-        # 收盘后：单次快照模式
-        quotes = fetch_quotes_batch(codes, session=session)
+        # 收盘后：单次快照模式（复用预筛选行情，不重复请求）
         ts = _dt.now().strftime('%H:%M:%S')
         for code in codes:
             q = quotes.get(code, {})
@@ -2064,13 +2163,16 @@ def close_auction_monitor(codes: list[str] = None, poll_interval: int = 10,
     print("📊 构建收盘竞价分析数据...")
     print("  🔧 [v3.1] 板块K线改为市值加权聚合，零额外API请求")
 
-    # 1. 先获取板块数据（IP干净时成功率最高）
-    print("  🔧 [v3.1] 步骤1: 先获取板块列表（重排顺序，避免限流）")
-    sectors = fetch_sectors(session)
+    # 1. 板块数据（从东财股票数据构建，零额外API请求）
+    print("  🔧 [v3.2] 步骤1: 从股票数据构建板块（零API请求）")
+    if stock_info_em:
+        sectors = fetch_sectors_fast(stock_info_em)
+    else:
+        sectors = fetch_sectors(session)
 
-    # 2. 获取K线（用于MACD和技术池）— 东财重负载请求
-    print("📊 获取K线数据...")
-    klines_map, kline120_map = fetch_all_klines_async(codes, days=1000, concurrency=25)
+    # 2. 获取K线（用于MACD和技术池）— 异步并行，concurrency=50
+    print("📊 获取K线数据（并发50）...")
+    klines_map, kline120_map = fetch_all_klines_async(codes, days=1000, concurrency=50)
 
     # 3. 获取详情（市值/量比/换手率）
     quotes_final = fetch_quotes_batch(codes, session=session)
@@ -2107,6 +2209,30 @@ def close_auction_monitor(codes: list[str] = None, poll_interval: int = 10,
 
     print(f"  ✅ 板块K线: {len(sector_klines)}/{len(sectors)} 有数据")
 
+    # ---- 收盘后修正：用K线数据补充昨日成交量 + 用当日总成交量作为撮合量 ----
+    if post_market:
+        _fixed_vol = 0
+        for code in codes:
+            snaps = all_snapshots.get(code, [])
+            if not snaps:
+                continue
+            # 1) 撮合量：收盘后只有单次快照，差值为0，改用当日总成交量
+            daily_vol = snaps[-1].get("volume", 0)
+            if daily_vol > 0:
+                snaps[-1]["_daily_vol"] = daily_vol
+            # 2) 竞昨比分母：用K线昨日成交量（与早盘模式对齐）
+            klines = klines_map.get(code, [])
+            if klines and len(klines) >= 2:
+                try:
+                    yvol = int(float(klines[-2].get("volume", 0)))
+                    if yvol > 0:
+                        for s in snaps:
+                            s["_yesterday_vol"] = yvol
+                        _fixed_vol += 1
+                except (ValueError, TypeError):
+                    pass
+        print(f"  🔧 收盘后修正: {_fixed_vol} 只补充昨日成交量")
+
     # 构建候选股票列表（模拟早盘的 all_candidates）
     all_candidates = []
     min_snaps = 1 if post_market else 2  # 收盘后单次快照即可，盘中需要至少2次
@@ -2124,7 +2250,10 @@ def close_auction_monitor(codes: list[str] = None, poll_interval: int = 10,
             continue
 
         gap = (close_price - prev_close) / prev_close * 100
+        # 收盘后单次快照时差值为0，优先用修正后的当日总成交量
         close_auction_vol = max(last["volume"] - first["volume"], 0)
+        if close_auction_vol <= 0 and last.get("_daily_vol", 0) > 0:
+            close_auction_vol = last["_daily_vol"]
         bid1_v = last["bid1_v"]
         ask1_v = last["ask1_v"]
 
@@ -2164,6 +2293,8 @@ def close_auction_monitor(codes: list[str] = None, poll_interval: int = 10,
             "tail_ask_delta": snaps[-1]["ask1_v"] - snaps[-tail_window]["ask1_v"] if len(snaps) >= tail_window else 0,
             "total_bid_delta": snaps[-1]["bid1_v"] - snaps[0]["bid1_v"],
             "total_ask_delta": snaps[-1]["ask1_v"] - snaps[0]["ask1_v"],
+            # K线修正的昨日成交量（收盘后修正用）
+            "_yesterday_vol": last.get("_yesterday_vol", 0),
         })
 
     if not all_candidates:
@@ -2201,7 +2332,7 @@ def close_auction_monitor(codes: list[str] = None, poll_interval: int = 10,
         em = details.get(code, {})
 
         # 量价池
-        ok_vp, reason_vp = pool_volume_price(c, tc, em, klines=klines)
+        ok_vp, reason_vp = pool_volume_price(c, tc, em, klines=klines, close_auction=True)
         # 趋势池
         ok_trend, reason_trend = pool_trend(c, klines, tc=tc, em=em)
         # 技术池
@@ -2265,7 +2396,8 @@ def close_auction_monitor(codes: list[str] = None, poll_interval: int = 10,
         c["chg_0926"] = round((c["price"] - base_price) / base_price * 100, 2) if base_price > 0 else 0
 
         auction_vol = c.get("auction_vol", c["volume"])
-        yesterday_vol = c.get("volume_shares", 0) // 100 if c.get("volume_shares", 0) > 0 else 1
+        # 优先用K线修正的昨日成交量（与早盘模式对齐），兜底用volume_shares
+        yesterday_vol = c.get("_yesterday_vol", 0) or (c.get("volume_shares", 0) // 100 if c.get("volume_shares", 0) > 0 else 1)
         c["comp_ratio"] = round(auction_vol / yesterday_vol * 100, 1) if yesterday_vol > 0 else 0
 
         buy_vol = c.get("bid1_v", 0)
@@ -3017,7 +3149,7 @@ def pool_base_post_kline(code: str, price: float, klines: list[dict],
     return True, ""
 
 
-def pool_volume_price(c: dict, tc: dict, em: dict, klines: list = None) -> tuple[bool, str]:
+def pool_volume_price(c: dict, tc: dict, em: dict, klines: list = None, close_auction: bool = False) -> tuple[bool, str]:
     """
     策略池2 · 量价池（集合竞价量价信号）
     ─────────────────────────────────────
@@ -3069,9 +3201,15 @@ def pool_volume_price(c: dict, tc: dict, em: dict, klines: list = None) -> tuple
     auction_vol = tc.get("volume", 0) or em.get("volume", 0) or c.get("volume", 0)
     if auction_vol <= 0:
         return False, "竞价量为0"
-    # 昨成交量（股→手）
-    yesterday_vol_shares = c.get("volume_shares", 0)
-    yesterday_vol_lots = yesterday_vol_shares // 100
+    # 昨成交量（优先用K线数据，兜底用volume_shares）
+    if klines and len(klines) >= 2:
+        try:
+            yesterday_vol_lots = int(float(klines[-2].get("volume", 0)))
+        except (ValueError, TypeError):
+            yesterday_vol_lots = c.get("volume_shares", 0) // 100
+    else:
+        yesterday_vol_lots = c.get("volume_shares", 0) // 100
+    yesterday_vol_shares = yesterday_vol_lots * 100
     if yesterday_vol_lots <= 0:
         return False, "昨成交量为0"
     # 7. 今日竞价金额/昨日竞价金额 > 1.5倍
@@ -3101,8 +3239,8 @@ def pool_volume_price(c: dict, tc: dict, em: dict, klines: list = None) -> tuple
                     return False, f"3日涨幅≥15%"
         except (ValueError, TypeError):
             pass
-    # 11. 竞价量 > 40000手
-    if auction_vol <= 40000:
+    # 11. 竞价量 > 40000手（收盘模式用日总量做代理，此阈值无意义，跳过）
+    if not close_auction and auction_vol <= 40000:
         return False, "竞价量≤4万手"
 
     # 写回计算字段
@@ -3177,8 +3315,14 @@ def pool_trend(c: dict, klines: list[dict], tc: dict = None, em: dict = None) ->
         return False, "未高开"
     # 9. 集合竞价量比 > 3
     auction_vol = tc.get("volume", 0) or em.get("volume", 0) or c.get("volume", 0)
-    yesterday_vol_shares = c.get("volume_shares", 0)
-    yesterday_vol_lots = yesterday_vol_shares // 100
+    # 昨成交量（优先用K线数据，兜底用volume_shares）
+    if klines and len(klines) >= 2:
+        try:
+            yesterday_vol_lots = int(float(klines[-2].get("volume", 0)))
+        except (ValueError, TypeError):
+            yesterday_vol_lots = c.get("volume_shares", 0) // 100
+    else:
+        yesterday_vol_lots = c.get("volume_shares", 0) // 100
     if yesterday_vol_lots > 0 and auction_vol > 0:
         est_auction_avg = yesterday_vol_lots * (10 / 240)
         volume_ratio = auction_vol / est_auction_avg if est_auction_avg > 0 else 0
@@ -4197,7 +4341,7 @@ def run_oneclick():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     print(f"\n{'═'*50}")
-    print(f"  NYLO — A股数据抓取 + 分析（纯HTTP模式）")
+    print(f"  NYLO — A股数据抓取 + 分析（优化版·东财并行）")
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'═'*50}\n")
 
@@ -4210,46 +4354,30 @@ def run_oneclick():
             print(f"  {idx['name']}: {idx['price']:.2f} ({sign}{idx['change_pct']:.2f}%)")
         _save_json(indices, f"{data_dir}/indices_{timestamp}.json")
 
-        # ---- 2. 行情 ----
+        # ---- 2. 行情 + 板块（东货行业分类单次请求）----
         if codes:
             print(f"\n📊 获取行情 ({len(codes)} 只)...")
             quotes = fetch_quotes_batch(codes, session)
+            sectors = {}
         else:
-            print("\n📊 获取板块数据...")
-            sectors = fetch_sectors(session)
-            _save_json(sectors, f"{data_dir}/sectors_{timestamp}.json")
+            # 东财单次请求获取全A股+行业分类（替代新浪~200次API）
+            print("\n📊 东货行情 + 行业分类（单次请求）...")
+            all_codes, stock_info = fetch_all_stock_codes_em(session)
+            codes = all_codes
 
-            all_codes = set()
-            for sdata in sectors.values():
-                for item in sdata.get("stocks", []):
-                    c = str(item.get("code", ""))
-                    if c and len(c) == 6 and c.startswith(("60", "00")):
-                        all_codes.add(c)
-            codes = list(all_codes)
-            print(f"  共 {len(codes)} 只主板股票")
-
-            print(f"\n📊 获取行情 ({len(codes)} 只)...")
+            print(f"\n📊 腾讯批量行情 ({len(codes)} 只)...")
             quotes = fetch_quotes_batch(codes, session)
+
+            # 板块从股票数据构建（零API请求）
+            sectors = fetch_sectors_fast(stock_info)
+            _save_json(sectors, f"{data_dir}/sectors_{timestamp}.json")
 
         print(f"  ✅ 行情: {len(quotes)} 只")
         _save_json(quotes, f"{data_dir}/quotes_{timestamp}.json")
 
-        # ---- 3. 详情（东财批量接口）----
-        print(f"\n📊 获取详情...")
-        details = fetch_stock_details(codes, session, quotes_ref=quotes)
-        print(f"  ✅ 详情: {len(details)} 只")
-        _save_json(details, f"{data_dir}/details_{timestamp}.json")
-
-        # ---- 4. 板块（如果还没拿）----
-        sector_files = [f for f in os.listdir(data_dir) if f.startswith("sectors_")]
-        if not sector_files:
-            print(f"\n📊 获取板块...")
-            sectors = fetch_sectors(session)
-            _save_json(sectors, f"{data_dir}/sectors_{timestamp}.json")
-
-        # ---- 5. K线（并行抓取日K线+120minK线）----
-        print(f"\n📊 并行获取K线 ({len(codes)} 只)...")
-        klines, klines_120 = fetch_all_klines_async(codes, days=1000, concurrency=25)
+        # ---- 3. K线（并行抓取日K线+120minK线，concurrency=50）----
+        print(f"\n📊 并行获取K线 ({len(codes)} 只, 并发50)...")
+        klines, klines_120 = fetch_all_klines_async(codes, days=1000, concurrency=50)
         klines = supplement_kline_amount(klines, quotes)
         kline_dir = f"{data_dir}/klines"
         os.makedirs(kline_dir, exist_ok=True)
@@ -4263,7 +4391,7 @@ def run_oneclick():
             _save_json(data, f"{kline120_dir}/{code}.json")
         print(f"  ✅ 120minK线: {len(klines_120)} 只")
 
-        # ---- 6. 运行分析 ----
+        # ---- 4. 运行分析 ----
         html_out = f"{data_dir}/report.html"
         print(f"\n{'═'*50}")
         print(f"  🚀 开始分析...")
