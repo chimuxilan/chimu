@@ -1035,6 +1035,16 @@ def fetch_all_stock_codes_em(session: requests.Session = None) -> tuple[list[str
     page = 1
     page_size = 5000
 
+    # push2 端点需要独立 session + 正确 Referer，不能复用 em_get 的 _EM_SESSION
+    _push2_session = requests.Session()
+    _push2_session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "Referer": "https://quote.eastmoney.com/",
+        "Accept": "*/*",
+        "Accept-Encoding": "gzip, deflate",
+        "Connection": "keep-alive",
+    })
+
     while True:
         params = {
             "pn": str(page), "pz": str(page_size), "po": "1", "np": "1",
@@ -1043,7 +1053,12 @@ def fetch_all_stock_codes_em(session: requests.Session = None) -> tuple[list[str
             "fields": "f2,f3,f12,f13,f14,f100,f115,f128",
         }
         try:
-            r = em_get(url, params=params, timeout=20)
+            # 东财限流：与 em_get 共享时间戳，避免并发撞限流
+            wait = _EM_MIN_INTERVAL - (time.time() - _em_last_call[0])
+            if wait > 0:
+                time.sleep(wait + random.uniform(0.1, 0.3))
+            r = _push2_session.get(url, params=params, timeout=20)
+            _em_last_call[0] = time.time()
             d = r.json()
             items = d.get("data", {}).get("diff", [])
             if not items:
