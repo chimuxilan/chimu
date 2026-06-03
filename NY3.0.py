@@ -1039,85 +1039,87 @@ def _safe_int(v, default=0):
         return default
 
 
-def fetch_all_stock_codes_em(session: requests.Session = None) -> tuple[list[str], dict]:
+def fetch_all_stock_codes_fast(session: requests.Session = None, max_workers: int = 10) -> tuple[list[str], dict]:
     """
-    东财 push2 获取全A股列表 + 行业分类（走 em_get 统一限流）。
-    ──────────────────────────────────────────────────────────────
-    替代 fetch_all_stock_codes()（新浪串行分页）+ fetch_sectors()（~200次新浪API）。
-    与仓库 a-stock-data 保持一致：所有 eastmoney.com 端点一律走 em_get()，不另建 session。
+    新浪并发获取全A股列表（不封IP，比串行快5-10倍）。
+    完全不依赖东财，只用新浪 API + ThreadPoolExecutor 并发。
 
     返回: (codes, stock_info)
       codes: 主板股票代码列表 (60xx/00xx)
-      stock_info: {code: {name, price, change_pct, market_cap, volume, industry}}
+      stock_info: {code: {name, price, change_pct}}
     """
-    url = "https://push2.eastmoney.com/api/qt/clist/get"
-    all_rows = []
-    page = 1
-    page_size = 5000
-    max_retries = 3
+    if session is None:
+        session = _build_session()
 
-    while True:
-        params = {
-            "pn": str(page), "pz": str(page_size), "po": "1", "np": "1",
-            "fltt": "2", "invt": "2", "ut": "b2884a393a59ad64002292a3e90d46a5",
-            "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",  # 沪深A股
-            "fields": "f2,f3,f12,f13,f14,f100,f115,f128",
-        }
-        # 与仓库一致：走 em_get()，传 per-request headers
-        headers = {"Referer": "https://quote.eastmoney.com/"}
-        success = False
-        for attempt in range(max_retries):
-            try:
-                r = em_get(url, params=params, headers=headers, timeout=20)
-                d = r.json()
-                items = d.get("data", {}).get("diff", [])
-                if not items and page == 1:
-                    print(f"    ⚠ 东财股票列表第{page}页返回空，重试({attempt+1}/{max_retries})...")
-                    time.sleep(2 ** attempt + random.uniform(0.5, 1.5))
-                    continue
-                success = True
-                break
-            except Exception as e:
-                print(f"    ⚠ 东财股票列表第{page}页失败({attempt+1}/{max_retries}): {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(2 ** attempt + random.uniform(0.5, 1.5))
+    # 先获取总数
+    r_count = safe_request(
+        "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeStockCount",
+        _limiter_sina, session,
+        params={"node": "hs_a"},
+        encoding="gbk",
+    )
+    total = int(r_count.text.strip().strip('"')) if r_count else 0
+    if total <= 0:
+        print("    ⚠ 新浪股票总数获取失败，回退串行模式")
+        codes = fetch_all_stock_codes(session)
+        return codes, {}
 
-        if not success:
-            print(f"    ❌ 东财股票列表第{page}页放弃")
-            break
+    page_size = 1000
+    total_pages = (total + page_size - 1) // page_size
+    print(f"    📦 新浪并发获取全A股: {total}只, {total_pages}页, {max_workers}线程...")
 
-        if not items:
-            break
-        all_rows.extend(items)
-        total = d.get("data", {}).get("total", 0)
-        if len(all_rows) >= total or len(items) < page_size:
-            break
-        page += 1
+    pages = list(range(1, total_pages + 1))
+    all_items = []
+
+    def _fetch_page(page):
+        try:
+            sess = _build_session()
+            r = safe_request(
+                "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData",
+                _limiter_sina, sess,
+                params={
+                    "page": str(page), "num": str(page_size), "sort": "symbol",
+                    "asc": "1", "node": "hs_a", "symbol": "", "_s_r_a": "page",
+                },
+                encoding="gbk",
+            )
+            if r:
+                return json.loads(r.text)
+        except Exception:
+            pass
+        return []
+
+    t0 = time.time()
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_fetch_page, p): p for p in pages}
+        for future in as_completed(futures):
+            items = future.result()
+            if items:
+                all_items.extend(items)
+
+    elapsed = time.time() - t0
 
     codes = []
     stock_info = {}
-    for item in all_rows:
-        code = str(item.get("f12", ""))
+    for item in all_items:
+        symbol = str(item.get("symbol", ""))
+        code = str(item.get("code", ""))
         if not code or len(code) != 6 or not code.isdigit():
             continue
-        # 只保留主板（60/00开头）
-        if not code.startswith(("60", "00")):
+        if not symbol.startswith(("sh", "sz")):
             continue
-        price = item.get("f2", 0)
-        if price is None or price == "-":
+        if not code.startswith(("60", "00")):
             continue
         codes.append(code)
         stock_info[code] = {
-            "name": str(item.get("f14", "")),
-            "price": _safe_float(price),
-            "change_pct": _safe_float(item.get("f3")),
-            "market_cap": _safe_float(item.get("f115")),      # 流通市值(元)
-            "volume": _safe_int(item.get("f128")),             # 成交量(手)
-            "industry": str(item.get("f100", "")),             # 行业分类
+            "name": str(item.get("name", "")),
+            "price": float(item.get("trade", 0) or 0),
+            "change_pct": float(item.get("changepercent", 0) or 0),
         }
 
-    print(f"    ✅ 东财全量A股: {len(codes)} 只主板 (单次请求, 含行业分类)")
+    print(f"    ✅ 新浪全量A股: {len(codes)} 只主板 ({elapsed:.1f}s, {max_workers}线程)")
     return codes, stock_info
+
 
 
 def fetch_sectors_fast(stock_info: dict) -> dict:
@@ -1744,7 +1746,7 @@ def scrape_all(output_dir: str = "stock_data", target_codes: list[str] = None):
     """
     完整抓取流程（优化版 — 东财单次请求替代新浪串行，板块零API构建）：
     1. 东财单次请求获取全A代码+行业分类（替代新浪串行分页+新浪板块~200次API）
-    2. 腾讯行情与东财股票列表并行
+    2. 腾讯批量行情
     3. 板块从股票数据直接构建（零额外API请求）
     4. K线异步并行抓取（并发提升至50）
     5. 板块K线从股票K线聚合（零额外API请求）
@@ -1763,7 +1765,7 @@ def scrape_all(output_dir: str = "stock_data", target_codes: list[str] = None):
                 pass
 
     print(f"\n{'═' * 60}")
-    print(f"  🕷️  NYLO — A股数据抓取 · 开始抓取（优化版·东财并行）")
+    print(f"  🕷️  NYLO — A股数据抓取 · 开始抓取（新浪并发+腾讯行情）")
     print(f"  时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  输出目录: {output_dir}/")
     print(f"{'═' * 60}\n")
@@ -1784,11 +1786,8 @@ def scrape_all(output_dir: str = "stock_data", target_codes: list[str] = None):
             print(f"\n📋 [2/5] 使用指定代码: {len(all_codes)} 只")
         else:
             print(f"\n📋 [2/5] 东财单次请求获取全A股+行业分类...")
-            all_codes, stock_info = fetch_all_stock_codes_em(session)
-            if len(all_codes) < 100:
-                print("    ⚠ 东财数据不足，回退新浪...")
-                all_codes = fetch_all_stock_codes(session)
-                stock_info = {}
+            all_codes, stock_info = fetch_all_stock_codes_fast(session)
+
             _save_json(all_codes, f"{output_dir}/all_codes_{timestamp}.json")
 
         # ── 2. 腾讯行情（与东财股票列表并行时已部分完成，此处补充完整行情）──
@@ -1797,13 +1796,9 @@ def scrape_all(output_dir: str = "stock_data", target_codes: list[str] = None):
         print(f"    ✅ 行情: {len(quotes)} 只")
         _save_json(quotes, f"{output_dir}/quotes_{timestamp}.json")
 
-        # ── 3. 板块从股票数据构建（零API请求）──
-        if stock_info:
-            print(f"\n📊 [4/5] 从股票数据构建板块（零API请求）...")
-            sectors = fetch_sectors_fast(stock_info)
-        else:
-            print(f"\n📊 [4/5] 获取板块（指定代码模式，走新浪）...")
-            sectors = fetch_sectors(session)
+        # ── 3. 行业板块（新浪）──
+        print(f"\n📊 [4/5] 获取行业板块...")
+        sectors = fetch_sectors(session)
         sectors_save = {}
         for sn, sd in sectors.items():
             sectors_save[sn] = {
@@ -2081,13 +2076,9 @@ def close_auction_monitor(codes: list[str] = None, poll_interval: int = 10,
 
         session = _build_session()
 
-        # 1. 获取全部主板A股代码（东货行情+行业分类单次请求，失败回退新浪）
+        # 1. 获取全部主板A股代码（新浪并发获取全A股，失败回退新浪）
         print("  📋 [1/3] 获取全部主板A股代码...")
-        all_codes, stock_info_em = fetch_all_stock_codes_em(session)
-        if len(all_codes) < 100:
-            print("    ⚠ 东财数据不足，回退新浪...")
-            all_codes = fetch_all_stock_codes(session)
-            stock_info_em = {}
+        all_codes, _ = fetch_all_stock_codes_fast(session)
         mainboard_codes = [c for c in all_codes if c.startswith(("60", "00"))]
         print(f"    ✅ 共 {len(mainboard_codes)} 只主板A股")
 
@@ -2210,10 +2201,7 @@ def close_auction_monitor(codes: list[str] = None, poll_interval: int = 10,
 
     # 1. 板块数据（从东财股票数据构建，零额外API请求）
     print("  🔧 [v3.2] 步骤1: 从股票数据构建板块（零API请求）")
-    if stock_info_em:
-        sectors = fetch_sectors_fast(stock_info_em)
-    else:
-        sectors = fetch_sectors(session)
+    sectors = fetch_sectors(session)
 
     # 2. 获取K线（用于MACD和技术池）— 异步并行，concurrency=50
     print("📊 获取K线数据（并发50）...")
@@ -4393,7 +4381,7 @@ def run_oneclick():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     print(f"\n{'═'*50}")
-    print(f"  NYLO — A股数据抓取 + 分析（优化版·东财并行）")
+    print(f"  NYLO — A股数据抓取 + 分析（新浪并发+腾讯行情）")
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'═'*50}\n")
 
@@ -4412,23 +4400,17 @@ def run_oneclick():
             quotes = fetch_quotes_batch(codes, session)
             sectors = {}
         else:
-            # 东货行情+行业分类单次请求（替代新浪~200次API，失败回退新浪）
-            print("\n📊 东货行情 + 行业分类（单次请求）...")
-            all_codes, stock_info = fetch_all_stock_codes_em(session)
-            if len(all_codes) < 100:
-                print("    ⚠ 东财数据不足，回退新浪...")
-                all_codes = fetch_all_stock_codes(session)
-                stock_info = {}
+            # 新浪并发获取全A股（替代新浪~200次API，失败回退新浪）
+            print("\n📊 新浪并发获取全A股...")
+            all_codes, stock_info = fetch_all_stock_codes_fast(session)
+
             codes = all_codes
 
             print(f"\n📊 腾讯批量行情 ({len(codes)} 只)...")
             quotes = fetch_quotes_batch(codes, session)
 
-            # 板块从股票数据构建（零API请求），东财无数据时回退新浪
-            if stock_info:
-                sectors = fetch_sectors_fast(stock_info)
-            else:
-                sectors = fetch_sectors(session)
+            # 行业板块（新浪）
+            sectors = fetch_sectors(session)
             _save_json(sectors, f"{data_dir}/sectors_{timestamp}.json")
         print(f"  ✅ 行情: {len(quotes)} 只")
         _save_json(quotes, f"{data_dir}/quotes_{timestamp}.json")
