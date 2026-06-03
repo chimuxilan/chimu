@@ -2302,14 +2302,21 @@ def close_auction_monitor(codes: list[str] = None, poll_interval: int = 10,
         bid1_v = last["bid1_v"]
         ask1_v = last["ask1_v"]
 
-        # 查板块信息
+        # 查板块信息（兼容 "stocks" 和 "members" 两种格式）
         sname = "未知"
         limit_cnt = 0
         for sn, sd in sectors.items():
-            members = sd.get("members", [])
-            if code in members:
+            # fetch_sectors_fast 用 "stocks"，fetch_sectors 也可能用 "stocks"
+            member_codes = set()
+            for stk in sd.get("stocks", []):
+                mc = stk.get("code", "") if isinstance(stk, dict) else str(stk)
+                if mc:
+                    member_codes.add(mc)
+            for mc in sd.get("members", []):
+                member_codes.add(str(mc))
+            if code in member_codes:
                 sname = sn
-                limit_cnt = sd.get("limit_count", 0)
+                limit_cnt = sd.get("limit_count", sd.get("limit_up", 0))
                 break
 
         q = quotes_final.get(code, {})
