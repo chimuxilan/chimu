@@ -2627,7 +2627,7 @@ def close_auction_monitor(codes: list[str] = None, poll_interval: int = 10,
     # ---- 生成HTML报告（复用早盘的 save_screen_html）----
     if not html_path:
         html_path = "close_auction_report.html"
-    path = save_screen_html(final, [], html_path)
+    path = save_screen_html(final, [], html_path, close_auction=True)
     print(f"\n📄 报告: {path}")
 
     return final
@@ -3654,7 +3654,7 @@ def _compute_screen_strategy(s: dict) -> str:
     return base
 
 
-def save_screen_html(stocks: list[dict], indices: list[dict], path: str, main_line_sectors: list = None) -> str:
+def save_screen_html(stocks: list[dict], indices: list[dict], path: str, main_line_sectors: list = None, close_auction: bool = False) -> str:
     """保存主板筛选策略HTML报告（与截图一致的格式）"""
     if main_line_sectors is None:
         main_line_sectors = []
@@ -3802,9 +3802,21 @@ def save_screen_html(stocks: list[dict], indices: list[dict], path: str, main_li
 <div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap">{ml_cells}</div>
 </div>"""
 
+    # 根据早盘/尾盘模式切换标题和列名
+    if close_auction:
+        report_title = "📊 收盘集合竞价 - 策略池OR筛选 · 频次排名TOP10"
+        col_price1 = "14:57"
+        col_price2 = "收盘价"
+        col_chg = "收盘涨幅"
+    else:
+        report_title = "📊 集合竞价 - 策略池OR筛选 · 频次排名TOP10"
+        col_price1 = "09:25"
+        col_price2 = "09:26"
+        col_chg = "09:26涨幅"
+
     html = f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>集合竞价 - 策略池OR筛选 · 频次排名</title>
+<title>{report_title.replace('📊 ', '')}</title>
 <style>
 *{{margin:0;padding:0;box-sizing:border-box}}
 body{{font-family:"Microsoft YaHei","PingFang SC",sans-serif;background:#0d1117;color:#c9d1d9;padding:16px}}
@@ -3819,7 +3831,7 @@ tr:hover{{background:#161b22}}
 .ft{{text-align:center;color:#484f58;font-size:10px;padding:20px 0}}
 @media(max-width:768px){{table{{font-size:11px}}th,td{{padding:4px 6px}}}}
 </style></head><body>
-<div class="hd"><h1>📊 集合竞价 - 策略池OR筛选 · 频次排名TOP10</h1><div class="t">更新时间: {now}</div></div>
+<div class="hd"><h1>{report_title}</h1><div class="t">更新时间: {now}</div></div>
 {idx_html}
 {main_line_html}
 {leader_html}
@@ -3827,8 +3839,8 @@ tr:hover{{background:#161b22}}
 <div class="tbl-wrap">
 <table>
 <thead><tr>
-<th>代码</th><th>名称</th><th>板块(涨停数)</th><th>主线</th><th>龙头</th><th>09:25</th><th>09:26</th><th>搓合量</th>
-<th>竞昨比</th><th>剩余率</th><th>09:26涨幅</th>
+<th>代码</th><th>名称</th><th>板块(涨停数)</th><th>主线</th><th>龙头</th><th>{col_price1}</th><th>{col_price2}</th><th>搓合量</th>
+<th>竞昨比</th><th>剩余率</th><th>{col_chg}</th>
 <th>筹码判断</th><th>频次</th><th>尾段判定</th><th>策略池</th><th>策略</th>
 <th>DIF</th><th>DEA</th><th>BAR</th><th>趋势</th><th>信号</th>
 </tr></thead>
