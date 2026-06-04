@@ -2183,7 +2183,9 @@ def close_auction_monitor(codes: list[str] = None, poll_interval: int = 10,
     session = _build_session()
 
     if post_market:
-        # 收盘后：单次快照模式（复用预筛选行情，不重复请求）
+        # 收盘后：单次快照模式 — 重新获取最新行情（不能复用早盘预筛选数据）
+        print("  🔄 重新获取收盘竞价行情数据...")
+        quotes = fetch_quotes_batch(codes, session=session)
         ts = _dt.now().strftime('%H:%M:%S')
         for code in codes:
             q = quotes.get(code, {})
