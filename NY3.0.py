@@ -2885,6 +2885,13 @@ def close_auction_monitor(codes: list[str] = None, poll_interval: int = 10,
 
         c["strategy"] = _compute_screen_strategy(c)
 
+    # ---- 去除涨停股票（涨幅>=9.5%）----
+    before_filter = len(final)
+    final = [c for c in final if c.get("auction_gain", 0) < 9.5]
+    filtered_count = before_filter - len(final)
+    if filtered_count > 0:
+        print(f"  🚫 去除涨停股票: {filtered_count} 只")
+    
     # ---- 按DDE净量排序（超强主力→强主力→主力流入→主力流出→强主力流出），保留前10 ----
     def _dde_sort_key(x):
         dde_net = x.get("dde_net_volume", 0)
@@ -4772,7 +4779,14 @@ def run_from_data_dir(data_dir: str, html_path: str = None, quiet: bool = False)
 
         c["strategy"] = _compute_screen_strategy(c)
 
-    # ---- 11. 按DDE净量排序（超强主力→强主力→主力流入→主力流出→强主力流出），保留前10 ----
+    # ---- 11. 去除涨停股票（涨幅>=9.5%）----
+    before_filter = len(final)
+    final = [c for c in final if c.get("auction_gain", 0) < 9.5]
+    filtered_count = before_filter - len(final)
+    if filtered_count > 0:
+        print(f"  🚫 去除涨停股票: {filtered_count} 只")
+    
+    # ---- 12. 按DDE净量排序（超强主力→强主力→主力流入→主力流出→强主力流出），保留前10 ----
     def _dde_sort_key_main(x):
         dde_net = x.get("dde_net_volume", 0)
         if dde_net > 5: return 5      # 超强主力流入
@@ -4791,7 +4805,7 @@ def run_from_data_dir(data_dir: str, html_path: str = None, quiet: bool = False)
     if len(final) > 10:
         final = final[:10]
 
-    # ---- 12. 龙头股识别 ----
+    # ---- 13. 龙头股识别 ----
     # 在前10中，按板块分组，每个板块内频次最高者为龙头
     sector_groups = {}
     for c in final:
