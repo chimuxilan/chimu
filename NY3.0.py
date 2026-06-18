@@ -1611,6 +1611,128 @@ def check_dde_rules(dde_data: dict, code: str) -> tuple[bool, list[str]]:
     return passed, rules
 
 
+def fetch_intraday_big_order_flow(codes: list[str], session: requests.Session = None) -> dict:
+    """
+    获取盘中当日实时大单逐笔流向数据
+    ─────────────────────────────────
+    数据来源：东财资金流向分钟级数据
+    返回: {code: {
+        mid_buy_vol: 中段买量(手),
+        mid_sell_vol: 中段卖量(手),
+        tail_buy_vol: 尾段买量(手),
+        tail_sell_vol: 尾段卖量(手),
+        big_order_net: 大单净流入(元),
+        super_large_net: 超大单净流入(元),
+        main_net_inflow: 主力净流入(元),
+        mid_buy_all: 中段是否全买单,
+        latest_big_orders: 最近大单列表
+    }}
+    """
+    if session is None:
+        session = _build_session()
+    
+    results = {}
+    
+    for code in codes:
+        try:
+            market = "1" if code.startswith("6") else "0"
+            secid = f"{market}.{code}"
+            
+            # 获取分钟级资金流向
+            r = em_get(
+                "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get",
+                params={
+                    "secid": secid,
+                    "fields1": "f1,f2,f3,f7",
+                    "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65",
+                    "klt": "1",
+                    "lmt": "0",
+                    "end": "20500101",
+                    "ut": "b2884a393a59ad64002292a3e90d46a5",
+                },
+            )
+            
+            if not r:
+                continue
+            
+            data = r.json()
+            if not data or data.get("data") is None:
+                continue
+            
+            klines = data.get("data", {}).get("klines", [])
+            if not klines:
+                continue
+            
+            # 解析分钟级数据
+            # 格式：时间,主力净流入,超大单净流入,大单净流入,中单净流入,小单净流入,...
+            mid_buy_vol = 0
+            mid_sell_vol = 0
+            tail_buy_vol = 0
+            tail_sell_vol = 0
+            big_order_net = 0
+            super_large_net = 0
+            main_net_inflow = 0
+            mid_buy_all = True
+            
+            # 分析最近30分钟的数据（中段）和最后5分钟（尾段）
+            now = datetime.now()
+            current_hour = now.hour
+            current_minute = now.minute
+            
+            for line in klines:
+                parts = line.split(",")
+                if len(parts) < 7:
+                    continue
+                
+                time_str = parts[0]  # 格式：HH:MM
+                try:
+                    hour, minute = map(int, time_str.split(":"))
+                except ValueError:
+                    continue
+                
+                main_flow = float(parts[1]) if parts[1] else 0
+                super_large_flow = float(parts[2]) if parts[2] else 0
+                large_flow = float(parts[3]) if parts[3] else 0
+                
+                # 累加大单数据
+                big_order_net += large_flow
+                super_large_net += super_large_flow
+                main_net_inflow += main_flow
+                
+                # 判断中段（09:15-09:22）和尾段（09:23-09:25）
+                if hour == 9:
+                    if 15 <= minute <= 22:
+                        # 中段
+                        if large_flow > 0:
+                            mid_buy_vol += int(large_flow / 10000)  # 转换为手
+                        else:
+                            mid_sell_vol += int(abs(large_flow) / 10000)
+                            mid_buy_all = False
+                    elif 23 <= minute <= 25:
+                        # 尾段
+                        if large_flow > 0:
+                            tail_buy_vol += int(large_flow / 10000)
+                        else:
+                            tail_sell_vol += int(abs(large_flow) / 10000)
+            
+            results[code] = {
+                "mid_buy_vol": mid_buy_vol,
+                "mid_sell_vol": mid_sell_vol,
+                "tail_buy_vol": tail_buy_vol,
+                "tail_sell_vol": tail_sell_vol,
+                "big_order_net": big_order_net,
+                "super_large_net": super_large_net,
+                "main_net_inflow": main_net_inflow,
+                "mid_buy_all": mid_buy_all,
+                "data_source": "eastmoney_intraday",
+            }
+            
+        except Exception as e:
+            continue
+    
+    return results
+
+
 # ════════════════════════════════════════════════════
 # 7. 大盘指数
 # ════════════════════════════════════════════════════
@@ -2743,10 +2865,14 @@ def close_auction_monitor(codes: list[str] = None, poll_interval: int = 10,
                 supplemented += 1
         print(f"  ✅ 新浪补充完成: {supplemented} 只获得1000天数据")
 
-    # ---- 获取DDE大单数据（收盘竞价）----
-    print("📊 获取DDE大单数据...")
+    # ---- 获取DDE大单数据 + 盘中实时大单流向（收盘竞价）----
+    print("📊 获取DDE大单数据 + 盘中实时大单流向...")
     final_codes = [c["code"] for c in final]
     dde_data = fetch_dde_data_batch(final_codes, session=session)
+    
+    # 获取盘中实时大单逐笔流向
+    intraday_flow = fetch_intraday_big_order_flow(final_codes, session=session)
+    print(f"    ✅ 盘中大单流向: {len(intraday_flow)} 只")
     
     # 将DDE数据附加到候选股票
     for c in final:
@@ -2771,6 +2897,29 @@ def close_auction_monitor(codes: list[str] = None, poll_interval: int = 10,
             c["dde_source"] = ""
             c["dde_passed"] = False
             c["dde_rules"] = ["无DDE数据"]
+        
+        # 附加盘中实时大单流向数据
+        if code in intraday_flow:
+            flow = intraday_flow[code]
+            c["mid_buy_vol"] = flow.get("mid_buy_vol", 0)
+            c["mid_sell_vol"] = flow.get("mid_sell_vol", 0)
+            c["tail_buy_vol"] = flow.get("tail_buy_vol", 0)
+            c["tail_sell_vol"] = flow.get("tail_sell_vol", 0)
+            c["big_order_net"] = flow.get("big_order_net", 0)
+            c["super_large_net_intraday"] = flow.get("super_large_net", 0)
+            c["main_net_intraday"] = flow.get("main_net_inflow", 0)
+            c["mid_buy_all"] = flow.get("mid_buy_all", False)
+            c["intraday_flow_source"] = flow.get("data_source", "")
+        else:
+            c["mid_buy_vol"] = 0
+            c["mid_sell_vol"] = 0
+            c["tail_buy_vol"] = 0
+            c["tail_sell_vol"] = 0
+            c["big_order_net"] = 0
+            c["super_large_net_intraday"] = 0
+            c["main_net_intraday"] = 0
+            c["mid_buy_all"] = False
+            c["intraday_flow_source"] = ""
 
     # ---- 抢筹/出货深度分析 + 频次统计（与早盘一致）----
     print("📊 执行抢筹/出货深度分析...")
@@ -2856,12 +3005,15 @@ def close_auction_monitor(codes: list[str] = None, poll_interval: int = 10,
 
         c["verdict"] = "真实抢筹" if score >= 9 else ("疑似出货" if score <= 0 else "正常")
 
-        # 尾段竞价判定（与早盘一致，用收盘竞价数据）
+        # 尾段竞价判定（与早盘一致，含盘中实时大单数据）
         is_limit_up = chg >= 9.5
         ts_score, ts_verdict, ts_signals = tail_segment_verdict(
             gap=chg, vol=auction_vol,
             buy_vol=buy_vol, sell_vol=sell_vol,
             is_limit_up=is_limit_up,
+            mid_buy_all=c.get("mid_buy_all", False),
+            mid_sell_vol=c.get("mid_sell_vol", 0),
+            tail_sell_vol=c.get("tail_sell_vol", 0),
             vol_min=500,
         )
 
@@ -3219,17 +3371,51 @@ def _build_tail_description(s: dict) -> str:
     else:
         attitude = "谨慎"
     
-    # 从信号中提取中段和尾段信息
-    mid_info = ""
-    tail_info = ""
-    extra_info = ""
+    # 获取盘中实时大单数据
+    mid_buy_vol = s.get("mid_buy_vol", 0)
+    mid_sell_vol = s.get("mid_sell_vol", 0)
+    tail_buy_vol = s.get("tail_buy_vol", 0)
+    tail_sell_vol = s.get("tail_sell_vol", 0)
+    big_order_net = s.get("big_order_net", 0)
+    super_large_net = s.get("super_large_net_intraday", 0)
+    main_net_intraday = s.get("main_net_intraday", 0)
     
+    # 构建中段描述
+    mid_info = ""
+    if mid_buy_vol > 0 or mid_sell_vol > 0:
+        if mid_buy_vol > mid_sell_vol * 2:
+            mid_state = "强势"
+        elif mid_sell_vol > mid_buy_vol * 2:
+            mid_state = "出货"
+        else:
+            mid_state = "分歧"
+        mid_info = f"中段:{mid_buy_vol}买/{mid_sell_vol}卖({mid_state})"
+    
+    # 构建尾段描述
+    tail_info = ""
+    if tail_buy_vol > 0 or tail_sell_vol > 0:
+        if tail_buy_vol > tail_sell_vol * 2:
+            tail_state = "强势"
+        elif tail_sell_vol > tail_buy_vol * 2:
+            tail_state = "出货"
+        else:
+            tail_state = "分歧"
+        tail_info = f"尾段:{tail_buy_vol}买/{tail_sell_vol}卖({tail_state})"
+    
+    # 构建大单描述
+    extra_info = ""
+    if big_order_net > 0:
+        extra_info = f"大买单({big_order_net/10000:.0f}万)"
+    elif big_order_net < 0:
+        extra_info = f"大卖单({abs(big_order_net)/10000:.0f}万)"
+    
+    # 从信号中提取补充信息
     for sig in ts_signals:
-        if "中段" in sig:
+        if "中段" in sig and not mid_info:
             mid_info = sig
-        elif "尾段" in sig:
+        elif "尾段" in sig and not tail_info:
             tail_info = sig
-        elif "大卖单" in sig or "大买单" in sig:
+        elif ("大卖单" in sig or "大买单" in sig) and not extra_info:
             extra_info = sig
     
     # 如果没有详细信号，使用简化描述
@@ -3237,7 +3423,6 @@ def _build_tail_description(s: dict) -> str:
         buy_vol = s.get("bid1_v", 0)
         sell_vol = s.get("ask1_v", 0)
         if buy_vol > 0 or sell_vol > 0:
-            # 判断状态
             if buy_vol > sell_vol * 2:
                 state = "强势"
             elif sell_vol > buy_vol * 2:
@@ -4629,10 +4814,14 @@ def run_from_data_dir(data_dir: str, html_path: str = None, quiet: bool = False)
 
     print(f"  初选池: {len(final)} 只（任一策略池通过）")
 
-    # ---- 9.5. 获取DDE大单数据 ----
-    print("📊 获取DDE大单数据...")
+    # ---- 9.5. 获取DDE大单数据 + 盘中实时大单流向 ----
+    print("📊 获取DDE大单数据 + 盘中实时大单流向...")
     final_codes = [c["code"] for c in final]
     dde_data = fetch_dde_data_batch(final_codes, session=session)
+    
+    # 获取盘中实时大单逐笔流向
+    intraday_flow = fetch_intraday_big_order_flow(final_codes, session=session)
+    print(f"    ✅ 盘中大单流向: {len(intraday_flow)} 只")
     
     # 将DDE数据附加到候选股票
     for c in final:
@@ -4657,6 +4846,29 @@ def run_from_data_dir(data_dir: str, html_path: str = None, quiet: bool = False)
             c["dde_source"] = ""
             c["dde_passed"] = False
             c["dde_rules"] = ["无DDE数据"]
+        
+        # 附加盘中实时大单流向数据
+        if code in intraday_flow:
+            flow = intraday_flow[code]
+            c["mid_buy_vol"] = flow.get("mid_buy_vol", 0)
+            c["mid_sell_vol"] = flow.get("mid_sell_vol", 0)
+            c["tail_buy_vol"] = flow.get("tail_buy_vol", 0)
+            c["tail_sell_vol"] = flow.get("tail_sell_vol", 0)
+            c["big_order_net"] = flow.get("big_order_net", 0)
+            c["super_large_net_intraday"] = flow.get("super_large_net", 0)
+            c["main_net_intraday"] = flow.get("main_net_inflow", 0)
+            c["mid_buy_all"] = flow.get("mid_buy_all", False)
+            c["intraday_flow_source"] = flow.get("data_source", "")
+        else:
+            c["mid_buy_vol"] = 0
+            c["mid_sell_vol"] = 0
+            c["tail_buy_vol"] = 0
+            c["tail_sell_vol"] = 0
+            c["big_order_net"] = 0
+            c["super_large_net_intraday"] = 0
+            c["main_net_intraday"] = 0
+            c["mid_buy_all"] = False
+            c["intraday_flow_source"] = ""
 
     # ---- 10. 抢筹/出货深度分析 + 频次统计 ----
     print("📊 执行抢筹/出货深度分析...")
@@ -4766,12 +4978,15 @@ def run_from_data_dir(data_dir: str, html_path: str = None, quiet: bool = False)
 
         c["verdict"] = "真实抢筹" if score >= 9 else ("疑似出货" if score <= 0 else "正常")
 
-        # ---- 尾段竞价判定（新规则三维评分）----
+        # ---- 尾段竞价判定（新规则三维评分，含盘中实时大单数据）----
         is_limit_up = chg >= 9.5
         ts_score, ts_verdict, ts_signals = tail_segment_verdict(
             gap=chg, vol=c.get("auction_vol", c.get("volume", 0)),
             buy_vol=buy_vol, sell_vol=sell_vol,
             is_limit_up=is_limit_up,
+            mid_buy_all=c.get("mid_buy_all", False),
+            mid_sell_vol=c.get("mid_sell_vol", 0),
+            tail_sell_vol=c.get("tail_sell_vol", 0),
         )
         c["tail_score"] = ts_score
         c["tail_verdict"] = ts_verdict
