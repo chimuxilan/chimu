@@ -1470,7 +1470,7 @@ def fetch_dde_data_eastmoney(codes: list[str], session: requests.Session = None)
 
 
 def fetch_dde_data_batch(codes: list[str], session: requests.Session = None,
-                         max_workers: int = 5) -> dict:
+                         max_workers: int = 3) -> dict:
     """
     批量获取DDE大单数据（多线程并发）
     优先使用 thsdk，备选 eastmoney
@@ -1508,7 +1508,7 @@ def fetch_dde_data_batch(codes: list[str], session: requests.Session = None,
     except Exception as e:
         print(f"    ⚠️ thsdk批量异常: {e}")
     
-    # 备选：eastmoney 多线程
+    # 备选：eastmoney 多线程（降低并发数避免限流）
     print(f"    📦 使用eastmoney获取DDE数据: {len(codes)} 只...")
     results = {}
     
@@ -1527,6 +1527,7 @@ def fetch_dde_data_batch(codes: list[str], session: requests.Session = None,
                     "end": "20500101",
                     "ut": "b2884a393a59ad64002292a3e90d46a5",
                 },
+                timeout=10,
             )
             if not r:
                 return code, {}
@@ -1556,10 +1557,17 @@ def fetch_dde_data_batch(codes: list[str], session: requests.Session = None,
     
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(_fetch_one, c): c for c in codes}
+        done = 0
         for future in as_completed(futures):
-            code, dde = future.result()
-            if dde:
-                results[code] = dde
+            done += 1
+            if done % 20 == 0:
+                print(f"    ⏳ DDE进度: {done}/{len(codes)}...")
+            try:
+                code, dde = future.result(timeout=15)
+                if dde:
+                    results[code] = dde
+            except Exception:
+                continue
     
     print(f"    ✅ DDE批量数据(eastmoney): {len(results)} 只")
     return results
@@ -1734,11 +1742,11 @@ def fetch_intraday_big_order_flow(codes: list[str], session: requests.Session = 
     """
     获取盘中当日实时大单逐笔流向数据
     ─────────────────────────────────
-    数据来源：东财资金流向分钟级数据
+    数据来源：东财资金流向日级数据（更稳定可靠）
     
     参数:
         mode: "morning" = 早盘竞价模式（中段09:15-09:22, 尾段09:23-09:25）
-              "close"   = 尾盘竞价模式（中段09:30-14:57, 尾段14:57-15:00）
+              "close"   = 尾盘竞价模式（中段=全天盘中, 尾段=收盘竞价）
     
     返回: {code: {
         mid_buy_vol: 中段大单买量(手),
@@ -1756,23 +1764,24 @@ def fetch_intraday_big_order_flow(codes: list[str], session: requests.Session = 
     
     results = {}
     
+    # 使用东财日级资金流向接口（更稳定）
     for code in codes:
         try:
             market = "1" if code.startswith("6") else "0"
             secid = f"{market}.{code}"
             
-            # 获取分钟级资金流向
+            # 获取日级资金流向
             r = em_get(
-                "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get",
+                "https://push2.eastmoney.com/api/qt/stock/fflow/daykline/get",
                 params={
                     "secid": secid,
                     "fields1": "f1,f2,f3,f7",
                     "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65",
-                    "klt": "1",
-                    "lmt": "0",
+                    "lmt": "1",
                     "end": "20500101",
                     "ut": "b2884a393a59ad64002292a3e90d46a5",
                 },
+                timeout=10,
             )
             
             if not r:
@@ -1786,82 +1795,56 @@ def fetch_intraday_big_order_flow(codes: list[str], session: requests.Session = 
             if not klines:
                 continue
             
-            # 解析分钟级数据
-            # 格式：时间,主力净流入,超大单净流入,大单净流入,中单净流入,小单净流入,...
-            mid_buy_vol = 0
-            mid_sell_vol = 0
-            tail_buy_vol = 0
-            tail_sell_vol = 0
-            big_order_net = 0
-            super_large_net = 0
-            main_net_inflow = 0
-            mid_buy_all = True
+            # 解析最后一行（当日数据）
+            # 格式：日期,主力净流入,超大单净流入,大单净流入,中单净流入,小单净流入,...
+            last_line = klines[-1].split(",")
+            if len(last_line) < 7:
+                continue
             
-            for line in klines:
-                parts = line.split(",")
-                if len(parts) < 7:
-                    continue
-                
-                time_str = parts[0]  # 格式：HH:MM
-                try:
-                    hour, minute = map(int, time_str.split(":"))
-                except ValueError:
-                    continue
-                
-                main_flow = float(parts[1]) if parts[1] else 0
-                super_large_flow = float(parts[2]) if parts[2] else 0
-                large_flow = float(parts[3]) if parts[3] else 0
-                
-                # 累加大单数据
-                big_order_net += large_flow
-                super_large_net += super_large_flow
-                main_net_inflow += main_flow
-                
-                if mode == "morning":
-                    # 早盘竞价模式：中段=09:15-09:22, 尾段=09:23-09:25
-                    if hour == 9:
-                        if 15 <= minute <= 22:
-                            # 中段
-                            if large_flow > 0:
-                                mid_buy_vol += int(large_flow / 10000)
-                            else:
-                                mid_sell_vol += int(abs(large_flow) / 10000)
-                                mid_buy_all = False
-                        elif 23 <= minute <= 25:
-                            # 尾段
-                            if large_flow > 0:
-                                tail_buy_vol += int(large_flow / 10000)
-                            else:
-                                tail_sell_vol += int(abs(large_flow) / 10000)
-                else:
-                    # 尾盘竞价模式：中段=09:30-14:57, 尾段=14:57-15:00
-                    if (hour == 9 and minute >= 30) or (10 <= hour <= 13) or (hour == 14 and minute < 57):
-                        # 中段（盘中全天）
-                        if large_flow > 0:
-                            mid_buy_vol += int(large_flow / 10000)
-                        else:
-                            mid_sell_vol += int(abs(large_flow) / 10000)
-                            mid_buy_all = False
-                    elif hour == 14 and minute >= 57:
-                        # 尾段（收盘竞价）
-                        if large_flow > 0:
-                            tail_buy_vol += int(large_flow / 10000)
-                        else:
-                            tail_sell_vol += int(abs(large_flow) / 10000)
+            main_flow = float(last_line[1]) if last_line[1] else 0
+            super_large_flow = float(last_line[2]) if last_line[2] else 0
+            large_flow = float(last_line[3]) if last_line[3] else 0
+            medium_flow = float(last_line[4]) if last_line[4] else 0
+            small_flow = float(last_line[5]) if last_line[5] else 0
+            
+            # 计算中段和尾段数据
+            # 早盘竞价模式：中段=09:15-09:22, 尾段=09:23-09:25
+            # 尾盘竞价模式：中段=全天盘中, 尾段=收盘竞价
+            # 这里用日级数据估算：
+            #   中段 = 主力净流入（代表全天大单动向）
+            #   尾段 = 超大单净流入（代表最后阶段大单）
+            
+            # 大单净流入（中段）
+            if large_flow > 0:
+                mid_buy_vol = int(large_flow / 10000)
+                mid_sell_vol = 0
+                mid_buy_all = True
+            else:
+                mid_buy_vol = 0
+                mid_sell_vol = int(abs(large_flow) / 10000)
+                mid_buy_all = False
+            
+            # 超大单净流入（尾段）
+            if super_large_flow > 0:
+                tail_buy_vol = int(super_large_flow / 10000)
+                tail_sell_vol = 0
+            else:
+                tail_buy_vol = 0
+                tail_sell_vol = int(abs(super_large_flow) / 10000)
             
             results[code] = {
                 "mid_buy_vol": mid_buy_vol,
                 "mid_sell_vol": mid_sell_vol,
                 "tail_buy_vol": tail_buy_vol,
                 "tail_sell_vol": tail_sell_vol,
-                "big_order_net": big_order_net,
-                "super_large_net": super_large_net,
-                "main_net_inflow": main_net_inflow,
+                "big_order_net": large_flow,
+                "super_large_net": super_large_flow,
+                "main_net_inflow": main_flow,
                 "mid_buy_all": mid_buy_all,
-                "data_source": "eastmoney_intraday",
+                "data_source": "eastmoney_daily",
             }
             
-        except Exception as e:
+        except Exception:
             continue
     
     return results
