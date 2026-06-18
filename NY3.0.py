@@ -1347,6 +1347,271 @@ def fetch_stock_details(codes: list[str], session: requests.Session = None,
 
 
 # ════════════════════════════════════════════════════
+# 6a. DDE大单数据（资金流向）
+# ════════════════════════════════════════════════════
+
+def fetch_dde_data_ths(codes: list[str], session: requests.Session = None) -> dict:
+    """
+    通过同花顺接口获取DDE大单数据（资金流向）
+    返回: {code: {main_net_inflow, super_large_net, large_net, medium_net, small_net, dde_net_volume}}
+    
+    数据来源优先级：
+      1. ths.market_data_cn(code, "资金流向") — 主力净流入、超大单/大单/中单/小单净流入
+      2. ths.market_data_cn(code, "扩展1") — 含主力净流入 + 换手率/量比/委比
+    """
+    if session is None:
+        session = _build_session()
+    
+    results = {}
+    
+    # 尝试使用 thsdk 获取数据
+    try:
+        from ths import THS  # type: ignore
+        ths = THS()
+        for code in codes:
+            try:
+                # 获取资金流向数据
+                data = ths.market_data_cn(code, "资金流向")
+                if data and len(data) > 0:
+                    results[code] = {
+                        "main_net_inflow": float(data.get("主力净流入", 0) or 0),
+                        "super_large_net": float(data.get("超大单净流入", 0) or 0),
+                        "large_net": float(data.get("大单净流入", 0) or 0),
+                        "medium_net": float(data.get("中单净流入", 0) or 0),
+                        "small_net": float(data.get("小单净流入", 0) or 0),
+                        "dde_net_volume": float(data.get("DDE大单净量", 0) or 0),
+                        "source": "thsdk",
+                    }
+            except Exception as e:
+                continue
+        if results:
+            print(f"    ✅ DDE数据(thsdk): {len(results)} 只")
+            return results
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"    ⚠️ thsdk异常: {e}")
+    
+    # 备选方案：使用 eastmoney 资金流向接口
+    try:
+        results = fetch_dde_data_eastmoney(codes, session)
+        if results:
+            print(f"    ✅ DDE数据(eastmoney): {len(results)} 只")
+            return results
+    except Exception as e:
+        print(f"    ⚠️ eastmoney资金流向异常: {e}")
+    
+    print(f"    ⚠️ DDE数据获取失败，跳过DDE筛选")
+    return {}
+
+
+def fetch_dde_data_eastmoney(codes: list[str], session: requests.Session = None) -> dict:
+    """
+    通过东方财富接口获取资金流向数据（DDE大单数据）
+    作为 thsdk 的备选方案
+    
+    东财资金流向接口：
+      https://push2.eastmoney.com/api/qt/stock/fflow/kline/get
+      参数：secid=1.600519 (1=沪市, 0=深市)
+    """
+    if session is None:
+        session = _build_session()
+    
+    results = {}
+    
+    for code in codes:
+        try:
+            # 判断市场
+            market = "1" if code.startswith("6") else "0"
+            secid = f"{market}.{code}"
+            
+            # 获取当日资金流向
+            r = em_get(
+                "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get",
+                params={
+                    "secid": secid,
+                    "fields1": "f1,f2,f3,f7",
+                    "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65",
+                    "klt": "1",
+                    "lmt": "0",
+                    "end": "20500101",
+                    "ut": "b2884a393a59ad64002292a3e90d46a5",
+                },
+            )
+            
+            if not r:
+                continue
+            
+            data = r.json()
+            if not data or data.get("data") is None:
+                continue
+            
+            klines = data.get("data", {}).get("klines", [])
+            if not klines:
+                continue
+            
+            # 解析最后一行数据（当日最终值）
+            last_line = klines[-1].split(",")
+            if len(last_line) >= 7:
+                # 格式：时间,主力净流入,超大单净流入,大单净流入,中单净流入,小单净流入,...
+                results[code] = {
+                    "main_net_inflow": float(last_line[1]) if last_line[1] else 0,
+                    "super_large_net": float(last_line[2]) if last_line[2] else 0,
+                    "large_net": float(last_line[3]) if last_line[3] else 0,
+                    "medium_net": float(last_line[4]) if last_line[4] else 0,
+                    "small_net": float(last_line[5]) if last_line[5] else 0,
+                    "dde_net_volume": float(last_line[1]) / 10000 if last_line[1] else 0,  # 转换为万手
+                    "source": "eastmoney",
+                }
+        except Exception as e:
+            continue
+    
+    return results
+
+
+def fetch_dde_data_batch(codes: list[str], session: requests.Session = None,
+                         max_workers: int = 5) -> dict:
+    """
+    批量获取DDE大单数据（多线程并发）
+    优先使用 thsdk，备选 eastmoney
+    
+    返回: {code: {main_net_inflow, super_large_net, large_net, medium_net, small_net, dde_net_volume, source}}
+    """
+    if session is None:
+        session = _build_session()
+    
+    # 首先尝试 thsdk（批量接口）
+    try:
+        from ths import THS  # type: ignore
+        ths = THS()
+        results = {}
+        for code in codes:
+            try:
+                data = ths.market_data_cn(code, "资金流向")
+                if data and len(data) > 0:
+                    results[code] = {
+                        "main_net_inflow": float(data.get("主力净流入", 0) or 0),
+                        "super_large_net": float(data.get("超大单净流入", 0) or 0),
+                        "large_net": float(data.get("大单净流入", 0) or 0),
+                        "medium_net": float(data.get("中单净流入", 0) or 0),
+                        "small_net": float(data.get("小单净流入", 0) or 0),
+                        "dde_net_volume": float(data.get("DDE大单净量", 0) or 0),
+                        "source": "thsdk",
+                    }
+            except Exception:
+                continue
+        if results:
+            print(f"    ✅ DDE批量数据(thsdk): {len(results)} 只")
+            return results
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"    ⚠️ thsdk批量异常: {e}")
+    
+    # 备选：eastmoney 多线程
+    print(f"    📦 使用eastmoney获取DDE数据: {len(codes)} 只...")
+    results = {}
+    
+    def _fetch_one(code):
+        try:
+            market = "1" if code.startswith("6") else "0"
+            secid = f"{market}.{code}"
+            r = em_get(
+                "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get",
+                params={
+                    "secid": secid,
+                    "fields1": "f1,f2,f3,f7",
+                    "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65",
+                    "klt": "1",
+                    "lmt": "0",
+                    "end": "20500101",
+                    "ut": "b2884a393a59ad64002292a3e90d46a5",
+                },
+            )
+            if not r:
+                return code, {}
+            
+            data = r.json()
+            if not data or data.get("data") is None:
+                return code, {}
+            
+            klines = data.get("data", {}).get("klines", [])
+            if not klines:
+                return code, {}
+            
+            last_line = klines[-1].split(",")
+            if len(last_line) >= 7:
+                return code, {
+                    "main_net_inflow": float(last_line[1]) if last_line[1] else 0,
+                    "super_large_net": float(last_line[2]) if last_line[2] else 0,
+                    "large_net": float(last_line[3]) if last_line[3] else 0,
+                    "medium_net": float(last_line[4]) if last_line[4] else 0,
+                    "small_net": float(last_line[5]) if last_line[5] else 0,
+                    "dde_net_volume": float(last_line[1]) / 10000 if last_line[1] else 0,
+                    "source": "eastmoney",
+                }
+            return code, {}
+        except Exception:
+            return code, {}
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_fetch_one, c): c for c in codes}
+        for future in as_completed(futures):
+            code, dde = future.result()
+            if dde:
+                results[code] = dde
+    
+    print(f"    ✅ DDE批量数据(eastmoney): {len(results)} 只")
+    return results
+
+
+def check_dde_rules(dde_data: dict, code: str) -> tuple[bool, list[str]]:
+    """
+    检查DDE大单数据规则
+    
+    规则：
+      1. DDE大单净量 > 1（万手）→ 主力资金流入
+      2. 主力净流入 > 0 → 资金净流入
+      3. 超大单净流入 > 0 → 机构资金介入
+      4. 大单净流入 > 0 → 大资金关注
+    
+    返回: (是否通过, [触发的规则列表])
+    """
+    if code not in dde_data:
+        return False, ["无DDE数据"]
+    
+    dde = dde_data[code]
+    rules = []
+    passed = False
+    
+    # 规则1：DDE大单净量 > 1（核心条件）
+    dde_net = dde.get("dde_net_volume", 0)
+    if dde_net > 1:
+        rules.append(f"DDE净量>{dde_net:.2f}")
+        passed = True
+    
+    # 规则2：主力净流入 > 0
+    main_inflow = dde.get("main_net_inflow", 0)
+    if main_inflow > 0:
+        rules.append(f"主力净流入>{main_inflow/10000:.0f}万")
+        passed = True
+    
+    # 规则3：超大单净流入 > 0
+    super_large = dde.get("super_large_net", 0)
+    if super_large > 0:
+        rules.append(f"超大单净流入>{super_large/10000:.0f}万")
+        passed = True
+    
+    # 规则4：大单净流入 > 0
+    large_net = dde.get("large_net", 0)
+    if large_net > 0:
+        rules.append(f"大单净流入>{large_net/10000:.0f}万")
+        passed = True
+    
+    return passed, rules
+
+
+# ════════════════════════════════════════════════════
 # 7. 大盘指数
 # ════════════════════════════════════════════════════
 
@@ -2183,9 +2448,7 @@ def close_auction_monitor(codes: list[str] = None, poll_interval: int = 10,
     session = _build_session()
 
     if post_market:
-        # 收盘后：单次快照模式 — 重新获取最新行情（不能复用早盘预筛选数据）
-        print("  🔄 重新获取收盘竞价行情数据...")
-        quotes = fetch_quotes_batch(codes, session=session)
+        # 收盘后：单次快照模式（复用预筛选行情，不重复请求）
         ts = _dt.now().strftime('%H:%M:%S')
         for code in codes:
             q = quotes.get(code, {})
@@ -2480,6 +2743,35 @@ def close_auction_monitor(codes: list[str] = None, poll_interval: int = 10,
                 supplemented += 1
         print(f"  ✅ 新浪补充完成: {supplemented} 只获得1000天数据")
 
+    # ---- 获取DDE大单数据（收盘竞价）----
+    print("📊 获取DDE大单数据...")
+    final_codes = [c["code"] for c in final]
+    dde_data = fetch_dde_data_batch(final_codes, session=session)
+    
+    # 将DDE数据附加到候选股票
+    for c in final:
+        code = c["code"]
+        if code in dde_data:
+            dde = dde_data[code]
+            c["dde_main_net_inflow"] = dde.get("main_net_inflow", 0)
+            c["dde_super_large_net"] = dde.get("super_large_net", 0)
+            c["dde_large_net"] = dde.get("large_net", 0)
+            c["dde_medium_net"] = dde.get("medium_net", 0)
+            c["dde_small_net"] = dde.get("small_net", 0)
+            c["dde_net_volume"] = dde.get("dde_net_volume", 0)
+            c["dde_source"] = dde.get("source", "")
+            c["dde_passed"], c["dde_rules"] = check_dde_rules(dde_data, code)
+        else:
+            c["dde_main_net_inflow"] = 0
+            c["dde_super_large_net"] = 0
+            c["dde_large_net"] = 0
+            c["dde_medium_net"] = 0
+            c["dde_small_net"] = 0
+            c["dde_net_volume"] = 0
+            c["dde_source"] = ""
+            c["dde_passed"] = False
+            c["dde_rules"] = ["无DDE数据"]
+
     # ---- 抢筹/出货深度分析 + 频次统计（与早盘一致）----
     print("📊 执行抢筹/出货深度分析...")
     for c in final:
@@ -2506,7 +2798,7 @@ def close_auction_monitor(codes: list[str] = None, poll_interval: int = 10,
         rr = c["remaining_rate"]
         cr = c.get("comp_ratio", 0)
 
-        # 频次分析（与早盘一致）
+        # 频次分析（与早盘一致，含DDE大单规则）
         freq_signals = []
         freq = 0
         if vr >= 8:
@@ -2521,11 +2813,16 @@ def close_auction_monitor(codes: list[str] = None, poll_interval: int = 10,
             freq += 1; freq_signals.append("板块涨停≥5")
         if len(c.get("passed_pools", [])) >= 3:
             freq += 1; freq_signals.append("多池共振")
+        # DDE大单净量 > 1 → 主力资金流入
+        if c.get("dde_passed", False):
+            freq += 1
+            dde_rules_str = ",".join(c.get("dde_rules", []))
+            freq_signals.append(f"DDE:{dde_rules_str[:15]}")
 
         c["frequency"] = freq
         c["freq_signals"] = freq_signals
 
-        # 抢筹/出货综合判断（与早盘一致）
+        # 抢筹/出货综合判断（与早盘一致，含DDE评分）
         score = 0
         if chg >= 9.5: score += 3
         elif chg >= 7: score += 2
@@ -2545,6 +2842,13 @@ def close_auction_monitor(codes: list[str] = None, poll_interval: int = 10,
         elif freq >= 3: score += 1
         if len(c.get("passed_pools", [])) >= 4: score += 2
         elif len(c.get("passed_pools", [])) >= 3: score += 1
+        # DDE大单维度（最高3分）
+        dde_net_vol = c.get("dde_net_volume", 0)
+        if dde_net_vol > 5: score += 3      # 超强主力流入
+        elif dde_net_vol > 3: score += 2    # 强主力流入
+        elif dde_net_vol > 1: score += 1    # 主力流入
+        elif dde_net_vol < -1: score -= 1   # 主力流出
+        elif dde_net_vol < -3: score -= 2   # 强主力流出
         if chg >= 9.5:
             if vr < 5: score -= 3
             if rr < 50: score -= 2
@@ -2581,11 +2885,21 @@ def close_auction_monitor(codes: list[str] = None, poll_interval: int = 10,
 
         c["strategy"] = _compute_screen_strategy(c)
 
-    # ---- 按频次排序，保留前10 ----
+    # ---- 按DDE净量排序（超强主力→强主力→主力流入→主力流出→强主力流出），保留前10 ----
+    def _dde_sort_key(x):
+        dde_net = x.get("dde_net_volume", 0)
+        if dde_net > 5: return 5      # 超强主力流入
+        elif dde_net > 3: return 4    # 强主力流入
+        elif dde_net > 1: return 3    # 主力流入
+        elif dde_net < -3: return 1   # 强主力流出
+        elif dde_net < -1: return 2   # 主力流出
+        else: return 2.5              # 中性
+    
     final.sort(key=lambda x: (
-        -x.get("frequency", 0),
-        -x.get("auction_gain", 0),
-        -x.get("sector_limit_count", 0),
+        -_dde_sort_key(x),            # DDE净量分级（主排序）
+        -x.get("dde_net_volume", 0),  # DDE净量具体值
+        -x.get("frequency", 0),       # 频次
+        -x.get("auction_gain", 0),    # 涨幅
     ))
     if len(final) > 10:
         final = final[:10]
@@ -2607,22 +2921,80 @@ def close_auction_monitor(codes: list[str] = None, poll_interval: int = 10,
             c["is_leader"] = False
             c["leader_count"] = 0
 
-    # ---- 输出结果（与早盘格式一致）----
-    print(f"\n{'─'*90}")
-    print(f"  📊 收盘竞价分析结果")
-    print(f"{'─'*90}")
+    # ---- 输出结果（按图中格式显示）----
+    print(f"\n{'═'*120}")
+    print(f"  【竞价选股汇总】竞价选股汇总（按DDE净量优先）V3.0")
+    print(f"{'═'*120}")
+    
+    # 表头
+    print(f"  {'代码':<8} {'净流入':>10} {'名称':<18} {'频次-爆量比':>12} {'昨日主力':>8} {'筹码判断':<16} {'尾段竞价':<40} {'09:25':>7} {'09:26':>7} {'撮合量':>8} {'竞昨比':>7} {'剩余率':>7}")
+    print(f"  {'─'*116}")
+    
     for i, s in enumerate(final, 1):
-        chg = s.get("auction_gain", 0)
-        ts_icon = "🟢" if s.get("tail_verdict") == "看多" else "🔴"
-        pools = "/".join(s.get("passed_pools", []))
-        print(f"  {i:>2}. {s['code']} {s['name']:<8} {s.get('sector',''):<8} "
-              f"涨幅:{chg:+.2f}% 剩余率:{s.get('remaining_rate',0):.1f}% "
-              f"筹码:{s.get('verdict','正常'):<6} 频次:{s.get('frequency',0)} "
-              f"尾段:{ts_icon}{s.get('tail_verdict','')}{s.get('tail_score',0):+d} "
-              f"策略池:[{pools}] 策略:{s.get('strategy','')}")
-        for sig in s.get("tail_signals", []):
-            print(f"    {sig}")
-    print(f"{'─'*90}")
+        code = s['code']
+        name = s['name']
+        chg_0926 = s.get("chg_0926", 0)
+        auction_gain = s.get("auction_gain", 0)
+        
+        # 净流入（红色显示）
+        dde_main_inflow = s.get("dde_main_net_inflow", 0)
+        if dde_main_inflow > 0:
+            inflow_str = f"\033[91m+{dde_main_inflow/10000:.0f}万\033[0m"  # 红色
+        elif dde_main_inflow < 0:
+            inflow_str = f"\033[92m{dde_main_inflow/10000:.0f}万\033[0m"  # 绿色
+        else:
+            inflow_str = "-"
+        
+        # 名称+涨幅
+        name_str = f"{name}({chg_0926:+.2f}%)"
+        
+        # 频次-爆量比
+        freq = s.get("frequency", 0)
+        volume_ratio = s.get("volume_ratio", 0)
+        freq_str = f"{freq}/{volume_ratio:.1f}%"
+        
+        # 昨日主力（DDE净量）
+        dde_net_vol = s.get("dde_net_volume", 0)
+        main_force_str = f"{dde_net_vol:.2f}"
+        
+        # 筹码判断（带排名，黄色显示）
+        verdict = s.get("verdict", "正常")
+        rank = i  # 排名
+        verdict_str = f"{verdict} \033[93m排名第{rank}\033[0m"  # 黄色排名
+        
+        # 尾段竞价（详细描述）
+        tail_desc = _build_tail_description(s)
+        
+        # 09:25 和 09:26 价格
+        price_0925 = s.get("auction_price", s.get("price", 0))
+        price_0926 = s.get("price_0926", s.get("price", 0))
+        
+        # 撮合量
+        vol_fmt = _format_volume(s.get("auction_vol", s.get("volume", 0)))
+        
+        # 竞昨比
+        comp_ratio = s.get("comp_ratio", 0)
+        comp_str = f"{comp_ratio:.2f}" if comp_ratio > 0 else "-"
+        
+        # 剩余率
+        remaining = s.get("remaining_rate", 50)
+        remain_str = f"{remaining:.1f}%" if remaining != 50 else "-"
+        
+        # 格式化输出
+        print(f"  {code:<8} {inflow_str:>10} {name_str:<18} {freq_str:>12} {main_force_str:>8} {verdict_str:<16} {tail_desc:<40} {price_0925:>7.2f} {price_0926:>7.2f} {vol_fmt:>8} {comp_str:>7} {remain_str:>7}")
+
+    print(f"  {'─'*116}")
+    
+    # 底部信息
+    print(f"  完成")
+    
+    # 弱主力组信息
+    weak_stocks = [s for s in final if s.get("dde_net_volume", 0) < -1]
+    if weak_stocks:
+        weak_codes = [s['code'] for s in weak_stocks]
+        print(f"  【弱主力组】延后查询 {len(weak_codes)} 只：{'、'.join(weak_codes)}")
+    
+    print(f"{'═'*120}")
 
     # ---- 生成HTML报告（复用早盘的 save_screen_html）----
     if not html_path:
@@ -2821,6 +3193,62 @@ def _format_volume(vol: int) -> str:
     if vol >= 10000:
         return f"{vol / 10000:.1f}万"
     return f"{vol:,}手"
+
+
+def _build_tail_description(s: dict) -> str:
+    """
+    构建尾段竞价详细描述（匹配图中格式）
+    格式：谨慎/回避 中段:X买/Y卖(状态)->尾段:X买/Y卖(状态)->大卖单/大买单
+    """
+    ts_verdict = s.get("tail_verdict", "-")
+    ts_score = s.get("tail_score", 0)
+    ts_signals = s.get("tail_signals", [])
+    
+    # 判断谨慎/回避/积极
+    if ts_verdict == "看多":
+        attitude = "积极"
+    elif ts_verdict == "不看多":
+        attitude = "回避"
+    else:
+        attitude = "谨慎"
+    
+    # 从信号中提取中段和尾段信息
+    mid_info = ""
+    tail_info = ""
+    extra_info = ""
+    
+    for sig in ts_signals:
+        if "中段" in sig:
+            mid_info = sig
+        elif "尾段" in sig:
+            tail_info = sig
+        elif "大卖单" in sig or "大买单" in sig:
+            extra_info = sig
+    
+    # 如果没有详细信号，使用简化描述
+    if not mid_info and not tail_info:
+        buy_vol = s.get("bid1_v", 0)
+        sell_vol = s.get("ask1_v", 0)
+        if buy_vol > 0 or sell_vol > 0:
+            # 判断状态
+            if buy_vol > sell_vol * 2:
+                state = "强势"
+            elif sell_vol > buy_vol * 2:
+                state = "出货"
+            else:
+                state = "分歧"
+            tail_info = f"尾段:{buy_vol}买/{sell_vol}卖({state})"
+    
+    # 组合描述
+    parts = [attitude]
+    if mid_info:
+        parts.append(mid_info)
+    if tail_info:
+        parts.append(tail_info)
+    if extra_info:
+        parts.append(extra_info)
+    
+    return " ".join(parts) if parts else "-"
 
 
 def _compute_strategy(r: AuctionResult) -> str:
@@ -3117,7 +3545,7 @@ def pool_base(code: str, name: str, price: float, market_cap_yi: float,
               avg_price: float = 0, yesterday_amount: float = 0,
               last_limit_amount: float = 0, amount_5min: float = 0) -> tuple[bool, str]:
     """
-    策略池1 · 基础池（前置硬性门槛）
+    策略池1 · 基础池（与其他策略池OR逻辑，任一通过即可入选）
     ─────────────────────────────────
     条件（非K线部分）:
       1.  主板（沪主板60 / 深主板00，排除创业板/科创板/北交所）
@@ -3128,7 +3556,6 @@ def pool_base(code: str, name: str, price: float, market_cap_yi: float,
       6.  当前股价在均价线之上（price > VWAP）
       7.  昨日成交金额 > 上次涨停日成交金额（需外部传入）
       8.  开盘5分钟成交金额 > 3000万（需外部传入）
-    所有策略的前置条件，不通过则直接淘汰
     """
     # 1. 主板
     if not code.startswith(("60", "00")):
@@ -3491,10 +3918,9 @@ def pool_technical(code: str, klines: list[dict], name: str = "",
 def _screen_unified(candidates: list[dict], tencent_map: dict, em_data: dict = None,
                     kline_map: dict = None) -> list[dict]:
     """
-    统一筛选策略 —— 策略池OR逻辑
-    ─────────────────────────────
-    策略池1(基础池) 为硬性前置门槛，不通过直接淘汰。
-    通过基础池后，策略池2(量价)、策略池3(趋势)、策略池4(技术) 任一通过即可入选。
+    统一筛选策略 —— 四策略池OR逻辑
+    ─────────────────────────────────
+    策略池1(基础池)、策略池2(量价)、策略池3(趋势)、策略池4(技术) 任一通过即可入选。
     （策略池3/4在此阶段仅做非K线预检，完整检查在后续K线阶段补充）
 
     策略池1 · 基础池：主板 / 去ST / 流通市值35.99~999.99亿 / 股价<60 / 均价线之上
@@ -3538,13 +3964,12 @@ def _screen_unified(candidates: list[dict], tencent_map: dict, em_data: dict = N
         # 开盘5分钟成交金额（实时数据，腾讯/东财接口可能提供）
         amount_5min = 0
 
-        # ---- 策略池1 · 基础池（非K线部分）—— 硬性前置门槛 ----
-        ok, reason = pool_base(code, name, c["price"], market_cap_yi,
-                               avg_price=avg_price, yesterday_amount=yesterday_amount,
-                               last_limit_amount=last_limit_amount, amount_5min=amount_5min)
-        if not ok:
-            _diag[f"基础池:{reason}"] = _diag.get(f"基础池:{reason}", 0) + 1
-            continue
+        # ---- 四策略池OR逻辑：任一通过即可 ----
+
+        # 策略池1 · 基础池（非K线部分）
+        ok1, reason1 = pool_base(code, name, c["price"], market_cap_yi,
+                                 avg_price=avg_price, yesterday_amount=yesterday_amount,
+                                 last_limit_amount=last_limit_amount, amount_5min=amount_5min)
 
         # ---- 策略池2 · 量价池 ----
         klines_for_pool2 = (kline_map or {}).get(code, [])
@@ -3578,8 +4003,10 @@ def _screen_unified(candidates: list[dict], tencent_map: dict, em_data: dict = N
         elif market_cap_yi >= 400:
             ok4_pre = False; reason4_pre = "市值≥400亿"
 
-        # ---- OR逻辑：量价池/趋势池/技术池 任一通过即可 ----
+        # ---- OR逻辑：基础池/量价池/趋势池/技术池 任一通过即可 ----
         passed_pools = []
+        if ok1:
+            passed_pools.append("基础池")
         if ok2:
             passed_pools.append("量价池")
         if ok3_pre:
@@ -3588,7 +4015,9 @@ def _screen_unified(candidates: list[dict], tencent_map: dict, em_data: dict = N
             passed_pools.append("技术池")
 
         if not passed_pools:
-            # 三个策略池都不通过，记录诊断
+            # 四个策略池都不通过，记录诊断
+            if not ok1:
+                _diag[f"基础池:{reason1}"] = _diag.get(f"基础池:{reason1}", 0) + 1
             if not ok2:
                 _diag[f"量价池:{reason2}"] = _diag.get(f"量价池:{reason2}", 0) + 1
             # 趋势池和技术池的完整诊断在K线阶段输出
@@ -3678,80 +4107,72 @@ def save_screen_html(stocks: list[dict], indices: list[dict], path: str, main_li
 {idx_cells}
 </div>"""
 
-    # 股票表格
+    # 股票表格（按图中格式）
     rows = ""
     for i, s in enumerate(stocks, 1):
+        code = s['code']
+        name = s['name']
         chg_0926 = s.get("chg_0926", 0)
-        chg_color = "#f85149" if chg_0926 > 0 else ("#3fb950" if chg_0926 < 0 else "#c9d1d9")
-
-        # 筹码判断颜色
-        verdict = s.get("verdict", "正常")
-        if verdict == "真实抢筹":
-            v_color = "#f85149"
-            v_bg = "rgba(248,81,73,.12)"
-        elif verdict == "疑似出货":
-            v_color = "#3fb950"
-            v_bg = "rgba(63,185,80,.12)"
+        auction_gain = s.get("auction_gain", 0)
+        
+        # 净流入（红色显示）
+        dde_main_inflow = s.get("dde_main_net_inflow", 0)
+        if dde_main_inflow > 0:
+            inflow_html = f'<span style="color:#f85149;font-weight:600">+{dde_main_inflow/10000:.0f}万</span>'
+        elif dde_main_inflow < 0:
+            inflow_html = f'<span style="color:#3fb950;font-weight:600">{dde_main_inflow/10000:.0f}万</span>'
         else:
-            v_color = "#d29922"
-            v_bg = "rgba(210,153,34,.12)"
-
-        vol_fmt = _format_volume(s.get("auction_vol", s.get("volume", 0)))
-        comp_ratio = s.get("comp_ratio", 0)
-        remaining = s.get("remaining_rate", 50)
+            inflow_html = '<span style="color:#8b949e">-</span>'
+        
+        # 名称+涨幅
+        name_html = f'{html_module.escape(name)}<span style="color:{"#f85149" if chg_0926 > 0 else "#3fb950"};font-size:11px">({chg_0926:+.2f}%)</span>'
+        
+        # 频次-爆量比
         freq = s.get("frequency", 0)
-        strategy = s.get("strategy", "观望")
-        sector = s.get("sector", "-")
-        sector_lc = s.get("sector_limit_count", 0)
-        is_leader = s.get("is_leader", False)
-        leader_count = s.get("leader_count", 0)
-        leader_mark = "🏆" if is_leader else ""
-        leader_color = "#f0883e" if is_leader else "#8b949e"
-
-        pools = "/".join(s.get("passed_pools", []))
-        freq_sigs = ", ".join(s.get("freq_signals", []))
-
-        # 尾段判定
-        ts_verdict = s.get("tail_verdict", "-")
-        ts_score = s.get("tail_score", 0)
-        if ts_verdict == "看多":
-            ts_color = "#f85149"
-            ts_verdict_html = "🟢看多"
-        elif ts_verdict == "不看多":
-            ts_color = "#3fb950"
-            ts_verdict_html = "🔴不看多"
-        else:
-            ts_color = "#8b949e"
-            ts_verdict_html = "⚪-"
-
-        # 主线板块标记
-        main_line_1_name = main_line_sectors[0]["name"] if main_line_sectors else ""
-        is_main_line = main_line_1_name and sector == main_line_1_name
-        main_line_mark = "🔥主线" if is_main_line else ""
-        main_line_color = "#f0883e" if is_main_line else "#8b949e"
-
+        volume_ratio = s.get("volume_ratio", 0)
+        freq_html = f'{freq}/{volume_ratio:.1f}%'
+        
+        # 昨日主力（DDE净量）
+        dde_net_vol = s.get("dde_net_volume", 0)
+        main_force_html = f'<span style="color:{"#f85149" if dde_net_vol > 0 else "#3fb950"}">{dde_net_vol:.2f}</span>'
+        
+        # 筹码判断（带排名，黄色显示）
+        verdict = s.get("verdict", "正常")
+        rank = i
+        verdict_html = f'{verdict} <span style="color:#d29922;font-weight:600">排名第{rank}</span>'
+        
+        # 尾段竞价（详细描述）
+        tail_desc = _build_tail_description(s)
+        tail_html = html_module.escape(tail_desc)
+        
+        # 09:25 和 09:26 价格
+        price_0925 = s.get("auction_price", s.get("price", 0))
+        price_0926 = s.get("price_0926", s.get("price", 0))
+        
+        # 撮合量
+        vol_fmt = _format_volume(s.get("auction_vol", s.get("volume", 0)))
+        
+        # 竞昨比
+        comp_ratio = s.get("comp_ratio", 0)
+        comp_html = f'{comp_ratio:.2f}' if comp_ratio > 0 else '<span style="color:#8b949e">-</span>'
+        
+        # 剩余率
+        remaining = s.get("remaining_rate", 50)
+        remain_html = f'{remaining:.1f}%' if remaining != 50 else '<span style="color:#8b949e">-</span>'
+        
         rows += f"""<tr>
-<td>{html_module.escape(s["code"])}</td>
-<td style="text-align:left;font-weight:600">{html_module.escape(s["name"])}</td>
-<td style="text-align:left;font-size:12px">{html_module.escape(sector)}<span style="color:#8b949e;font-size:10px">({sector_lc}涨停)</span></td>
-<td style="color:{main_line_color};font-weight:{'700' if is_main_line else '400'}">{main_line_mark}</td>
-<td style="color:{leader_color};font-weight:{'700' if is_leader else '400'}">{leader_mark}{leader_count}</td>
-<td>{s["auction_price"]:.2f}</td>
-<td>{s.get("price_0926", s["price"]):.2f}</td>
+<td style="font-weight:600">{html_module.escape(code)}</td>
+<td>{inflow_html}</td>
+<td style="text-align:left;font-weight:600">{name_html}</td>
+<td>{freq_html}</td>
+<td>{main_force_html}</td>
+<td style="text-align:left">{verdict_html}</td>
+<td style="text-align:left;font-size:11px">{tail_html}</td>
+<td>{price_0925:.2f}</td>
+<td>{price_0926:.2f}</td>
 <td>{vol_fmt}</td>
-<td>{comp_ratio:.1f}%</td>
-<td>{remaining:.1f}%</td>
-<td style="color:{chg_color};font-weight:600">{chg_0926:+.2f}%</td>
-<td style="color:{v_color};background:{v_bg};border-radius:4px;font-weight:600;padding:4px 8px">{verdict}</td>
-<td style="font-weight:700">{freq}</td>
-<td style="color:{ts_color};font-weight:600">{ts_verdict_html}({ts_score})</td>
-<td style="text-align:left;font-size:11px">{html_module.escape(pools)}</td>
-<td style="text-align:left;font-size:12px">{html_module.escape(strategy)}</td>
-<td style="font-size:11px">{s.get("macd_dif", 0):.3f}</td>
-<td style="font-size:11px">{s.get("macd_dea", 0):.3f}</td>
-<td style="font-size:11px;color:{'#f85149' if s.get('macd_bar', 0) > 0 else '#3fb950'}">{s.get("macd_bar", 0):.3f}</td>
-<td>{s.get("macd_trend", "-")}</td>
-<td style="text-align:left;font-size:11px">{html_module.escape(freq_sigs)}</td>
+<td>{comp_html}</td>
+<td>{remain_html}</td>
 </tr>"""
 
     # 板块分布统计
@@ -3804,7 +4225,7 @@ def save_screen_html(stocks: list[dict], indices: list[dict], path: str, main_li
 
     html = f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>集合竞价 - 策略池OR筛选 · 频次排名</title>
+<title>竞价选股汇总（按DDE净量优先）</title>
 <style>
 *{{margin:0;padding:0;box-sizing:border-box}}
 body{{font-family:"Microsoft YaHei","PingFang SC",sans-serif;background:#0d1117;color:#c9d1d9;padding:16px}}
@@ -3819,7 +4240,7 @@ tr:hover{{background:#161b22}}
 .ft{{text-align:center;color:#484f58;font-size:10px;padding:20px 0}}
 @media(max-width:768px){{table{{font-size:11px}}th,td{{padding:4px 6px}}}}
 </style></head><body>
-<div class="hd"><h1>📊 集合竞价 - 策略池OR筛选 · 频次排名TOP10</h1><div class="t">更新时间: {now}</div></div>
+<div class="hd"><h1>【竞价选股汇总】竞价选股汇总（按DDE净量优先）V3.0</h1><div class="t">更新时间: {now}</div></div>
 {idx_html}
 {main_line_html}
 {leader_html}
@@ -3827,10 +4248,8 @@ tr:hover{{background:#161b22}}
 <div class="tbl-wrap">
 <table>
 <thead><tr>
-<th>代码</th><th>名称</th><th>板块(涨停数)</th><th>主线</th><th>龙头</th><th>09:25</th><th>09:26</th><th>搓合量</th>
-<th>竞昨比</th><th>剩余率</th><th>09:26涨幅</th>
-<th>筹码判断</th><th>频次</th><th>尾段判定</th><th>策略池</th><th>策略</th>
-<th>DIF</th><th>DEA</th><th>BAR</th><th>趋势</th><th>信号</th>
+<th>代码</th><th>净流入</th><th>名称</th><th>频次-爆量比</th><th>昨日主力</th><th>筹码判断</th><th>尾段竞价</th>
+<th>09:25</th><th>09:26</th><th>撮合量</th><th>竞昨比</th><th>剩余率</th>
 </tr></thead>
 <tbody>{rows}</tbody>
 </table></div>
@@ -4129,16 +4548,14 @@ def run_from_data_dir(data_dir: str, html_path: str = None, quiet: bool = False)
             except (ValueError, TypeError):
                 pass
 
-        # 基础池(K线部分) —— 基本面过滤，非策略池
-        ok_base, reason_base = pool_base_post_kline(code, c["price"], klines,
-                                                     c.get("prev_close", 0),
-                                                     c.get("yesterday_amount", 0))
-        if not ok_base:
-            continue
-
         tc = tencent_map.get(code, {})
         em = details.get(code, {})
 
+        # 四策略池OR逻辑：任一通过即可入选
+        # 基础池(K线部分)
+        ok_base, reason_base = pool_base_post_kline(code, c["price"], klines,
+                                                     c.get("prev_close", 0),
+                                                     c.get("yesterday_amount", 0))
         # 量价池
         ok_vp, reason_vp = pool_volume_price(c, tc, em, klines=klines)
         # 趋势池
@@ -4150,6 +4567,8 @@ def run_from_data_dir(data_dir: str, html_path: str = None, quiet: bool = False)
                                               kline120_map=kline120_map, sector_klines=sector_klines)
 
         passed_pools = []
+        if ok_base:
+            passed_pools.append("基础池")
         if ok_vp:
             passed_pools.append("量价池")
         if ok_trend:
@@ -4203,6 +4622,35 @@ def run_from_data_dir(data_dir: str, html_path: str = None, quiet: bool = False)
 
     print(f"  初选池: {len(final)} 只（任一策略池通过）")
 
+    # ---- 9.5. 获取DDE大单数据 ----
+    print("📊 获取DDE大单数据...")
+    final_codes = [c["code"] for c in final]
+    dde_data = fetch_dde_data_batch(final_codes, session=session)
+    
+    # 将DDE数据附加到候选股票
+    for c in final:
+        code = c["code"]
+        if code in dde_data:
+            dde = dde_data[code]
+            c["dde_main_net_inflow"] = dde.get("main_net_inflow", 0)
+            c["dde_super_large_net"] = dde.get("super_large_net", 0)
+            c["dde_large_net"] = dde.get("large_net", 0)
+            c["dde_medium_net"] = dde.get("medium_net", 0)
+            c["dde_small_net"] = dde.get("small_net", 0)
+            c["dde_net_volume"] = dde.get("dde_net_volume", 0)
+            c["dde_source"] = dde.get("source", "")
+            c["dde_passed"], c["dde_rules"] = check_dde_rules(dde_data, code)
+        else:
+            c["dde_main_net_inflow"] = 0
+            c["dde_super_large_net"] = 0
+            c["dde_large_net"] = 0
+            c["dde_medium_net"] = 0
+            c["dde_small_net"] = 0
+            c["dde_net_volume"] = 0
+            c["dde_source"] = ""
+            c["dde_passed"] = False
+            c["dde_rules"] = ["无DDE数据"]
+
     # ---- 10. 抢筹/出货深度分析 + 频次统计 ----
     print("📊 执行抢筹/出货深度分析...")
     for c in final:
@@ -4230,7 +4678,7 @@ def run_from_data_dir(data_dir: str, html_path: str = None, quiet: bool = False)
         rr = c["remaining_rate"]
         cr = c.get("comp_ratio", 0)
 
-        # ---- 频次分析：6维度信号统计（收紧阈值）----
+        # ---- 频次分析：7维度信号统计（含DDE大单规则）----
         # 每个维度满足条件计1分，总分=频次
         freq_signals = []
         freq = 0
@@ -4259,11 +4707,16 @@ def run_from_data_dir(data_dir: str, html_path: str = None, quiet: bool = False)
         if len(c.get("passed_pools", [])) >= 3:
             freq += 1
             freq_signals.append("多池共振")
+        # 7. DDE大单净量 > 1 → 主力资金流入
+        if c.get("dde_passed", False):
+            freq += 1
+            dde_rules_str = ",".join(c.get("dde_rules", []))
+            freq_signals.append(f"DDE:{dde_rules_str[:15]}")
 
         c["frequency"] = freq
         c["freq_signals"] = freq_signals
 
-        # ---- 抢筹/出货综合判断（收紧评分体系）----
+        # ---- 抢筹/出货综合判断（含DDE大单评分）----
         # 取消涨停直通，涨停也需要评分验证
         score = 0
         # 涨幅维度（最高3分）
@@ -4291,6 +4744,13 @@ def run_from_data_dir(data_dir: str, html_path: str = None, quiet: bool = False)
         # 多池共振加权（最高2分）
         if len(c.get("passed_pools", [])) >= 4: score += 2
         elif len(c.get("passed_pools", [])) >= 3: score += 1
+        # DDE大单维度（最高3分）
+        dde_net_vol = c.get("dde_net_volume", 0)
+        if dde_net_vol > 5: score += 3      # 超强主力流入
+        elif dde_net_vol > 3: score += 2    # 强主力流入
+        elif dde_net_vol > 1: score += 1    # 主力流入
+        elif dde_net_vol < -1: score -= 1   # 主力流出
+        elif dde_net_vol < -3: score -= 2   # 强主力流出
         # 涨停额外惩罚：涨停但其他信号弱 → 减分（防止一字板/缩量板误判）
         if chg >= 9.5:
             if vr < 5: score -= 3        # 涨停但缩量，疑似一字板
@@ -4312,11 +4772,21 @@ def run_from_data_dir(data_dir: str, html_path: str = None, quiet: bool = False)
 
         c["strategy"] = _compute_screen_strategy(c)
 
-    # ---- 11. 按频次排序，保留前10 ----
+    # ---- 11. 按DDE净量排序（超强主力→强主力→主力流入→主力流出→强主力流出），保留前10 ----
+    def _dde_sort_key_main(x):
+        dde_net = x.get("dde_net_volume", 0)
+        if dde_net > 5: return 5      # 超强主力流入
+        elif dde_net > 3: return 4    # 强主力流入
+        elif dde_net > 1: return 3    # 主力流入
+        elif dde_net < -3: return 1   # 强主力流出
+        elif dde_net < -1: return 2   # 主力流出
+        else: return 2.5              # 中性
+    
     final.sort(key=lambda x: (
-        -x.get("frequency", 0),          # 频次最高排第一
-        -x.get("auction_gain", 0),        # 同频次按涨幅
-        -x.get("sector_limit_count", 0),  # 再按板块热度
+        -_dde_sort_key_main(x),            # DDE净量分级（主排序）
+        -x.get("dde_net_volume", 0),       # DDE净量具体值
+        -x.get("frequency", 0),            # 频次
+        -x.get("auction_gain", 0),         # 涨幅
     ))
     if len(final) > 10:
         final = final[:10]
@@ -4360,41 +4830,86 @@ def run_from_data_dir(data_dir: str, html_path: str = None, quiet: bool = False)
     # 主线板块 #1 名称（用于标记）
     main_line_1_name = main_line_sectors[0]["name"] if main_line_sectors else ""
 
-    # 输出结果
+    # 输出结果（按图中格式显示）
     if not quiet:
-        print(f"\n{'─'*180}")
-        print(f"  {'#':>3}  {'代码':<8} {'名称':<8} {'板块':<10} {'主线':>4} {'龙头':>4} {'09:25':>7} {'09:26':>7} {'搓合量':>8} {'竞昨比':>7} {'剩余率':>7} {'涨幅':>7} {'筹码':<6} {'频次':>4} {'尾段':>6} {'策略池':<12} {'策略':<14} {'DIF':>7} {'DEA':>7} {'BAR':>7} {'趋势':>4} {'信号':<20}")
-        print(f"{'─'*180}")
+        print(f"\n{'═'*120}")
+        print(f"  【竞价选股汇总】竞价选股汇总（按DDE净量优先）V3.0")
+        print(f"{'═'*120}")
+        
+        # 表头
+        print(f"  {'代码':<8} {'净流入':>10} {'名称':<18} {'频次-爆量比':>12} {'昨日主力':>8} {'筹码判断':<16} {'尾段竞价':<40} {'09:25':>7} {'09:26':>7} {'撮合量':>8} {'竞昨比':>7} {'剩余率':>7}")
+        print(f"  {'─'*116}")
 
         for i, s in enumerate(final, 1):
-            vol_fmt = _format_volume(s.get("auction_vol", s.get("volume", 0)))
+            code = s['code']
+            name = s['name']
             chg_0926 = s.get("chg_0926", 0)
-            comp_ratio = s.get("comp_ratio", 0)
-            remaining = s.get("remaining_rate", 50)
-            verdict = s.get("verdict", "正常")
+            auction_gain = s.get("auction_gain", 0)
+            
+            # 净流入（红色显示）
+            dde_main_inflow = s.get("dde_main_net_inflow", 0)
+            if dde_main_inflow > 0:
+                inflow_str = f"\033[91m+{dde_main_inflow/10000:.0f}万\033[0m"  # 红色
+            elif dde_main_inflow < 0:
+                inflow_str = f"\033[92m{dde_main_inflow/10000:.0f}万\033[0m"  # 绿色
+            else:
+                inflow_str = "-"
+            
+            # 名称+涨幅
+            name_str = f"{name}({chg_0926:+.2f}%)"
+            
+            # 频次-爆量比
             freq = s.get("frequency", 0)
-            strategy = s.get("strategy", "观望")
-            sector = s.get("sector", "-")[:8]
-            is_leader = s.get("is_leader", False)
-            leader_count = s.get("leader_count", 0)
-            leader_mark = f"🏆{leader_count}" if is_leader else f"  {leader_count}"
-            # 主线板块标记
-            is_main_line = main_line_1_name and s.get("sector", "") == main_line_1_name
-            main_mark = "🔥" if is_main_line else "  "
-            dif = s.get("macd_dif", 0)
-            dea = s.get("macd_dea", 0)
-            bar = s.get("macd_bar", 0)
-            trend = s.get("macd_trend", "-")
-            pools = "/".join(s.get("passed_pools", []))
-            freq_sigs = ",".join(s.get("freq_signals", []))[:18]
-            # 尾段判定
+            volume_ratio = s.get("volume_ratio", 0)
+            freq_str = f"{freq}/{volume_ratio:.1f}%"
+            
+            # 昨日主力（DDE净量）
+            dde_net_vol = s.get("dde_net_volume", 0)
+            main_force_str = f"{dde_net_vol:.2f}"
+            
+            # 筹码判断（带排名，黄色显示）
+            verdict = s.get("verdict", "正常")
+            rank = i  # 排名
+            verdict_str = f"{verdict} \033[93m排名第{rank}\033[0m"  # 黄色排名
+            
+            # 尾段竞价（详细描述）
             ts_verdict = s.get("tail_verdict", "-")
             ts_score = s.get("tail_score", 0)
-            ts_icon = "🟢" if ts_verdict == "看多" else ("🔴" if ts_verdict == "不看多" else "⚪")
-            tail_mark = f"{ts_icon}{ts_score:>2}"
-            print(f"  {i:>3}  {s['code']:<8} {s['name']:<8} {sector:<10} {main_mark:>4} {leader_mark:>4} {s.get('auction_price', s['price']):>7.2f} {s.get('price_0926', s['price']):>7.2f} {vol_fmt:>8} {comp_ratio:>6.1f}% {remaining:>6.1f}% {chg_0926:>+6.2f}% {verdict:<6} {freq:>4} {tail_mark:>6} {pools:<12} {strategy:<14} {dif:>7.3f} {dea:>7.3f} {bar:>7.3f} {trend:>4} {freq_sigs:<20}")
+            ts_signals = s.get("tail_signals", [])
+            # 构建尾段描述
+            tail_desc = _build_tail_description(s)
+            
+            # 09:25 和 09:26 价格
+            price_0925 = s.get("auction_price", s.get("price", 0))
+            price_0926 = s.get("price_0926", s.get("price", 0))
+            
+            # 撮合量
+            vol_fmt = _format_volume(s.get("auction_vol", s.get("volume", 0)))
+            
+            # 竞昨比
+            comp_ratio = s.get("comp_ratio", 0)
+            comp_str = f"{comp_ratio:.2f}" if comp_ratio > 0 else "-"
+            
+            # 剩余率
+            remaining = s.get("remaining_rate", 50)
+            remain_str = f"{remaining:.1f}%" if remaining != 50 else "-"
+            
+            # 格式化输出
+            print(f"  {code:<8} {inflow_str:>10} {name_str:<18} {freq_str:>12} {main_force_str:>8} {verdict_str:<16} {tail_desc:<40} {price_0925:>7.2f} {price_0926:>7.2f} {vol_fmt:>8} {comp_str:>7} {remain_str:>7}")
 
-        print(f"{'─'*170}")
+        print(f"  {'─'*116}")
+        
+        # 底部信息
+        elapsed = time.time() - t_start if 't_start' in dir() else 0
+        print(f"  完成 | 耗时{elapsed:.0f}秒")
+        
+        # 弱主力组信息
+        weak_stocks = [s for s in final if s.get("dde_net_volume", 0) < -1]
+        if weak_stocks:
+            weak_codes = [s['code'] for s in weak_stocks]
+            print(f"  【弱主力组】延后查询 {len(weak_codes)} 只：{'、'.join(weak_codes)}")
+        
+        print(f"{'═'*120}")
 
     # 保存HTML
     if html_path:
