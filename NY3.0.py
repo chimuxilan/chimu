@@ -1611,21 +1611,144 @@ def check_dde_rules(dde_data: dict, code: str) -> tuple[bool, list[str]]:
     return passed, rules
 
 
-def fetch_intraday_big_order_flow(codes: list[str], session: requests.Session = None) -> dict:
+def fetch_big_order_flow_ths(codes: list[str]) -> dict:
+    """
+    通过 ths.big_order_flow(code) 获取大单逐笔流向
+    ─────────────────────────────────────────────
+    秒级实时，最细粒度
+    返回: {code: [
+        {time, direction, volume, price},  # 每笔大单
+        ...
+    ]}
+    """
+    results = {}
+    
+    try:
+        from ths import THS  # type: ignore
+        ths = THS()
+        for code in codes:
+            try:
+                data = ths.big_order_flow(code)
+                if data and len(data) > 0:
+                    orders = []
+                    for item in data:
+                        orders.append({
+                            "time": str(item.get("time", "")),
+                            "direction": str(item.get("direction", "")),  # 买/卖
+                            "volume": int(item.get("volume", 0)),
+                            "price": float(item.get("price", 0)),
+                        })
+                    results[code] = orders
+            except Exception:
+                continue
+        if results:
+            print(f"    ✅ 大单逐笔流向(thsdk): {len(results)} 只")
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"    ⚠️ ths.big_order_flow异常: {e}")
+    
+    return results
+
+
+def fetch_wencai_dde_stocks(min_dde: float = 1.0) -> list[dict]:
+    """
+    通过 ths.wencai_nlp() 查询DDE大单净量>阈值的股票
+    ─────────────────────────────────────────────
+    问财接口，盘中可查
+    返回: [{code, name, dde_net_volume, main_net_inflow, ...}]
+    """
+    results = []
+    
+    try:
+        from ths import THS  # type: ignore
+        ths = THS()
+        query = f"DDE大单净量>{min_dde},非ST"
+        data = ths.wencai_nlp(query)
+        if data and len(data) > 0:
+            for item in data:
+                results.append({
+                    "code": str(item.get("code", "")),
+                    "name": str(item.get("name", "")),
+                    "dde_net_volume": float(item.get("dde_net_volume", 0) or 0),
+                    "main_net_inflow": float(item.get("main_net_inflow", 0) or 0),
+                    "change_pct": float(item.get("change_pct", 0) or 0),
+                })
+            print(f"    ✅ 问财DDE筛选: {len(results)} 只 (DDE>{min_dde})")
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"    ⚠️ ths.wencai_nlp异常: {e}")
+    
+    return results
+
+
+def fetch_historical_dde_westock(code: str, date: str = None, 
+                                 start_date: str = None, end_date: str = None) -> dict:
+    """
+    通过 westock-data 获取历史DDE资金流数据
+    ─────────────────────────────────────
+    盘后可用，支持单日查询和区间查询
+    
+    参数:
+        code: 股票代码
+        date: 查询日期，格式 YYYYMMDD
+        start_date: 区间开始日期
+        end_date: 区间结束日期
+    
+    返回: {MainNetFlow, BlockNetFlow, date, ...}
+    """
+    results = {}
+    
+    try:
+        # 单日查询
+        if date:
+            cmd = f"westock-data asfund {code} --date {date}"
+        # 区间查询
+        elif start_date and end_date:
+            cmd = f"westock-data asfund {code} --start {start_date} --end {end_date}"
+        else:
+            return results
+        
+        import subprocess
+        proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+        if proc.returncode == 0 and proc.stdout.strip():
+            # 解析输出
+            for line in proc.stdout.strip().split("\n"):
+                parts = line.split(",")
+                if len(parts) >= 3:
+                    results[parts[0]] = {
+                        "MainNetFlow": float(parts[1]) if parts[1] else 0,
+                        "BlockNetFlow": float(parts[2]) if parts[2] else 0,
+                    }
+    except subprocess.TimeoutExpired:
+        pass
+    except Exception:
+        pass
+    
+    return results
+
+
+def fetch_intraday_big_order_flow(codes: list[str], session: requests.Session = None,
+                                  mode: str = "close") -> dict:
     """
     获取盘中当日实时大单逐笔流向数据
     ─────────────────────────────────
     数据来源：东财资金流向分钟级数据
+    
+    参数:
+        mode: "morning" = 早盘竞价模式（中段09:15-09:22, 尾段09:23-09:25）
+              "close"   = 尾盘竞价模式（中段09:30-14:57, 尾段14:57-15:00）
+    
     返回: {code: {
-        mid_buy_vol: 中段买量(手),
-        mid_sell_vol: 中段卖量(手),
-        tail_buy_vol: 尾段买量(手),
-        tail_sell_vol: 尾段卖量(手),
+        mid_buy_vol: 中段大单买量(手),
+        mid_sell_vol: 中段大单卖量(手),
+        tail_buy_vol: 尾段大单买量(手),
+        tail_sell_vol: 尾段大单卖量(手),
         big_order_net: 大单净流入(元),
         super_large_net: 超大单净流入(元),
         main_net_inflow: 主力净流入(元),
         mid_buy_all: 中段是否全买单,
-        latest_big_orders: 最近大单列表
     }}
     """
     if session is None:
@@ -1674,11 +1797,6 @@ def fetch_intraday_big_order_flow(codes: list[str], session: requests.Session = 
             main_net_inflow = 0
             mid_buy_all = True
             
-            # 分析最近30分钟的数据（中段）和最后5分钟（尾段）
-            now = datetime.now()
-            current_hour = now.hour
-            current_minute = now.minute
-            
             for line in klines:
                 parts = line.split(",")
                 if len(parts) < 7:
@@ -1699,17 +1817,33 @@ def fetch_intraday_big_order_flow(codes: list[str], session: requests.Session = 
                 super_large_net += super_large_flow
                 main_net_inflow += main_flow
                 
-                # 判断中段（09:15-09:22）和尾段（09:23-09:25）
-                if hour == 9:
-                    if 15 <= minute <= 22:
-                        # 中段
+                if mode == "morning":
+                    # 早盘竞价模式：中段=09:15-09:22, 尾段=09:23-09:25
+                    if hour == 9:
+                        if 15 <= minute <= 22:
+                            # 中段
+                            if large_flow > 0:
+                                mid_buy_vol += int(large_flow / 10000)
+                            else:
+                                mid_sell_vol += int(abs(large_flow) / 10000)
+                                mid_buy_all = False
+                        elif 23 <= minute <= 25:
+                            # 尾段
+                            if large_flow > 0:
+                                tail_buy_vol += int(large_flow / 10000)
+                            else:
+                                tail_sell_vol += int(abs(large_flow) / 10000)
+                else:
+                    # 尾盘竞价模式：中段=09:30-14:57, 尾段=14:57-15:00
+                    if (hour == 9 and minute >= 30) or (10 <= hour <= 13) or (hour == 14 and minute < 57):
+                        # 中段（盘中全天）
                         if large_flow > 0:
-                            mid_buy_vol += int(large_flow / 10000)  # 转换为手
+                            mid_buy_vol += int(large_flow / 10000)
                         else:
                             mid_sell_vol += int(abs(large_flow) / 10000)
                             mid_buy_all = False
-                    elif 23 <= minute <= 25:
-                        # 尾段
+                    elif hour == 14 and minute >= 57:
+                        # 尾段（收盘竞价）
                         if large_flow > 0:
                             tail_buy_vol += int(large_flow / 10000)
                         else:
@@ -2870,8 +3004,13 @@ def close_auction_monitor(codes: list[str] = None, poll_interval: int = 10,
     final_codes = [c["code"] for c in final]
     dde_data = fetch_dde_data_batch(final_codes, session=session)
     
-    # 获取盘中实时大单逐笔流向
-    intraday_flow = fetch_intraday_big_order_flow(final_codes, session=session)
+    # 尝试 ths.big_order_flow 获取大单逐笔流向（更细粒度）
+    big_order_flow_ths = fetch_big_order_flow_ths(final_codes)
+    if big_order_flow_ths:
+        print(f"    ✅ 大单逐笔流向(ths.big_order_flow): {len(big_order_flow_ths)} 只")
+    
+    # 获取盘中实时大单逐笔流向（东财分钟级数据，尾盘竞价模式）
+    intraday_flow = fetch_intraday_big_order_flow(final_codes, session=session, mode="close")
     print(f"    ✅ 盘中大单流向: {len(intraday_flow)} 只")
     
     # 将DDE数据附加到候选股票
@@ -4819,8 +4958,13 @@ def run_from_data_dir(data_dir: str, html_path: str = None, quiet: bool = False)
     final_codes = [c["code"] for c in final]
     dde_data = fetch_dde_data_batch(final_codes, session=session)
     
-    # 获取盘中实时大单逐笔流向
-    intraday_flow = fetch_intraday_big_order_flow(final_codes, session=session)
+    # 尝试 ths.big_order_flow 获取大单逐笔流向（更细粒度）
+    big_order_flow_ths = fetch_big_order_flow_ths(final_codes)
+    if big_order_flow_ths:
+        print(f"    ✅ 大单逐笔流向(ths.big_order_flow): {len(big_order_flow_ths)} 只")
+    
+    # 获取盘中实时大单逐笔流向（东财分钟级数据，早盘竞价模式）
+    intraday_flow = fetch_intraday_big_order_flow(final_codes, session=session, mode="morning")
     print(f"    ✅ 盘中大单流向: {len(intraday_flow)} 只")
     
     # 将DDE数据附加到候选股票
