@@ -117,33 +117,46 @@ except Exception:
 # ═══════════════════════════════════════════════════════════
 
 class SourceStatusTracker:
-    """追踪数据源可达性：检测一次后缓存状态，避免反复尝试被封源"""
+    """追踪数据源可达性：检测一次后缓存状态，避免反复尝试被封源（线程安全）"""
     def __init__(self):
         self._status = {}  # {source_name: bool} True=可达, False=被封
         self._checked = {}  # {source_name: float} 检测时间戳
+        self._lock = threading.Lock()
     
     def is_reachable(self, source: str) -> Optional[bool]:
         """返回已知状态，None=未检测"""
-        return self._status.get(source)
+        with self._lock:
+            return self._status.get(source)
     
     def mark(self, source: str, reachable: bool):
         """标记数据源状态"""
-        self._status[source] = reachable
-        self._checked[source] = time.time()
+        with self._lock:
+            self._status[source] = reachable
+            self._checked[source] = time.time()
+    
+    def mark_failure(self, source: str):
+        """标记源失败（便捷方法）"""
+        self.mark(source, False)
+    
+    def mark_success(self, source: str):
+        """标记源成功（便捷方法）"""
+        self.mark(source, True)
     
     def need_check(self, source: str, max_age: float = 300) -> bool:
         """是否需要重新检测（缓存超过max_age秒）"""
-        if source not in self._checked:
-            return True
-        return (time.time() - self._checked[source]) > max_age
+        with self._lock:
+            if source not in self._checked:
+                return True
+            return (time.time() - self._checked[source]) > max_age
     
     def summary(self) -> str:
         """返回状态摘要"""
-        parts = []
-        for src, ok in self._status.items():
-            icon = "✅" if ok else "❌"
-            parts.append(f"{icon}{src}")
-        return " ".join(parts) if parts else "未检测"
+        with self._lock:
+            parts = []
+            for src, ok in self._status.items():
+                icon = "✅" if ok else "❌"
+                parts.append(f"{icon}{src}")
+            return " ".join(parts) if parts else "未检测"
 
 _source_tracker = SourceStatusTracker()
 
@@ -738,72 +751,53 @@ _EM_SESSION.headers.update({
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     "Referer": "https://quote.eastmoney.com/",
 })
-_EM_MIN_INTERVAL = 1.0
+_EM_MIN_INTERVAL = 0.5  # 东财安全阈值>5次/秒，0.5s间隔=2QPS，留充足余量
 _em_last_call = [0.0]
+_em_lock = threading.Lock()  # 限流锁：保证多线程下 em_get 仍为串行
 
 def em_get(url: str, params: dict = None, headers: dict = None,
            timeout: int = 15, proxy: str = None, **kwargs):
-    """东财统一请求入口：串行限流（≥1s+随机抖动）+ 复用 Keep-Alive 会话 + 可选代理"""
-    wait = _EM_MIN_INTERVAL - (time.time() - _em_last_call[0])
-    if wait > 0:
-        time.sleep(wait + random.uniform(0.1, 0.5))
+    """东财统一请求入口：线程安全的串行限流（≥1s+随机抖动）+ 会话复用 + 可选代理"""
+    with _em_lock:  # 加锁：多线程下保证串行间隔
+        wait = _EM_MIN_INTERVAL - (time.time() - _em_last_call[0])
+        if wait > 0:
+            time.sleep(wait + random.uniform(0.1, 0.5))
+        _em_last_call[0] = time.time()  # 请求前更新时间戳
     proxies = {"http": proxy, "https": proxy} if proxy else None
-    try:
-        return _EM_SESSION.get(url, params=params, headers=headers,
-                               timeout=timeout, proxies=proxies, **kwargs)
-    finally:
-        _em_last_call[0] = time.time()
+    return _EM_SESSION.get(url, params=params, headers=headers,
+                           timeout=timeout, proxies=proxies, **kwargs)
 
 
 def em_get_batch(codes: list[str], url: str, params_fn=None,
                  max_workers: int = 5, timeout: int = 15) -> dict:
     """
-    东财批量请求：统一线程池 + 全局限流 + 代理池集成
-    替代各函数内部自建 ThreadPoolExecutor + requests.Session 的散乱模式
+    东财批量请求（串行版）：严格遵守防封铁律。
+    所有东财请求串行调用，间隔由 em_get 内置锁保证 ≥1s。
 
     Args:
         codes: 股票代码列表
         url: 请求URL
         params_fn: code -> params 的函数
-        max_workers: 并发数（默认5，东财并发≥10会封）
+        max_workers: 保留参数（兼容旧调用），实际串行执行
         timeout: 单次请求超时
 
     Returns:
         {code: response_json_or_None}
     """
     results = {}
-    lock = threading.Lock()
-
-    def _fetch(code):
-        proxy = None
+    for code in codes:
         try:
-            if _proxy_pool and _proxy_pool.has_proxies:
-                proxy = _proxy_pool.get()
             params = params_fn(code) if params_fn else None
-            r = em_get(url, params=params, timeout=timeout, proxy=proxy)
+            r = em_get(url, params=params, timeout=timeout)
             if r and r.status_code == 200:
-                if _proxy_pool:
-                    _proxy_pool.mark_good(proxy)
                 try:
-                    data = r.json()
+                    results[code] = r.json()
                 except Exception:
-                    data = None
-                with lock:
-                    results[code] = data
-            else:
-                if _proxy_pool:
-                    _proxy_pool.mark_bad(proxy)
-                with lock:
                     results[code] = None
-        except Exception:
-            if _proxy_pool:
-                _proxy_pool.mark_bad(proxy)
-            with lock:
+            else:
                 results[code] = None
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        list(executor.map(_fetch, codes))
-
+        except Exception:
+            results[code] = None
     return results
 
 
@@ -1192,27 +1186,21 @@ def fetch_kline_batch(codes: list[str], days: int = 1000, max_workers: int = 16,
 
     def _fetch_one(code):
         klines = []
-        # 优先：mootdx TCP（快速跳过已知被封的源）
+        # 1. 优先：mootdx TCP（不封IP）
         if _source_tracker.is_reachable("mootdx") is not False:
             klines = fetch_kline_mootdx(code, days=min(days, 2400))
             if klines:
-                _source_tracker.mark("mootdx", True)
-            else:
-                # 首次失败不立即标记，但连续多只失败后标记
-                pass
-        # 如果 mootdx 数据不足且需要更多天数，用 HTTP 源补充
+                _source_tracker.mark_success("mootdx")
+        # 2. 腾讯K线（不封IP，比新浪快4倍）
+        if not klines:
+            klines = fetch_kline_tencent(code, days=min(days, 300), session=session)
+        # 3. 新浪K线（有频率限制0.2s，仅作为补充天数）
         if len(klines) < days:
             sina_klines = fetch_kline_sina(code, days=min(days, 1000), session=session)
             if len(sina_klines) > len(klines):
                 klines = sina_klines
+        # 4. 百度K线（不封IP，自带MA5/10/20）
         if not klines:
-            # 备用：腾讯K线（快速跳过已知被封的源）
-            if _source_tracker.is_reachable("tencent_kline") is not False:
-                klines = fetch_kline_tencent(code, days=min(days, 300), session=session)
-                if not klines:
-                    pass  # 不立即标记，可能只是单只股票无数据
-        if not klines:
-            # 最后备用：百度K线（不封IP，自带MA5/10/20）
             klines = fetch_kline_baidu(code, days=min(days, 300), session=session)
         return code, klines
 
@@ -1720,7 +1708,8 @@ def fetch_all_klines_async(codes: list[str], days: int = 1000,
 def fetch_kline_120min(code: str, count: int = 60, session: requests.Session = None,
                        limiter: RateLimiter = None) -> list[dict]:
     """
-    获取120分钟K线数据（新浪60分钟K线每2根合并为1根）
+    获取120分钟K线数据（腾讯代理主源 + 新浪备用源）
+    腾讯60分钟K线 → 每2根合并为1根120分钟K线
     用于分析脚本的 pool_technical (120分钟MACD检查)
     返回: [{"day", "open", "close", "high", "low", "volume"}, ...]
     """
@@ -1728,38 +1717,76 @@ def fetch_kline_120min(code: str, count: int = 60, session: requests.Session = N
         session = _build_session()
 
     sym = f"sh{code}" if code.startswith("6") else f"sz{code}"
-    r = safe_request(
-        "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData",
-        limiter or _limiter_sina, session,
-        params={"symbol": sym, "scale": "60", "ma": "no", "datalen": count * 2},
-        headers={"Referer": "https://finance.sina.com.cn/"},
-    )
-    if not r:
-        # safe_request 已打印错误信息
-        return []
-    if not r.text.strip() or r.text.strip() == "null":
+    m60_raw = []
+
+    # 主源：腾讯代理获取60分钟K线（不封IP）
+    try:
+        r = safe_request(
+            "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/kline/mkline",
+            _limiter_tencent, session,
+            params={"param": f"{sym},m60,,120"},
+        )
+        if r:
+            data = r.json()
+            stock_data = data.get("data", {}).get(sym, {})
+            tencent_m60 = stock_data.get("m60", stock_data.get("qfqm60", []))
+            for item in tencent_m60:
+                try:
+                    m60_raw.append({
+                        "day": str(item[0]),
+                        "open": str(item[1]),
+                        "close": str(item[2]),
+                        "high": str(item[3]),
+                        "low": str(item[4]),
+                        "volume": str(int(float(item[5]) * 100)),  # 手→股
+                    })
+                except (IndexError, ValueError, TypeError):
+                    continue
+    except Exception:
+        pass
+
+    # 备用源：新浪60分钟K线
+    if len(m60_raw) < 2:
+        r = safe_request(
+            "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData",
+            limiter or _limiter_sina, session,
+            params={"symbol": sym, "scale": "60", "ma": "no", "datalen": count * 2},
+            headers={"Referer": "https://finance.sina.com.cn/"},
+        )
+        if r and r.text.strip() and r.text.strip() != "null":
+            try:
+                sina_m60 = json.loads(r.text)
+                for item in sina_m60:
+                    try:
+                        m60_raw.append({
+                            "day": str(item.get("day", "")),
+                            "open": str(item.get("open", 0)),
+                            "close": str(item.get("close", 0)),
+                            "high": str(item.get("high", 0)),
+                            "low": str(item.get("low", 0)),
+                            "volume": str(int(float(item.get("volume", 0)))),
+                        })
+                    except (ValueError, TypeError):
+                        continue
+            except Exception:
+                pass
+
+    # 合并为120分钟
+    if len(m60_raw) < 2:
         return []
 
-    try:
-        m60 = json.loads(r.text)
-        if not m60 or len(m60) < 2:
-            return []
-        m120 = []
-        for i in range(0, len(m60) - 1, 2):
-            a, b = m60[i], m60[i + 1]
-            m120.append({
-                "day": b["day"],
-                "open": a["open"],
-                "close": b["close"],
-                "high": str(max(float(a["high"]), float(b["high"]))),
-                "low": str(min(float(a["low"]), float(b["low"]))),
-                "volume": str(int(float(a.get("volume", 0)) + float(b.get("volume", 0)))),
-            })
-        return m120
-    except Exception as e:
-        # 打印解析错误以便排查，不再静默吞掉
-        print(f"    ⚠️ 120min解析失败 {code}: {e} (text={r.text[:200]})")
-        return []
+    m120 = []
+    for i in range(0, len(m60_raw) - 1, 2):
+        a, b = m60_raw[i], m60_raw[i + 1]
+        m120.append({
+            "day": b["day"],
+            "open": a["open"],
+            "close": b["close"],
+            "high": str(max(float(a["high"]), float(b["high"]))),
+            "low": str(min(float(a["low"]), float(b["low"]))),
+            "volume": str(int(float(a["volume"]) + float(b["volume"]))),
+        })
+    return m120
 
 
 def supplement_kline_amount(kline_map: dict, quotes: dict) -> dict:
@@ -2291,11 +2318,13 @@ def fetch_dde_data_eastmoney(codes: list[str], session: requests.Session = None)
 def fetch_fund_flow_combined(codes: list[str], session: requests.Session = None,
                               max_workers: int = 8) -> tuple:
     """
-    合并获取 DDE 昨日主力数据 + 盘中大单流向（单次API调用，避免重复请求封IP）
+    合并获取 DDE 昨日主力数据 + 盘中大单流向（串行版，防封IP）
     
     调用一次 eastmoney daykline 接口，同时提取:
       - klines[-2] → 昨日完整DDE数据（主力净流入等）
       - klines[-1] → 当日大单流向数据（中段/尾段）
+    
+    ⚠️ 东财防封铁律：串行调用，间隔由 em_get 内置锁保证 ≥1s。
     
     返回: (dde_dict, intraday_dict)
       dde_dict:     {code: {main_net_inflow, dde_net_volume, ...}}
@@ -2308,32 +2337,23 @@ def fetch_fund_flow_combined(codes: list[str], session: requests.Session = None,
     intra_results = {}
     
     def _fetch_one(code):
-        proxy = None
         try:
             market = "1" if code.startswith("6") else "0"
             secid = f"{market}.{code}"
 
-            # 通过代理池获取代理
-            if _proxy_pool and _proxy_pool.has_proxies:
-                proxy = _proxy_pool.get()
-
-            # 使用 em_get 统一限流（替代自建Session绕过限速的模式）
             r = em_get(
                 "https://push2.eastmoney.com/api/qt/stock/fflow/daykline/get",
                 params={
                     "secid": secid,
                     "fields1": "f1,f2,f3,f7",
                     "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65",
-                    "lmt": "3",       # 取最近3天（确保有昨天和今天）
+                    "lmt": "3",
                     "end": "20500101",
                     "ut": "b2884a393a59ad64002292a3e90d46a5",
                 },
                 timeout=15,
-                proxy=proxy,
             )
             if not r or r.status_code != 200:
-                if _proxy_pool:
-                    _proxy_pool.mark_bad(proxy)
                 return code, None, None
 
             try:
@@ -2436,28 +2456,23 @@ def fetch_fund_flow_combined(codes: list[str], session: requests.Session = None,
                 _proxy_pool.mark_bad(proxy)
             return code, None, None
     
-    print(f"    📦 获取资金流向数据(合并DDE+大单): {len(codes)} 只...")
+    print(f"    📦 获取资金流向数据(合并DDE+大单): {len(codes)} 只(串行)...")
 
     # 快速跳过已知被封的源
     if _source_tracker.is_reachable("eastmoney_https") is False:
         print("    ⏭️ 东财HTTPS已知被封，跳过")
         return {}, {}
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(_fetch_one, c): c for c in codes}
-        done = 0
-        for future in as_completed(futures):
-            done += 1
-            if done % 20 == 0:
-                print(f"    ⏳ 资金流向进度: {done}/{len(codes)}...")
-            try:
-                code, dde, intra = future.result(timeout=20)
-                if dde:
-                    dde_results[code] = dde
-                if intra:
-                    intra_results[code] = intra
-            except Exception:
-                continue
+    done = 0
+    for code in codes:
+        code_r, dde, intra = _fetch_one(code)
+        done += 1
+        if done % 20 == 0:
+            print(f"    ⏳ 资金流向进度: {done}/{len(codes)}...")
+        if dde:
+            dde_results[code_r] = dde
+        if intra:
+            intra_results[code_r] = intra
     
     print(f"    ✅ DDE昨日主力: {len(dde_results)} 只 | 盘中大单流向: {len(intra_results)} 只")
     return dde_results, intra_results
@@ -2741,15 +2756,17 @@ def fetch_fund_flow_efinance(codes: list[str], max_workers: int = 8) -> tuple:
 
 
 def _check_eastmoney_https() -> bool:
-    """快速检测东财HTTPS API是否可达（结果缓存5分钟）"""
+    """快速检测东财HTTPS（缓存15分钟，超时3秒）"""
     cached = _source_tracker.is_reachable("eastmoney_https")
-    if cached is not None and not _source_tracker.need_check("eastmoney_https", max_age=300):
+    if cached is not None and not _source_tracker.need_check("eastmoney_https", max_age=900):
         return cached
     try:
-        r = em_get(
+        r = requests.get(
             "https://push2.eastmoney.com/api/qt/stock/fflow/daykline/get",
-            params={"secid": "1.600519", "fields1": "f1", "fields2": "f51", "lmt": "1", "end": "20500101"},
-            timeout=8,
+            params={"secid": "1.600519", "fields1": "f1", "fields2": "f51", "lmt": "1", "end": "20500101",
+                    "ut": "b2884a393a59ad64002292a3e90d46a5"},
+            timeout=5,
+            headers={"User-Agent": "Mozilla/5.0"},
         )
         ok = r.status_code == 200 and r.json().get("data") is not None
         _source_tracker.mark("eastmoney_https", ok)
@@ -2760,15 +2777,17 @@ def _check_eastmoney_https() -> bool:
 
 
 def _check_eastmoney_http() -> bool:
-    """快速检测东财HTTP API是否可达（结果缓存5分钟）"""
+    """快速检测东财HTTP（缓存15分钟，超时5秒）"""
     cached = _source_tracker.is_reachable("eastmoney_http")
-    if cached is not None and not _source_tracker.need_check("eastmoney_http", max_age=300):
+    if cached is not None and not _source_tracker.need_check("eastmoney_http", max_age=900):
         return cached
     try:
-        r = em_get(
+        r = requests.get(
             "http://push2.eastmoney.com/api/qt/stock/fflow/kline/get",
-            params={"secid": "1.600519", "fields1": "f1", "fields2": "f51", "klt": "1", "lmt": "1"},
-            timeout=8,
+            params={"secid": "1.600519", "fields1": "f1", "fields2": "f51", "klt": "1", "lmt": "1",
+                    "ut": "b2884a393a59ad64002292a3e90d46a5"},
+            timeout=5,
+            headers={"User-Agent": "Mozilla/5.0"},
         )
         ok = r.status_code == 200 and r.json().get("data") is not None
         _source_tracker.mark("eastmoney_http", ok)
@@ -2778,55 +2797,120 @@ def _check_eastmoney_http() -> bool:
         return False
 
 
+def _check_eastmoney_parallel() -> tuple[bool, bool]:
+    """并行检测东财HTTPS和HTTP可达性（总耗时=max(3s, 最快返回)，而非累加）"""
+    cached_https = _source_tracker.is_reachable("eastmoney_https")
+    cached_http = _source_tracker.is_reachable("eastmoney_http")
+    https_fresh = cached_https is not None and not _source_tracker.need_check("eastmoney_https", max_age=900)
+    http_fresh = cached_http is not None and not _source_tracker.need_check("eastmoney_http", max_age=900)
+    if https_fresh and http_fresh:
+        return cached_https, cached_http
+
+    results = [None, None]
+    def _check_https():
+        results[0] = _check_eastmoney_https()
+    def _check_http():
+        results[1] = _check_eastmoney_http()
+    t1 = threading.Thread(target=_check_https)
+    t2 = threading.Thread(target=_check_http)
+    t1.start()
+    t2.start()
+    t1.join(timeout=6)
+    t2.join(timeout=6)
+    return (results[0] if results[0] is not None else False,
+            results[1] if results[1] is not None else False)
+
+
 def fetch_fund_flow_auto(codes: list[str], max_workers: int = 8) -> tuple:
     """
-    智能选择数据源（带缓存检测 + 负向缓存）：
+    智能选择数据源（串行版，防封IP）：
     1. 优先尝试东财 HTTPS daykline（完整日级数据，含昨日主力）
     2. 若 HTTPS 被封，尝试 HTTP kline 分钟级接口
     3. 若两者均封，直接返回空数据（避免浪费时间逐一尝试）
 
-    优化：加入负向缓存，已知失败的股票短时间内不重复请求
+    优化：
+    - 线程安全的负向缓存
+    - 轻量级数据源检测（不经em_get限流）
+    - 串行请求（遵守东财防封铁律）
     """
-    # 负向缓存：跳过最近5分钟内已确认失败的股票
+    # 线程安全的负向缓存
     if not hasattr(fetch_fund_flow_auto, '_fail_cache'):
-        fetch_fund_flow_auto._fail_cache = {}  # {code: fail_timestamp}
+        fetch_fund_flow_auto._fail_cache = {}
+        fetch_fund_flow_auto._fail_lock = threading.Lock()
     fail_cache = fetch_fund_flow_auto._fail_cache
-    now = time.time()
-    # 清理超过5分钟的负向缓存
-    expired = [c for c, t in fail_cache.items() if now - t > 300]
-    for c in expired:
-        del fail_cache[c]
+    fail_lock = fetch_fund_flow_auto._fail_lock
 
-    orig_count = len(codes)
-    codes = [c for c in codes if c not in fail_cache]
-    skipped = orig_count - len(codes)
+    now = time.time()
+    with fail_lock:
+        # 清理超过5分钟的负向缓存
+        expired = [c for c, t in fail_cache.items() if now - t > 300]
+        for c in expired:
+            del fail_cache[c]
+        orig_count = len(codes)
+        codes = [c for c in codes if c not in fail_cache]
+        skipped = orig_count - len(codes)
     if skipped > 0:
         print(f"    ⏭️ 跳过 {skipped} 只近期失败股票（负向缓存）")
 
     if not codes:
         return {}, {}
 
-    # 检测 HTTPS 是否可达（缓存5分钟）
+    # 并行检测 HTTPS+HTTP（总耗时≤3秒，而非累加16秒）
     print("    🔍 检测数据源连通性...", end="")
-    https_ok = _check_eastmoney_https()
+    https_ok, http_ok = _check_eastmoney_parallel()
 
     if https_ok:
         print(" ✅ 东财HTTPS可用")
-        _source_tracker.mark("eastmoney_https", True)
-        dde, intra = fetch_fund_flow_combined(codes, max_workers=max_workers)
-    elif _check_eastmoney_http():
+        dde, intra = fetch_fund_flow_combined(codes)
+    elif http_ok:
         print(" ❌ HTTPS被封, ✅ HTTP可用")
-        dde, intra = fetch_fund_flow_efinance(codes, max_workers=max_workers)
+        dde, intra = {}, {}
+        for code in codes:
+            try:
+                market = "1" if code.startswith("6") else "0"
+                secid = f"{market}.{code}"
+                r = em_get(
+                    "http://push2.eastmoney.com/api/qt/stock/fflow/kline/get",
+                    params={"secid": secid, "fields1": "f1,f2,f3,f7",
+                            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63",
+                            "klt": "1", "lmt": "0",
+                            "ut": "b2884a393a59ad64002292a3e90d46a5"},
+                    timeout=15,
+                )
+                if not r or r.status_code != 200:
+                    continue
+                data = r.json()
+                if not data or data.get("data") is None:
+                    continue
+                klines = data["data"].get("klines", [])
+                if not klines or len(klines) < 2:
+                    continue
+                last_row = klines[-1].split(",")
+                if len(last_row) >= 6:
+                    main_net = float(last_row[1]) if last_row[1] else 0
+                    dde[code] = {
+                        "main_net_inflow": main_net,
+                        "super_large_net": float(last_row[5]) if last_row[5] else 0,
+                        "large_net": float(last_row[4]) if last_row[4] else 0,
+                        "medium_net": float(last_row[3]) if last_row[3] else 0,
+                        "small_net": float(last_row[2]) if last_row[2] else 0,
+                        "dde_net_volume": main_net / 10000 if main_net else 0,
+                        "source": "eastmoney_http",
+                    }
+            except Exception:
+                continue
     else:
         print(" ❌ 东财全封（HTTPS+HTTP），跳过资金流向获取")
         print(f"    ⚠️ 数据源状态: {_source_tracker.summary()}")
         dde, intra = {}, {}
 
-    # 记录失败的股票到负向缓存
+    # 记录失败股票到负向缓存（线程安全）
     failed = [c for c in codes if c not in dde]
-    for c in failed:
-        fail_cache[c] = now
     if failed:
+        with fail_lock:
+            expire = time.time() + 300
+            for c in failed:
+                fail_cache[c] = expire
         print(f"    📝 {len(failed)} 只记录负向缓存（下次跳过）")
 
     return dde, intra
@@ -2871,20 +2955,15 @@ def fetch_dde_data_batch_legacy(codes: list[str], session: requests.Session = No
     except Exception as e:
         print(f"    ⚠️ thsdk批量异常: {e}")
     
-    # 备选：eastmoney 多线程（降低并发数避免限流，直接用独立session绕过串行em_get）
-    print(f"    📦 使用eastmoney获取DDE数据: {len(codes)} 只...")
+    # 备选：eastmoney 串行（严格遵守防封铁律）
+    print(f"    📦 使用eastmoney获取DDE数据: {len(codes)} 只(串行)...")
     results = {}
 
-    _EM_HEADERS = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-        "Referer": "https://quote.eastmoney.com/",
-    }
-
-    def _fetch_one(code):
+    done = 0
+    for code in codes:
         try:
             market = "1" if code.startswith("6") else "0"
             secid = f"{market}.{code}"
-            # 使用 em_get 统一限流（替代自建Session绕过限速的模式）
             r = em_get(
                 "https://push2.eastmoney.com/api/qt/stock/fflow/daykline/get",
                 params={
@@ -2898,18 +2977,19 @@ def fetch_dde_data_batch_legacy(codes: list[str], session: requests.Session = No
                 timeout=10,
             )
             if not r or r.status_code != 200:
-                return code, {}
+                done += 1
+                continue
 
             data = r.json()
             if not data or data.get("data") is None:
-                return code, {}
+                done += 1
+                continue
 
             klines = data.get("data", {}).get("klines", [])
             if not klines:
-                return code, {}
+                done += 1
+                continue
 
-            # 日K线格式：日期,主力净流入,超大单净流入,大单净流入,中单净流入,小单净流入,主力净流入占比,超大单净流入占比,大单净流入占比,中单净流入占比,小单净流入占比,...
-            # 取倒数第2行作为昨日数据（倒数第1行是当天盘中数据，可能不完整）
             if len(klines) >= 2:
                 yesterday_line = klines[-2].split(",")
             else:
@@ -2917,33 +2997,20 @@ def fetch_dde_data_batch_legacy(codes: list[str], session: requests.Session = No
 
             if len(yesterday_line) >= 6:
                 main_net = float(yesterday_line[1]) if yesterday_line[1] else 0
-                return code, {
+                results[code] = {
                     "main_net_inflow": main_net,
                     "super_large_net": float(yesterday_line[2]) if yesterday_line[2] else 0,
                     "large_net": float(yesterday_line[3]) if yesterday_line[3] else 0,
                     "medium_net": float(yesterday_line[4]) if yesterday_line[4] else 0,
                     "small_net": float(yesterday_line[5]) if yesterday_line[5] else 0,
-                    "dde_net_volume": main_net / 10000 if main_net else 0,  # 转万元
+                    "dde_net_volume": main_net / 10000 if main_net else 0,
                     "source": "eastmoney",
                 }
-            return code, {}
         except Exception:
-            return code, {}
-
-    # 并发数5：既快速又不触发东财反爬
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = {executor.submit(_fetch_one, c): c for c in codes}
-        done = 0
-        for future in as_completed(futures):
-            done += 1
-            if done % 20 == 0:
-                print(f"    ⏳ DDE进度: {done}/{len(codes)}...")
-            try:
-                code, dde = future.result(timeout=20)
-                if dde:
-                    results[code] = dde
-            except Exception:
-                continue
+            pass
+        done += 1
+        if done % 20 == 0:
+            print(f"    ⏳ DDE进度: {done}/{len(codes)}...")
     
     print(f"    ✅ DDE批量数据(eastmoney): {len(results)} 只")
     return results
@@ -3140,11 +3207,11 @@ def fetch_intraday_big_order_flow(codes: list[str], session: requests.Session = 
 
     results = {}
 
-    def _fetch_intraday_one(code):
+    done = 0
+    for code in codes:
         try:
             market = "1" if code.startswith("6") else "0"
             secid = f"{market}.{code}"
-            # 使用 em_get 统一限流（替代自建Session绕过限速的模式）
             r = em_get(
                 "https://push2.eastmoney.com/api/qt/stock/fflow/daykline/get",
                 params={
@@ -3157,29 +3224,29 @@ def fetch_intraday_big_order_flow(codes: list[str], session: requests.Session = 
                 },
                 timeout=10,
             )
-
             if not r or r.status_code != 200:
-                return code, None
+                done += 1
+                continue
 
             data = r.json()
             if not data or data.get("data") is None:
-                return code, None
+                done += 1
+                continue
 
             klines = data.get("data", {}).get("klines", [])
             if not klines:
-                return code, None
+                done += 1
+                continue
 
-            # 解析最后一行（当日数据）
-            # 格式：日期,主力净流入,超大单净流入,大单净流入,中单净流入,小单净流入,...
             last_line = klines[-1].split(",")
             if len(last_line) < 7:
-                return code, None
+                done += 1
+                continue
 
             main_flow = float(last_line[1]) if last_line[1] else 0
             super_large_flow = float(last_line[2]) if last_line[2] else 0
             large_flow = float(last_line[3]) if last_line[3] else 0
 
-            # 大单净流入（中段）
             if large_flow > 0:
                 mid_buy_vol = int(large_flow / 10000)
                 mid_sell_vol = 0
@@ -3189,7 +3256,6 @@ def fetch_intraday_big_order_flow(codes: list[str], session: requests.Session = 
                 mid_sell_vol = int(abs(large_flow) / 10000)
                 mid_buy_all = False
 
-            # 超大单净流入（尾段）
             if super_large_flow > 0:
                 tail_buy_vol = int(super_large_flow / 10000)
                 tail_sell_vol = 0
@@ -3197,7 +3263,7 @@ def fetch_intraday_big_order_flow(codes: list[str], session: requests.Session = 
                 tail_buy_vol = 0
                 tail_sell_vol = int(abs(super_large_flow) / 10000)
 
-            return code, {
+            results[code] = {
                 "mid_buy_vol": mid_buy_vol,
                 "mid_sell_vol": mid_sell_vol,
                 "tail_buy_vol": tail_buy_vol,
@@ -3209,18 +3275,8 @@ def fetch_intraday_big_order_flow(codes: list[str], session: requests.Session = 
                 "data_source": "eastmoney_daily",
             }
         except Exception:
-            return code, None
-
-    # 多线程并发，避免串行等待 N*1s
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = {executor.submit(_fetch_intraday_one, c): c for c in codes}
-        for future in as_completed(futures):
-            try:
-                code, info = future.result(timeout=20)
-                if info is not None:
-                    results[code] = info
-            except Exception:
-                continue
+            pass
+        done += 1
 
     return results
 
@@ -3841,6 +3897,367 @@ def _load_json(path):
 # ════════════════════════════════════════════════════
 # CLI
 # ════════════════════════════════════════════════════
+
+
+# ═══════════════════════════════════════════════════════════
+# 第二轮优化：新增数据源（基于 a-stock-data 28 端点分析）
+# ═══════════════════════════════════════════════════════════
+
+# 东财通用 UA
+_EM_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+
+
+# ── [新增1] 同花顺热点 — 当日强势股 + 题材归因 reason tags ──
+
+def ths_hot_reason(date: str = None) -> list[dict]:
+    """
+    同花顺当日强势股归因（零鉴权 73ms）。
+    返回: [{code, name, reason, change_pct, turnover_pct, close, dde_net_volume}]
+    """
+    from datetime import date as _date
+    if date is None:
+        date = _date.today().strftime("%Y-%m-%d")
+    url = (
+        f"http://zx.10jqka.com.cn/event/api/getharden/"
+        f"date/{date}/orderby/date/orderway/desc/charset/GBK/"
+    )
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "Chrome/117.0.0.0 Safari/537.36",
+    }
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        data = r.json()
+        if data.get("errocode", 0) != 0:
+            return []
+        results = []
+        for row in (data.get("data") or []):
+            results.append({
+                "code": str(row.get("code", "")),
+                "name": str(row.get("name", "")),
+                "reason": str(row.get("reason", "")),
+                "change_pct": float(row.get("zhangfu", 0) or 0),
+                "turnover_pct": float(row.get("huanshou", 0) or 0),
+                "close": float(row.get("close", 0) or 0),
+                "dde_net_volume": float(row.get("ddejingliang", 0) or 0),
+                "amount": float(row.get("chengjiaoe", 0) or 0),
+            })
+        return results
+    except Exception:
+        return []
+
+
+def get_hot_theme_keywords(date: str = None, top_n: int = 10) -> list[tuple[str, int]]:
+    """提取当日热门题材关键词（词频统计）"""
+    from collections import Counter
+    stocks = ths_hot_reason(date)
+    all_tags = []
+    for s in stocks:
+        reason = s.get("reason", "")
+        if reason:
+            all_tags.extend(t.strip() for t in reason.split("+") if t.strip())
+    return Counter(all_tags).most_common(top_n)
+
+
+# ── [新增2] 北向资金 — 沪深股通分钟级流向 ──
+
+def hsgt_realtime() -> dict:
+    """
+    沪深股通当日实时分钟流向（零鉴权，262 个时间点）。
+    返回: {time, hgt_yi(沪股通/亿), sgt_yi(深股通/亿)}
+    """
+    url = "https://data.hexin.cn/market/hsgtApi/method/dayChart/"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "Chrome/117.0.0.0 Safari/537.36",
+        "Host": "data.hexin.cn",
+        "Referer": "https://data.hexin.cn/",
+    }
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        d = r.json()
+        times = d.get("time", [])
+        hgt = d.get("hgt", [])
+        sgt = d.get("sgt", [])
+        n = len(times)
+        return {
+            "time": times,
+            "hgt_yi": (hgt + [None] * max(0, n - len(hgt)))[:n],
+            "sgt_yi": (sgt + [None] * max(0, n - len(sgt)))[:n],
+        }
+    except Exception:
+        return {"time": [], "hgt_yi": [], "sgt_yi": []}
+
+
+def get_northbound_close() -> tuple[float, float]:
+    """获取北向资金收盘数据。返回: (沪股通/亿, 深股通/亿)"""
+    data = hsgt_realtime()
+    hgt_close = sgt_close = 0.0
+    for v in reversed(data.get("hgt_yi", [])):
+        if v is not None:
+            hgt_close = float(v)
+            break
+    for v in reversed(data.get("sgt_yi", [])):
+        if v is not None:
+            sgt_close = float(v)
+            break
+    return hgt_close, sgt_close
+
+
+# ── [新增3] 东财数据中心统一查询（6 端点共用） ──
+
+DATACENTER_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
+
+def eastmoney_datacenter(report_name: str, columns: str = "ALL",
+                          filter_str: str = "", page_size: int = 50,
+                          sort_columns: str = "", sort_types: str = "-1") -> list[dict]:
+    """
+    东财数据中心统一查询（已内置 em_get 限流）。
+    覆盖: 龙虎榜/解禁/融资融券/大宗交易/股东户数/分红
+    """
+    params = {
+        "reportName": report_name, "columns": columns,
+        "filter": filter_str, "pageNumber": "1", "pageSize": str(page_size),
+        "sortColumns": sort_columns, "sortTypes": sort_types,
+        "source": "WEB", "client": "WEB",
+    }
+    try:
+        r = em_get(DATACENTER_URL, params=params, timeout=15)
+        d = r.json()
+        if d.get("result") and d["result"].get("data"):
+            return d["result"]["data"]
+    except Exception:
+        pass
+    return []
+
+
+def dragon_tiger_board(code: str, trade_date: str = None, look_back: int = 30) -> dict:
+    """龙虎榜数据聚合。返回: {records, seats: {buy, sell}}"""
+    if trade_date is None:
+        trade_date = datetime.now().strftime("%Y-%m-%d")
+    start_str = (datetime.strptime(trade_date, "%Y-%m-%d") - timedelta(days=look_back)).strftime("%Y-%m-%d")
+    data = eastmoney_datacenter(
+        "RPT_DAILYBILLBOARD_DETAILSNEW",
+        filter_str=f"(TRADE_DATE>='{start_str}')(TRADE_DATE<='{trade_date}')(SECURITY_CODE=\"{code}\")",
+        page_size=50, sort_columns="TRADE_DATE", sort_types="-1",
+    )
+    records = [{"date": str(r.get("TRADE_DATE", ""))[:10],
+                "reason": r.get("EXPLANATION", ""),
+                "net_buy": round((r.get("BILLBOARD_NET_AMT") or 0) / 10000, 1)} for r in data]
+    seats = {"buy": [], "sell": []}
+    if records:
+        ld = records[0]["date"]
+        for row in eastmoney_datacenter("RPT_BILLBOARD_DAILYDETAILSBUY",
+                filter_str=f"(TRADE_DATE='{ld}')(SECURITY_CODE=\"{code}\")",
+                page_size=10, sort_columns="BUY", sort_types="-1")[:5]:
+            seats["buy"].append({"name": row.get("OPERATEDEPT_NAME", ""),
+                                  "buy_amt": round((row.get("BUY") or 0) / 10000, 1)})
+        for row in eastmoney_datacenter("RPT_BILLBOARD_DAILYDETAILSSELL",
+                filter_str=f"(TRADE_DATE='{ld}')(SECURITY_CODE=\"{code}\")",
+                page_size=10, sort_columns="SELL", sort_types="-1")[:5]:
+            seats["sell"].append({"name": row.get("OPERATEDEPT_NAME", ""),
+                                   "sell_amt": round((row.get("SELL") or 0) / 10000, 1)})
+    return {"records": records, "seats": seats}
+
+
+def lockup_expiry(code: str, forward_days: int = 90) -> list[dict]:
+    """限售解禁预警：未来 N 天待解禁"""
+    td = datetime.now().strftime("%Y-%m-%d")
+    ed = (datetime.now() + timedelta(days=forward_days)).strftime("%Y-%m-%d")
+    return [{"date": str(r.get("FREE_DATE", ""))[:10],
+             "type": r.get("LIMITED_STOCK_TYPE", ""),
+             "shares": r.get("FREE_SHARES_NUM", 0),
+             "ratio": r.get("FREE_RATIO", 0)}
+            for r in eastmoney_datacenter("RPT_LIFT_STAGE",
+                filter_str=f"(SECURITY_CODE=\"{code}\")(FREE_DATE>='{td}')(FREE_DATE<='{ed}')",
+                page_size=20, sort_columns="FREE_DATE", sort_types="1")]
+
+
+def margin_trading(code: str, page_size: int = 10) -> list[dict]:
+    """融资融券明细（日级）"""
+    return [{"date": str(r.get("DATE", ""))[:10], "rzye": r.get("RZYE", 0),
+             "rzmre": r.get("RZMRE", 0), "rqye": r.get("RQYE", 0)}
+            for r in eastmoney_datacenter("RPTA_WEB_RZRQ_GGMX",
+                filter_str=f'(SCODE="{code}")', page_size=page_size,
+                sort_columns="DATE", sort_types="-1")]
+
+
+def holder_num_change(code: str, page_size: int = 10) -> list[dict]:
+    """股东户数变化（筹码集中度指标）"""
+    return [{"date": str(r.get("END_DATE", ""))[:10],
+             "holder_num": r.get("HOLDER_NUM", 0),
+             "change_ratio": r.get("HOLDER_NUM_RATIO", 0),
+             "avg_shares": r.get("AVG_FREE_SHARES", 0)}
+            for r in eastmoney_datacenter("RPT_HOLDERNUMLATEST",
+                filter_str=f'(SECURITY_CODE="{code}")', page_size=page_size,
+                sort_columns="END_DATE", sort_types="-1")]
+
+
+# ── [新增4] 巨潮公告 — 动态 orgId ──
+
+_CNINFO_ORGID_MAP = {}
+_CNINFO_ORGID_LOCK = threading.Lock()
+
+def _cninfo_orgid(code: str) -> str:
+    """查股票真实 orgId（模块级缓存）"""
+    global _CNINFO_ORGID_MAP
+    with _CNINFO_ORGID_LOCK:
+        if not _CNINFO_ORGID_MAP:
+            try:
+                r = requests.get("http://www.cninfo.com.cn/new/data/szse_stock.json",
+                                 headers={"User-Agent": _EM_UA}, timeout=15)
+                _CNINFO_ORGID_MAP = {s["code"]: s["orgId"] for s in r.json().get("stockList", [])}
+            except Exception:
+                pass
+        org = _CNINFO_ORGID_MAP.get(code)
+        if org:
+            return org
+    if code.startswith("6"):
+        return f"gssh0{code}"
+    elif code.startswith(("8", "4")):
+        return f"gsbj0{code}"
+    return f"gssz0{code}"
+
+
+def cninfo_announcements(code: str, page_size: int = 30) -> list[dict]:
+    """巨潮公告全文检索。返回: [{title, type, date, url}]"""
+    url = "https://www.cninfo.com.cn/new/hisAnnouncement/query"
+    org_id = _cninfo_orgid(code)
+    payload = {
+        "stock": f"{code},{org_id}", "tabName": "fulltext",
+        "pageSize": str(page_size), "pageNum": "1",
+        "column": "", "category": "", "plate": "",
+        "seDate": "", "searchkey": "", "secid": "",
+        "sortName": "", "sortType": "", "isHLtitle": "true",
+    }
+    headers = {
+        "User-Agent": _EM_UA,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Referer": "https://www.cninfo.com.cn/new/disclosure",
+        "Origin": "https://www.cninfo.com.cn",
+    }
+    try:
+        r = requests.post(url, data=payload, headers=headers, timeout=15)
+        rows = []
+        for item in (r.json().get("announcements", []) or []):
+            ts = item.get("announcementTime")
+            if isinstance(ts, (int, float)):
+                ds = datetime.fromtimestamp(ts / 1000).strftime("%Y-%m-%d")
+            else:
+                ds = str(ts)[:10] if ts else ""
+            rows.append({"title": item.get("announcementTitle", ""),
+                         "type": item.get("announcementTypeName", ""),
+                         "date": ds,
+                         "url": f"https://www.cninfo.com.cn/new/disclosure/detail?annoId={item.get('announcementId', '')}"})
+        return rows
+    except Exception:
+        return []
+
+
+# ── [新增5] 东财个股信息 ──
+
+def eastmoney_stock_info(code: str) -> dict:
+    """东财个股基本面（行业/股本/市值/上市日期）"""
+    mc = 1 if code.startswith("6") else 0
+    params = {"fltt": "2", "invt": "2",
+              "fields": "f57,f58,f84,f85,f127,f116,f117,f189,f43",
+              "secid": f"{mc}.{code}"}
+    try:
+        r = em_get("https://push2.eastmoney.com/api/qt/stock/get",
+                    params=params, headers={"User-Agent": _EM_UA}, timeout=10)
+        d = r.json().get("data", {})
+        return {"code": d.get("f57", ""), "name": d.get("f58", ""),
+                "industry": d.get("f127", ""), "total_shares": d.get("f84", 0),
+                "float_shares": d.get("f85", 0), "mcap": d.get("f116", 0),
+                "float_mcap": d.get("f117", 0), "list_date": str(d.get("f189", "")),
+                "price": d.get("f43", 0)}
+    except Exception:
+        return {}
+
+
+# ── [新增6] mootdx 财务快照 + F10 ──
+
+def mootdx_finance_snapshot(code: str) -> dict:
+    """mootdx 财务快照（37字段季报，不封IP）"""
+    if not _HAS_MOOTDX or _MOOTDX_CLIENT is None:
+        return {}
+    try:
+        fin = _MOOTDX_CLIENT.finance(symbol=code)
+        if fin is None or fin.empty:
+            return {}
+        row = fin.iloc[0] if len(fin) > 0 else {}
+        return {"eps": float(row.get("eps", 0) or 0),
+                "bvps": float(row.get("bvps", 0) or 0),
+                "roe": float(row.get("roe", 0) or 0),
+                "profit": float(row.get("profit", 0) or 0),
+                "income": float(row.get("income", 0) or 0),
+                "total_shares": float(row.get("zongguben", 0) or 0),
+                "float_shares": float(row.get("liutongguben", 0) or 0)}
+    except Exception:
+        return {}
+
+
+def mootdx_f10_text(code: str, category: str = "最新提示") -> str:
+    """mootdx F10 公司文本（9大类，不封IP）"""
+    if not _HAS_MOOTDX or _MOOTDX_CLIENT is None:
+        return ""
+    try:
+        text = _MOOTDX_CLIENT.F10(symbol=code, name=category)
+        return text if text else ""
+    except Exception:
+        return ""
+
+
+# ── [新增7] 东财板块归属 slist ──
+
+def eastmoney_concept_blocks(code: str) -> dict:
+    """个股所属板块/概念归属（一次请求拿全）。返回: {total, boards, concept_tags}"""
+    mc = 1 if code.startswith("6") else 0
+    params = {"fltt": "2", "invt": "2", "secid": f"{mc}.{code}",
+              "spt": "3", "pi": "0", "pz": "200", "po": "1",
+              "fields": "f12,f14,f3,f128"}
+    try:
+        r = em_get("https://push2.eastmoney.com/api/qt/slist/get",
+                    params=params, headers={"User-Agent": _EM_UA}, timeout=15)
+        d = r.json()
+    except Exception:
+        return {"total": 0, "boards": [], "concept_tags": []}
+    diff = (d.get("data") or {}).get("diff") or {}
+    items = diff.values() if isinstance(diff, dict) else diff
+    boards = [{"name": it.get("f14", ""), "code": it.get("f12", ""),
+               "change_pct": it.get("f3", ""), "lead_stock": it.get("f128", "")}
+              for it in items]
+    return {"total": len(boards), "boards": boards,
+            "concept_tags": [b["name"] for b in boards]}
+
+
+# ── [附录] 新浪财报三表（正确解析方式） ──
+
+def sina_financial_report(code: str, report_type: str = "lrb", num: int = 8) -> list[dict]:
+    """新浪财报三表。report_type: fzb/lrb/llb"""
+    prefix = "sh" if code.startswith("6") else "sz"
+    url = "https://quotes.sina.cn/cn/api/openapi.php/CompanyFinanceService.getFinanceReport2022"
+    params = {"paperCode": f"{prefix}{code}", "source": report_type,
+              "type": "0", "page": "1", "num": str(num)}
+    try:
+        r = requests.get(url, params=params, headers={"User-Agent": _EM_UA}, timeout=15)
+        report_list = r.json().get("result", {}).get("data", {}).get("report_list", {}) or {}
+        rows = []
+        for period in sorted(report_list.keys(), reverse=True)[:num]:
+            obj = report_list[period]
+            rec = {"报告期": f"{period[:4]}-{period[4:6]}-{period[6:8]}"}
+            for it in (obj.get("data", []) or []):
+                title = it.get("item_title", "")
+                if not title or it.get("item_value") is None:
+                    continue
+                rec[title] = it.get("item_value")
+                tongbi = it.get("item_tongbi")
+                if tongbi not in (None, ""):
+                    rec[title + "_同比"] = tongbi
+            rows.append(rec)
+        return rows
+    except Exception:
+        return []
 
 
 # ════════════════════════════════════════════════════
@@ -4527,8 +4944,8 @@ def close_auction_monitor(codes: list[str] = None, poll_interval: int = 10,
         if dde_net_vol > 5: score += 3      # 超强主力流入
         elif dde_net_vol > 3: score += 2    # 强主力流入
         elif dde_net_vol > 1: score += 1    # 主力流入
+        elif dde_net_vol < -3: score -= 2   # 强主力流出（先检查更极端的值）
         elif dde_net_vol < -1: score -= 1   # 主力流出
-        elif dde_net_vol < -3: score -= 2   # 强主力流出
         if chg >= 9.5:
             if vr < 5: score -= 3
             if rr < 50: score -= 2
@@ -5325,9 +5742,9 @@ def pool_base_post_kline(code: str, price: float, klines: list[dict],
     if last_limit_amount > 0 and y_amount <= last_limit_amount:
         return False, "昨额≤涨停额"
 
-    # 10. 7天涨幅 < 34.99%
-    if len(klines) >= 8:
-        close_7d_ago = float(klines[-8].get("close", 0))
+    # 10. 7天涨幅 < 34.99%（klines[-2]=昨收, klines[-9]=7个交易日前收盘）
+    if len(klines) >= 9:
+        close_7d_ago = float(klines[-9].get("close", 0))
         if close_7d_ago > 0:
             gain_7d = (y_close - close_7d_ago) / close_7d_ago * 100
             if gain_7d >= 34.99:
@@ -5432,12 +5849,14 @@ def pool_volume_price(c: dict, tc: dict, em: dict, klines: list = None, close_au
     yesterday_vol_shares = yesterday_vol_lots * 100
     if yesterday_vol_lots <= 0:
         return False, "昨成交量为0"
-    # 7. 今日竞价金额/昨日竞价金额 > 1.5倍
+    # 7. 今日竞价额/昨日竞价额 > 1.5倍（竞价额 vs 昨日全天额 ≈ 不可能达标，改用估算）
+    # 竞价约10分钟，昨日全天240分钟，估算昨日同期竞价额 = 昨日总额 * 10/240
     today_amount = auction_vol * c["price"] * 100
     yesterday_amount = yesterday_vol_shares * c["prev_close"]
     if yesterday_amount <= 0:
         return False, "昨金额为0"
-    amount_ratio = today_amount / yesterday_amount
+    est_yesterday_auction_amount = yesterday_amount * (10 / 240)
+    amount_ratio = today_amount / est_yesterday_auction_amount if est_yesterday_auction_amount > 0 else 0
     if amount_ratio <= 1.5:
         return False, "金额比≤1.5"
     # 8. 换手率 > 0.11%
@@ -5527,12 +5946,9 @@ def pool_trend(c: dict, klines: list[dict], tc: dict = None, em: dict = None) ->
                     return False, "前一日涨停"
         except (ValueError, TypeError):
             pass
-    # 7. 非盘中下跌
-    if c["open_price"] < c["prev_close"]:
-        return False, "盘中下跌"
-    # 8. 开盘跳空高开
+    # 7. 非盘中下跌 + 高开（open > prev_close）
     if c["open_price"] <= c["prev_close"]:
-        return False, "未高开"
+        return False, "未高开/下跌"
     # 9. 集合竞价量比 > 3
     auction_vol = tc.get("volume", 0) or em.get("volume", 0) or c.get("volume", 0)
     # 昨成交量（优先用K线数据，兜底用volume_shares）
@@ -5681,10 +6097,8 @@ def _screen_unified(candidates: list[dict], tencent_map: dict, em_data: dict = N
             ok3_pre = False; reason3_pre = "ST"
         elif c["auction_gain"] <= 3 or c["auction_gain"] >= 10:
             ok3_pre = False; reason3_pre = "涨幅不在3-10%"
-        elif c["open_price"] < c["prev_close"]:
-            ok3_pre = False; reason3_pre = "盘中下跌"
         elif c["open_price"] <= c["prev_close"]:
-            ok3_pre = False; reason3_pre = "未高开"
+            ok3_pre = False; reason3_pre = "未高开/下跌"
 
         # ---- 策略池4 · 技术池（非K线预检部分）----
         # 完整的技术池检查需要K线数据，在后续阶段做；此处做基础条件预检
@@ -6475,8 +6889,8 @@ def run_from_data_dir(data_dir: str, html_path: str = None, quiet: bool = False)
         if dde_net_vol > 5: score += 3      # 超强主力流入
         elif dde_net_vol > 3: score += 2    # 强主力流入
         elif dde_net_vol > 1: score += 1    # 主力流入
+        elif dde_net_vol < -3: score -= 2   # 强主力流出（先检查更极端的值）
         elif dde_net_vol < -1: score -= 1   # 主力流出
-        elif dde_net_vol < -3: score -= 2   # 强主力流出
         # 涨停额外惩罚：涨停但其他信号弱 → 减分（防止一字板/缩量板误判）
         if chg >= 9.5:
             if vr < 5: score -= 3        # 涨停但缩量，疑似一字板
