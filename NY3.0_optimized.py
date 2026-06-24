@@ -2335,6 +2335,7 @@ def fetch_fund_flow_combined(codes: list[str], session: requests.Session = None,
     
     dde_results = {}
     intra_results = {}
+    _fail_reasons = {}  # 诊断：记录失败原因
     
     def _fetch_one(code):
         try:
@@ -2353,18 +2354,25 @@ def fetch_fund_flow_combined(codes: list[str], session: requests.Session = None,
                 },
                 timeout=15,
             )
-            if not r or r.status_code != 200:
+            if not r:
+                _fail_reasons[code] = "请求返回None"
+                return code, None, None
+            if r.status_code != 200:
+                _fail_reasons[code] = f"HTTP {r.status_code}"
                 return code, None, None
 
             try:
                 data = r.json()
-            except Exception:
+            except Exception as e:
+                _fail_reasons[code] = f"JSON解析失败: {e}"
                 return code, None, None
             if not data or data.get("data") is None:
+                _fail_reasons[code] = f"data为空(rc={data.get('rc','?') if data else 'None'})"
                 return code, None, None
             
             klines = data.get("data", {}).get("klines", [])
             if not klines:
+                _fail_reasons[code] = "klines为空"
                 return code, None, None
             
             # 东财返回空数据（rc≠0 或 data=None）时记录，避免重复请求
@@ -2463,6 +2471,18 @@ def fetch_fund_flow_combined(codes: list[str], session: requests.Session = None,
             dde_results[code_r] = dde
         if intra:
             intra_results[code_r] = intra
+    
+    # 诊断输出
+    if not dde_results and _fail_reasons:
+        # 统计失败原因
+        from collections import Counter
+        reason_cnt = Counter(_fail_reasons.values())
+        print(f"    ⚠️ 全部失败，失败原因统计:")
+        for reason, cnt in reason_cnt.most_common(3):
+            print(f"      {reason}: {cnt}只")
+        # 打印前3个具体示例
+        for code, reason in list(_fail_reasons.items())[:3]:
+            print(f"      示例: {code} → {reason}")
     
     print(f"    ✅ DDE昨日主力: {len(dde_results)} 只 | 盘中大单流向: {len(intra_results)} 只")
     return dde_results, intra_results
@@ -2845,15 +2865,15 @@ def fetch_fund_flow_auto(codes: list[str], max_workers: int = 8) -> tuple:
     if not codes:
         return {}, {}
 
-    # 并行检测 HTTPS+HTTP（总耗时≤3秒，而非累加16秒）
+    # 并行检测 HTTPS+HTTP（总耗时≤5秒）
     print("    🔍 检测数据源连通性...", end="")
     https_ok, http_ok = _check_eastmoney_parallel()
+    print(f" HTTPS={'✅' if https_ok else '❌'} HTTP={'✅' if http_ok else '❌'}")
 
     if https_ok:
-        print(" ✅ 东财HTTPS可用")
         dde, intra = fetch_fund_flow_combined(codes)
     elif http_ok:
-        print(" ❌ HTTPS被封, ✅ HTTP可用")
+        print("    📡 使用HTTP备用源...")
         dde, intra = {}, {}
         for code in codes:
             try:
