@@ -2381,10 +2381,10 @@ def fetch_fund_flow_combined(codes: list[str], session: requests.Session = None,
                     main_net = float(yd[1]) if yd[1] else 0
                     dde = {
                         "main_net_inflow": main_net,
-                        "super_large_net": float(yd[2]) if yd[2] else 0,
-                        "large_net": float(yd[3]) if yd[3] else 0,
-                        "medium_net": float(yd[4]) if yd[4] else 0,
-                        "small_net": float(yd[5]) if yd[5] else 0,
+                        "small_net": float(yd[2]) if yd[2] else 0,
+                        "medium_net": float(yd[3]) if yd[3] else 0,
+                        "large_net": float(yd[4]) if yd[4] else 0,
+                        "super_large_net": float(yd[5]) if yd[5] else 0,
                         "dde_net_volume": main_net / 10000 if main_net else 0,
                         "source": "eastmoney",
                     }
@@ -2395,10 +2395,10 @@ def fetch_fund_flow_combined(codes: list[str], session: requests.Session = None,
                     main_net = float(yd[1]) if yd[1] else 0
                     dde = {
                         "main_net_inflow": main_net,
-                        "super_large_net": float(yd[2]) if yd[2] else 0,
-                        "large_net": float(yd[3]) if yd[3] else 0,
-                        "medium_net": float(yd[4]) if yd[4] else 0,
-                        "small_net": float(yd[5]) if yd[5] else 0,
+                        "small_net": float(yd[2]) if yd[2] else 0,
+                        "medium_net": float(yd[3]) if yd[3] else 0,
+                        "large_net": float(yd[4]) if yd[4] else 0,
+                        "super_large_net": float(yd[5]) if yd[5] else 0,
                         "dde_net_volume": main_net / 10000 if main_net else 0,
                         "source": "eastmoney",
                     }
@@ -2408,8 +2408,8 @@ def fetch_fund_flow_combined(codes: list[str], session: requests.Session = None,
             last = klines[-1].split(",")
             if len(last) >= 6:
                 main_flow = float(last[1]) if last[1] else 0
-                super_large_flow = float(last[2]) if last[2] else 0
-                large_flow = float(last[3]) if last[3] else 0
+                large_flow = float(last[4]) if last[4] else 0
+                super_large_flow = float(last[5]) if last[5] else 0
                 
                 # 大单净流入 → 中段买卖量
                 if large_flow > 0:
@@ -2880,12 +2880,40 @@ def fetch_fund_flow_auto(codes: list[str], max_workers: int = 8) -> tuple:
                     main_net = float(last_row[1]) if last_row[1] else 0
                     dde[code] = {
                         "main_net_inflow": main_net,
-                        "super_large_net": float(last_row[5]) if last_row[5] else 0,
-                        "large_net": float(last_row[4]) if last_row[4] else 0,
-                        "medium_net": float(last_row[3]) if last_row[3] else 0,
                         "small_net": float(last_row[2]) if last_row[2] else 0,
+                        "medium_net": float(last_row[3]) if last_row[3] else 0,
+                        "large_net": float(last_row[4]) if last_row[4] else 0,
+                        "super_large_net": float(last_row[5]) if last_row[5] else 0,
                         "dde_net_volume": main_net / 10000 if main_net else 0,
                         "source": "eastmoney_http",
+                    }
+                    # 同时提取 intraday 数据（与 HTTPS 路径一致）
+                    large_flow = float(last_row[4]) if last_row[4] else 0
+                    super_large_flow = float(last_row[5]) if last_row[5] else 0
+                    if large_flow > 0:
+                        mid_buy_vol = int(abs(large_flow) / 10000)
+                        mid_sell_vol = 0
+                        mid_buy_all = True
+                    else:
+                        mid_buy_vol = 0
+                        mid_sell_vol = int(abs(large_flow) / 10000)
+                        mid_buy_all = False
+                    if super_large_flow > 0:
+                        tail_buy_vol = int(abs(super_large_flow) / 10000)
+                        tail_sell_vol = 0
+                    else:
+                        tail_buy_vol = 0
+                        tail_sell_vol = int(abs(super_large_flow) / 10000)
+                    intra[code] = {
+                        "mid_buy_vol": mid_buy_vol,
+                        "mid_sell_vol": mid_sell_vol,
+                        "tail_buy_vol": tail_buy_vol,
+                        "tail_sell_vol": tail_sell_vol,
+                        "big_order_net": large_flow,
+                        "super_large_net": super_large_flow,
+                        "main_net_inflow": main_net,
+                        "mid_buy_all": mid_buy_all,
+                        "data_source": "eastmoney_http",
                     }
             except Exception:
                 continue
