@@ -2359,22 +2359,14 @@ def fetch_fund_flow_combined(codes: list[str], session: requests.Session = None,
             try:
                 data = r.json()
             except Exception:
-                if _proxy_pool:
-                    _proxy_pool.mark_bad(proxy)
                 return code, None, None
             if not data or data.get("data") is None:
                 return code, None, None
             
             klines = data.get("data", {}).get("klines", [])
             if not klines:
-                if _proxy_pool:
-                    _proxy_pool.mark_bad(proxy)
                 return code, None, None
             
-            # 请求成功，标记代理可用
-            if _proxy_pool:
-                _proxy_pool.mark_good(proxy)
-
             # 东财返回空数据（rc≠0 或 data=None）时记录，避免重复请求
             data = r.json()
             if not data or data.get("data") is None:
@@ -2452,8 +2444,6 @@ def fetch_fund_flow_combined(codes: list[str], session: requests.Session = None,
             return code, dde, intra
             
         except Exception as e:
-            if _proxy_pool and proxy:
-                _proxy_pool.mark_bad(proxy)
             return code, None, None
     
     print(f"    📦 获取资金流向数据(合并DDE+大单): {len(codes)} 只(串行)...")
