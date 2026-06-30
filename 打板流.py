@@ -202,6 +202,55 @@ ths = THSClientWrapper()
 # ================================================================
 # ★★★ 实时达标信号（截图逻辑）
 # ================================================================
+def _detect_volume_breakout(df_hist, cur_price: float, cur_volume: float = 0) -> dict:
+    """
+    爆量突破放量检测
+    返回 {is_breakout, vol_ratio, breakout_high, vol_surge, price_break, label}
+    """
+    result = {"is_breakout": False, "vol_ratio": 0.0, "breakout_high": 0.0,
+              "vol_surge": False, "price_break": False, "label": ""}
+    if df_hist is None or len(df_hist) < 10:
+        return result
+
+    volumes = df_hist["成交量"].tolist()
+    highs   = df_hist["最高"].tolist()
+
+    # ① 放量检测: 当日量 / 近5日均量
+    avg_vol_5  = sum(volumes[-5:]) / 5 if len(volumes) >= 5 else sum(volumes) / len(volumes)
+    today_vol  = cur_volume if cur_volume > 0 else volumes[-1]
+
+    if avg_vol_5 > 0:
+        vol_ratio = round(today_vol / avg_vol_5, 2)
+    else:
+        vol_ratio = 0.0
+    result["vol_ratio"] = vol_ratio
+
+    # 放量标准: 量比 >= 2.0 (2倍以上算放量, 3倍以上算爆量)
+    result["vol_surge"] = vol_ratio >= 2.0
+
+    # ② 突破检测: 当前价 > 近10日最高价
+    recent_high_10 = max(highs[-10:]) if len(highs) >= 10 else max(highs)
+    result["breakout_high"] = recent_high_10
+    result["price_break"] = cur_price > recent_high_10
+
+    # ③ 综合判定
+    if result["vol_surge"] and result["price_break"]:
+        result["is_breakout"] = True
+        if vol_ratio >= 3.0:
+            result["label"] = f"🔥爆量突破(量比{vol_ratio:.1f}x, 突破{recent_high_10:.2f})"
+        else:
+            result["label"] = f"📈放量突破(量比{vol_ratio:.1f}x, 突破{recent_high_10:.2f})"
+    elif result["vol_surge"]:
+        if vol_ratio >= 3.0:
+            result["label"] = f"💥爆量未突破(量比{vol_ratio:.1f}x, 高点{recent_high_10:.2f})"
+        else:
+            result["label"] = f"📊放量未突破(量比{vol_ratio:.1f}x, 高点{recent_high_10:.2f})"
+    elif result["price_break"]:
+        result["label"] = f"突破(缩量, 高点{recent_high_10:.2f})"
+
+    return result
+
+
 def _calc_expma(closes: List[float], period: int) -> float:
     """计算 EXPMA（指数移动平均线）"""
     if len(closes) < period:
@@ -291,6 +340,10 @@ def build_limit_signal(code: str, stock: dict, bid_m: dict,
     if df_hist is not None and len(df_hist) >= 5:
         avg_trade = round(df_hist["成交额"].tail(5).mean() / 10000, 3)
 
+    # ★ 爆量突破放量检测
+    today_volume = bid_m.get("volume", 0)
+    vol_break = _detect_volume_breakout(df_hist, cur_price, today_volume)
+
     # 所属概念(取前3个)
     concepts = freq_info.get("concepts", [])
     concept_str = ",".join(concepts[:3]) if concepts else ""
@@ -308,6 +361,7 @@ def build_limit_signal(code: str, stock: dict, bid_m: dict,
             "expma10": expma10,
             "expma13": expma13,
             "avg_trade": avg_trade,
+            "vol_break": vol_break,
         },
     }
 
@@ -321,6 +375,14 @@ def print_limit_signal(signal: dict):
     ms_tag    = "强" if d["mid_strength"] > 0 else "弱"
     is_limit  = d["change_pct"] >= 9.5
     marker    = "★" if is_limit else "●"
+    vb = d.get("vol_break", {})
+    vb_tag = ""
+    if vb.get("is_breakout"):
+        vb_tag = f" {vb['label']}"
+    elif vb.get("vol_surge"):
+        vb_tag = f" {vb['label']}"
+    elif vb.get("price_break"):
+        vb_tag = f" {vb['label']}"
     print(f"  {marker} [{signal['first_time']}] "
           f"{d['code']} {d['name']} "
           f"价格={d['price']:.2f} 涨幅={d['change_pct']:.2f}% "
@@ -328,7 +390,8 @@ def print_limit_signal(signal: dict):
           f"EXPMA({d['expma10']:.2f}/{d['expma13']:.2f}){expma_tag} "
           f"中期={ms_tag}({d['mid_strength']:+.2f}) "
           f"5日均额={d['avg_trade']:.0f}万 "
-          f"概念={d['concept'] or '无'}")
+          f"概念={d['concept'] or '无'}"
+          f"{vb_tag}")
 
 
 # ================================================================
@@ -870,6 +933,19 @@ def score_tail_auction(code, stock, bid_metrics, market_temp, market_info, freq_
             sig_bonus += 4; sig_notes.append(f"主力买入({mnet:+.0f}万)")
         elif mnet < -500:
             sig_bonus -= 8; sig_notes.append(f"主力卖出({mnet:+.0f}万)")
+
+    # ★ 爆量突破放量加分
+    if limit_signal:
+        vb = limit_signal.get("达标", {}).get("vol_break", {})
+        if vb.get("is_breakout"):
+            if vb["vol_ratio"] >= 3.0:
+                sig_bonus += 15; sig_notes.append(f"🔥爆量突破(量比{vb['vol_ratio']:.1f}x)")
+            else:
+                sig_bonus += 10; sig_notes.append(f"📈放量突破(量比{vb['vol_ratio']:.1f}x)")
+        elif vb.get("vol_surge"):
+            sig_bonus += 5; sig_notes.append(f"放量未突破(量比{vb['vol_ratio']:.1f}x)")
+        elif vb.get("price_break"):
+            sig_bonus += 3; sig_notes.append("缩量突破")
 
     s_val, note_val, extra_val = score_valuation_and_ths(code, stock)
     s_freq, note_freq = freq_to_score(freq_info)
