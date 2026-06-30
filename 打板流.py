@@ -227,51 +227,94 @@ ql = QianlongClassic()
 
 
 # ================================================================
-# ★★★ 板块/概念频次 — 线程池并行 + pickle 缓存
+# ★★★ 板块/概念频次 — 逐股查归属 + pickle 缓存
 # ================================================================
-def _scan_one_board(name: str, func, code_set: set, kind: str):
-    """扫描单个板块, 返回 (name, overlap_codes_set)"""
-    df = akshare_call(func, symbol=name)
-    if df is None or df.empty:
-        return name, set()
-    members = set(str(c).zfill(6) for c in df["代码"].tolist())
-    overlap = code_set & members
-    return name, overlap
+def _fetch_boards_for_stock(code: str) -> Tuple[List[str], List[str]]:
+    """
+    调用东财 RPT_F10_CORETHEME_BOARDTYPE 接口，获取单只股票的全部板块归属。
+    返回 (sectors: 行业列表, concepts: 概念列表)
+    """
+    import requests as _req
+    url = "https://datacenter.eastmoney.com/securities/api/data/v1/get"
+    params = {
+        "sortColumns": "SECURITY_CODE",
+        "sortTypes": "1",
+        "pageSize": "200",
+        "pageNumber": "1",
+        "reportName": "RPT_F10_CORETHEME_BOARDTYPE",
+        "columns": "ALL",
+        "quoteColumns": "",
+        "filter": f'(SECURITY_CODE="{code}")',
+        "source": "HSF10",
+        "client": "PC",
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://emweb.securities.eastmoney.com/",
+    }
+    sectors, concepts = [], []
+    for attempt in range(3):
+        try:
+            _akshare_throttle()
+            r = _req.get(url, params=params, headers=headers, timeout=15)
+            data = r.json()
+            if not data.get("result") or not data["result"].get("data"):
+                return sectors, concepts
+            for b in data["result"]["data"]:
+                bt = b.get("BOARD_TYPE", "")
+                name = b.get("BOARD_NAME", "")
+                if not name:
+                    continue
+                if bt == "行业":
+                    sectors.append(name)
+                elif bt == "板块":
+                    pass  # 地域板块，跳过
+                else:
+                    concepts.append(name)
+            return sectors, concepts
+        except Exception as e:
+            if attempt < 2:
+                time.sleep(2 ** attempt * 1.5)
+            else:
+                print(f"  → 个股板块查询失败({code}): {e}")
+    return sectors, concepts
 
 
-def _parallel_board_scan(
-    board_names: List[str], func, code_set: set,
-    kind: str, max_workers: int = 2,
-) -> Dict[str, List[str]]:
+def _batch_stock_board_scan(
+    pool_codes: List[str], max_workers: int = 2,
+) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
     """
-    并行扫描所有板块, 返回 { stock_code: [board_name, ...] }
-    max_workers=2 → 2路并行, 等效于间隔 0.4s/call
+    逐股查询板块归属（替代原来的逐板块扫描）。
+    返回 (sector_hits, concept_hits):
+      sector_hits  = { code: [行业名, ...] }
+      concept_hits = { code: [概念名, ...] }
     """
-    hits = {c: [] for c in code_set}
-    total = len(board_names)
+    sector_hits  = {c: [] for c in pool_codes}
+    concept_hits = {c: [] for c in pool_codes}
+    total = len(pool_codes)
     done = [0]
 
-    def worker(name):
-        _, overlap = _scan_one_board(name, func, code_set, kind)
+    def worker(code):
+        sectors, concepts = _fetch_boards_for_stock(code)
         with _cache_lock:
             done[0] += 1
             d = done[0]
-        if d % 30 == 0 or d == total:
-            print(f"    → {kind}板块 {d}/{total}...", end="\r")
-        return name, overlap
+        if d % 10 == 0 or d == total:
+            print(f"    → 个股板块 {d}/{total}...", end="\r")
+        return code, sectors, concepts
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {pool.submit(worker, n): n for n in board_names}
+        futures = {pool.submit(worker, c): c for c in pool_codes}
         for future in as_completed(futures):
             try:
-                name, overlap = future.result()
-                for c in overlap:
-                    hits[c].append(name)
+                code, sectors, concepts = future.result()
+                sector_hits[code]  = sectors
+                concept_hits[code] = concepts
             except Exception:
                 pass
 
-    print(f"    → {kind}板块 完成 {total} 个      ")
-    return hits
+    print(f"    → 个股板块查询完成 {total} 只      ")
+    return sector_hits, concept_hits
 
 
 def analyze_sector_concept_frequency(pool_codes: List[str]) -> Dict[str, Dict]:
@@ -299,36 +342,16 @@ def analyze_sector_concept_frequency(pool_codes: List[str]) -> Dict[str, Dict]:
         _print_freq_preview(result, pool_codes)
         return result
 
-    # ② 并行拉取
-    print(f"  → 开始并行扫描 (2路, 限频{AKSHARE_MIN_GAP}s)...")
-
-    sector_names = []
-    df_ind = akshare_call(ak.stock_board_industry_name_em)
-    if df_ind is not None and not df_ind.empty:
-        sector_names = df_ind["板块名称"].tolist()
-    print(f"    行业板块: {len(sector_names)} 个")
-
-    concept_names = []
-    df_con = akshare_call(ak.stock_board_concept_name_em)
-    if df_con is not None and not df_con.empty:
-        concept_names = df_con["板块名称"].tolist()
-    print(f"    概念板块: {len(concept_names)} 个")
-
-    # 并行扫描
-    sector_hits = _parallel_board_scan(
-        sector_names, ak.stock_board_industry_cons_em, code_set, "行业", max_workers=2
-    )
-    concept_hits = _parallel_board_scan(
-        concept_names, ak.stock_board_concept_cons_em, code_set, "概念", max_workers=2
-    )
+    # ② ★ 逐股查询板块归属（替代原来的逐板块扫描）
+    print(f"  → 逐股查询板块归属 ({len(pool_codes)} 只, 限频{AKSHARE_MIN_GAP}s)...")
+    sector_hits, concept_hits = _batch_stock_board_scan(pool_codes, max_workers=2)
 
     for c in pool_codes:
-        result[c]["sectors"] = sector_hits.get(c, [])
-        result[c]["sector_count"] = len(result[c]["sectors"])
-        result[c]["concepts"] = concept_hits.get(c, [])
+        result[c]["sectors"]       = sector_hits.get(c, [])
+        result[c]["sector_count"]  = len(result[c]["sectors"])
+        result[c]["concepts"]      = concept_hits.get(c, [])
         result[c]["concept_count"] = len(result[c]["concepts"])
-        # ★ 频次 = 行业板块数 + 概念板块数，每进一个 +1，不加权
-        result[c]["total_freq"] = result[c]["sector_count"] + result[c]["concept_count"]
+        result[c]["total_freq"]    = result[c]["sector_count"] + result[c]["concept_count"]
 
     # ③ 写入缓存
     cache_payload = {"code_set": code_set, "data": {c: result[c] for c in pool_codes}}
@@ -819,6 +842,78 @@ tr:hover {{ background:#1f2937; }}
 
 
 # ================================================================
+# ★ 股池筛选: 年涨幅>30% + 近期涨停
+# ================================================================
+def _check_ytd_and_limit_up(code: str) -> Tuple[bool, float, bool]:
+    """
+    检查单只股票是否满足: 今年涨幅>30% 且 近期有涨停
+    返回 (是否通过, 年涨幅%, 近期是否涨停)
+    """
+    try:
+        today_str = datetime.now().strftime("%Y%m%d")
+        year_start = f"{datetime.now().year}0101"
+        df = akshare_call(
+            ak.stock_zh_a_hist,
+            symbol=code, period="daily",
+            start_date=year_start, end_date=today_str,
+            adjust="qfq", timeout=15,
+        )
+        if df is None or df.empty or len(df) < 2:
+            return False, 0.0, False
+
+        # 年涨幅 = (最新收盘 - 年初收盘) / 年初收盘
+        start_close = float(df.iloc[0]["收盘"])
+        end_close   = float(df.iloc[-1]["收盘"])
+        if start_close <= 0:
+            return False, 0.0, False
+        ytd_pct = (end_close - start_close) / start_close * 100
+
+        # 近期涨停: 最近 20 个交易日内，任一日涨幅 >= 9.9%
+        # 创业板(30x)/科创板(68x) 涨跌幅限制 20%, 判断 >= 19.9%
+        has_limit_up = False
+        recent = df.tail(20)
+        for _, row in recent.iterrows():
+            chg = float(row.get("涨跌幅", 0) or 0)
+            if code.startswith(("30", "68")):
+                if chg >= 19.9:
+                    has_limit_up = True; break
+            else:
+                if chg >= 9.9:
+                    has_limit_up = True; break
+
+        passed = (ytd_pct > 30) and has_limit_up
+        return passed, ytd_pct, has_limit_up
+
+    except Exception as e:
+        print(f"  → 筛选查询失败({code}): {e}")
+        return False, 0.0, False
+
+
+def filter_pool_by_ytd_and_limit_up(pool: list) -> list:
+    """
+    从股票池中筛选: 今年涨幅>30% 且 近期有涨停
+    """
+    if not pool:
+        return pool
+
+    print(f"[筛选] 检查年涨幅>30% + 近期涨停 ({len(pool)} 只)...")
+    filtered = []
+    for i, stock in enumerate(pool):
+        code = stock["code"]
+        passed, ytd_pct, has_lu = _check_ytd_and_limit_up(code)
+        status = "✓" if passed else "✗"
+        print(f"    [{i+1}/{len(pool)}] {code} {stock.get('name',''):<6s} "
+              f"年涨幅={ytd_pct:+.1f}%  涨停={'有' if has_lu else '无'}  {status}")
+        if passed:
+            stock["ytd_pct"] = ytd_pct
+            filtered.append(stock)
+        time.sleep(0.8)  # 限频
+
+    print(f"[筛选] 通过: {len(filtered)}/{len(pool)} 只")
+    return filtered
+
+
+# ================================================================
 # 股池加载
 # ================================================================
 def _load_pool():
@@ -902,6 +997,10 @@ def main():
     pool = _load_pool()
     if not pool:
         print("[错误] 无可用股票池，退出"); return
+    # ★ 年涨幅>30% + 近期涨停 筛选
+    pool = filter_pool_by_ytd_and_limit_up(pool)
+    if not pool:
+        print("[筛选] 无符合条件的股票，退出"); return
     pool_codes = [s["code"] for s in pool]
 
     # 2. ★ 板块/概念频次(带缓存 + 并行, 每条线+1)
