@@ -200,6 +200,138 @@ ths = THSClientWrapper()
 
 
 # ================================================================
+# ★★★ 实时达标信号（截图逻辑）
+# ================================================================
+def _calc_expma(closes: List[float], period: int) -> float:
+    """计算 EXPMA（指数移动平均线）"""
+    if len(closes) < period:
+        return closes[-1] if closes else 0.0
+    k = 2.0 / (period + 1)
+    ema = closes[0]
+    for price in closes[1:]:
+        ema = price * k + ema * (1 - k)
+    return round(ema, 2)
+
+
+def _calc_mid_strength(df_hist) -> float:
+    """
+    中期强度指标: 综合量价关系、趋势惯性、波动率
+    正值=中期偏强, 负值=中期偏弱
+    """
+    if df_hist is None or len(df_hist) < 10:
+        return 0.0
+    closes = df_hist["收盘"].tolist()
+    volumes = df_hist["成交量"].tolist()
+
+    # ① 趋势惯性: 近5日涨幅 vs 近20日涨幅
+    if len(closes) >= 20:
+        short_chg = (closes[-1] - closes[-6]) / closes[-6] * 100
+        long_chg  = (closes[-1] - closes[-20]) / closes[-20] * 100
+        trend = (short_chg - long_chg) * 2  # 短期加速为正
+    else:
+        trend = 0.0
+
+    # ② 量价配合: 近5日量比
+    if len(volumes) >= 10:
+        recent_vol = sum(volumes[-5:]) / 5
+        avg_vol    = sum(volumes[-10:]) / 10
+        vol_ratio  = (recent_vol / avg_vol - 1) * 20 if avg_vol > 0 else 0
+    else:
+        vol_ratio = 0.0
+
+    # ③ 波动率收敛: 近5日振幅 / 近20日振幅
+    if len(closes) >= 20:
+        recent_range = (max(closes[-5:]) - min(closes[-5:])) / min(closes[-5:]) * 100
+        avg_range    = (max(closes[-20:]) - min(closes[-20:])) / min(closes[-20:]) * 100
+        vol_converge = (avg_range - recent_range) * 1.5  # 收敛为正(蓄势)
+    else:
+        vol_converge = 0.0
+
+    strength = trend + vol_ratio + vol_converge
+    return round(strength, 2)
+
+
+def build_limit_signal(code: str, stock: dict, bid_m: dict,
+                        freq_info: dict, df_hist=None) -> dict:
+    """
+    构建达标信号字典（截图逻辑）
+    当股票涨幅接近涨停时生成完整信号
+    """
+    cur_price = bid_m.get("price", 0) or bid_m.get("open", 0)
+    pre_close = bid_m.get("pre_close", 0)
+    if pre_close <= 0:
+        return {}
+
+    change_pct = (cur_price - pre_close) / pre_close * 100
+
+    # 主力净流入(万) — 优先用同花顺, 否则从 bid1 盘口估算
+    main_net_wan = 0.0
+    if HAS_THS:
+        fund = ths.get_fund_flow(code)
+        if fund:
+            main_net_wan = fund.get("main_net_inflow", 0) / 10000
+    if main_net_wan == 0:
+        bid_vol = bid_m.get("bid1_vol", 0)
+        ask_vol = bid_m.get("ask1_vol", 0)
+        if bid_vol + ask_vol > 0:
+            main_net_wan = (bid_vol - ask_vol) / (bid_vol + ask_vol) * 1000  # 粗略估算
+
+    # EXPMA
+    expma10 = expma13 = 0.0
+    if df_hist is not None and len(df_hist) >= 13:
+        closes = df_hist["收盘"].tolist()
+        expma10 = _calc_expma(closes, 10)
+        expma13 = _calc_expma(closes, 13)
+
+    # 中期强度
+    mid_strength = _calc_mid_strength(df_hist)
+
+    # 近5日平均成交额(万)
+    avg_trade = 0.0
+    if df_hist is not None and len(df_hist) >= 5:
+        avg_trade = round(df_hist["成交额"].tail(5).mean() / 10000, 3)
+
+    # 所属概念(取前3个)
+    concepts = freq_info.get("concepts", [])
+    concept_str = ",".join(concepts[:3]) if concepts else ""
+
+    return {
+        "first_time": datetime.now().strftime("%H:%M:%S"),
+        "达标": {
+            "code": code,
+            "name": stock.get("name", ""),
+            "price": round(cur_price, 2),
+            "change_pct": round(change_pct, 4),
+            "main_net_wan": round(main_net_wan, 3),
+            "mid_strength": mid_strength,
+            "concept": concept_str,
+            "expma10": expma10,
+            "expma13": expma13,
+            "avg_trade": avg_trade,
+        },
+    }
+
+
+def print_limit_signal(signal: dict):
+    """终端打印信号（涨停标★，其他标●）"""
+    if not signal:
+        return
+    d = signal["达标"]
+    expma_tag = "↑" if d["expma10"] > d["expma13"] else "↓"
+    ms_tag    = "强" if d["mid_strength"] > 0 else "弱"
+    is_limit  = d["change_pct"] >= 9.5
+    marker    = "★" if is_limit else "●"
+    print(f"  {marker} [{signal['first_time']}] "
+          f"{d['code']} {d['name']} "
+          f"价格={d['price']:.2f} 涨幅={d['change_pct']:.2f}% "
+          f"主力={d['main_net_wan']:+.0f}万 "
+          f"EXPMA({d['expma10']:.2f}/{d['expma13']:.2f}){expma_tag} "
+          f"中期={ms_tag}({d['mid_strength']:+.2f}) "
+          f"5日均额={d['avg_trade']:.0f}万 "
+          f"概念={d['concept'] or '无'}")
+
+
+# ================================================================
 # 钱龙经典指标
 # ================================================================
 class QianlongClassic:
@@ -695,8 +827,50 @@ def score_tail_auction(code, stock, bid_metrics, market_temp, market_info, freq_
     rej2, reason2 = check_soft_reject(code, pre_close, open_p, cur, vol, stock, jzb)
     if rej2: return -80, f"柔性否决: {reason2}", {"reason": reason2, "limit_up": limit_up, "jzb": jzb}
 
+    # 加载历史K线(用于EXPMA/中期强度/均额)
+    df_hist = None
+    try:
+        today_str = datetime.now().strftime("%Y%m%d")
+        month_ago = (datetime.now().replace(day=1)).strftime("%Y%m%d")
+        df_hist = akshare_call(
+            ak.stock_zh_a_hist, symbol=code, period="daily",
+            start_date=month_ago, end_date=today_str, adjust="qfq",
+        )
+    except Exception:
+        pass
+
     s_mom, note_mom = score_momentum(code, stock)
     s_sen, note_sen = score_sentiment(code, stock, market_temp, market_info, jzb)
+
+    # ★ 生成达标信号（每只股票都分析）
+    limit_signal = build_limit_signal(code, stock, bid_m, freq_info, df_hist)
+    print_limit_signal(limit_signal)
+
+    # ★ 信号加分（EXPMA/中期强度/主力净流入）
+    sig_bonus = 0; sig_notes = []
+    if limit_signal:
+        d = limit_signal.get("达标", {})
+        ms = d.get("mid_strength", 0)
+        e10 = d.get("expma10", 0)
+        e13 = d.get("expma13", 0)
+        mnet = d.get("main_net_wan", 0)
+        if ms > 5:
+            sig_bonus += 10; sig_notes.append(f"中期强势({ms:+.1f})")
+        elif ms > 0:
+            sig_bonus += 5; sig_notes.append(f"中期偏强({ms:+.1f})")
+        elif ms < -10:
+            sig_bonus -= 8; sig_notes.append(f"中期弱势({ms:+.1f})")
+        if e10 > e13:
+            sig_bonus += 5; sig_notes.append("EXPMA多头")
+        elif e10 < e13 and e13 > 0:
+            sig_bonus -= 3; sig_notes.append("EXPMA空头")
+        if mnet > 500:
+            sig_bonus += 8; sig_notes.append(f"主力强买({mnet:+.0f}万)")
+        elif mnet > 100:
+            sig_bonus += 4; sig_notes.append(f"主力买入({mnet:+.0f}万)")
+        elif mnet < -500:
+            sig_bonus -= 8; sig_notes.append(f"主力卖出({mnet:+.0f}万)")
+
     s_val, note_val, extra_val = score_valuation_and_ths(code, stock)
     s_freq, note_freq = freq_to_score(freq_info)
     base = s_mom + s_sen + s_val + s_freq
@@ -712,16 +886,18 @@ def score_tail_auction(code, stock, bid_metrics, market_temp, market_info, freq_
         adj += a
         if n: adj_notes.append(n)
 
-    s = base + dragon_bonus + adj
+    s = base + dragon_bonus + adj + sig_bonus
     all_notes = (
         f"频次:{note_freq}|动量:{note_mom}|情绪:{note_sen}|价值:{note_val}"
         + (f"|龙头:{dragon_note}" if dragon_note else "")
+        + (f"|信号:{'; '.join(sig_notes)}" if sig_notes else "")
         + (f"|调节:{'; '.join(adj_notes)}" if adj_notes else "")
     )
     details = {
         "reason": all_notes, "base": base, "dragon_bonus": dragon_bonus,
         "adjustment": adj, "limit_up": limit_up, "jzb": jzb,
         "freq_score": s_freq, "freq_note": note_freq, **extra_val,
+        "limit_signal": limit_signal, "sig_bonus": sig_bonus, "sig_notes": sig_notes,
     }
     return s, all_notes, details
 
