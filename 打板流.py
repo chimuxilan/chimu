@@ -584,11 +584,17 @@ def get_spot_df():
     _df_spot_cache = cache_load("spot", ttl_hours=0.5)
     if _df_spot_cache is not None:
         return _df_spot_cache
-    df = akshare_call(ak.stock_zh_a_spot_em)
-    if df is not None and not df.empty:
-        _df_spot_cache = df
-        cache_save("spot", df)
-    return _df_spot_cache
+    # ★ 重试3次，间隔3秒（东财高频请求后可能断开）
+    for attempt in range(3):
+        df = akshare_call(ak.stock_zh_a_spot_em)
+        if df is not None and not df.empty:
+            _df_spot_cache = df
+            cache_save("spot", df)
+            return _df_spot_cache
+        if attempt < 2:
+            print(f"  → akshare 快照失败, {3-attempt}秒后重试...")
+            time.sleep(3)
+    return None
 
 
 def get_zt_df():
@@ -1267,27 +1273,61 @@ def main():
     bid_metrics = fetch_bid_metrics_from_akshare()
     print(f"  → akshare 快照: {len(bid_metrics)} 只")
 
-    # mootdx 补充盘口
+    # mootdx 补充盘口 + 兜底行情
     if not tdx.connected: tdx.connect()
     if tdx.connected:
-        codes6 = [c for c in pool_codes if c in bid_metrics]
-        for i in range(0, len(codes6), 80):
-            batch = codes6[i:i+80]
-            quotes = tdx.get_quotes([_code_to_tdx(c) for c in batch])
-            code_map = {c: c for c in batch}  # TDX API 返回裸代码，直接用裸代码做 key
-            for tdx_code, q in quotes.items():
-                code6 = code_map.get(tdx_code, "")
-                if code6 in bid_metrics:
-                    bid_metrics[code6].update({
-                        "bid1_vol": q.get("bid1_vol", 0),
-                        "ask1_vol": q.get("ask1_vol", 0),
-                        "bid1": q.get("bid1", 0), "ask1": q.get("ask1", 0),
-                    })
-                    if q.get("price", 0) > 0: bid_metrics[code6]["price"] = q["price"]
-                    if q.get("volume", 0) > 0:
-                        bid_metrics[code6]["volume"] = q["volume"] * 100  # TDX返回手，转为股
-            time.sleep(0.2)
-        print("  → mootdx 盘口补充完成")
+        # ★ akshare 快照失败时，用 mootdx 兜底获取价格/成交量/昨收
+        tdx_codes = pool_codes if not bid_metrics else [c for c in pool_codes if c in bid_metrics]
+        # 如果 bid_metrics 为空，先用 mootdx 拉全量行情
+        if not bid_metrics:
+            print("  → akshare 快照为空, 用 mootdx 兜底...")
+            for i in range(0, len(pool_codes), 80):
+                batch = pool_codes[i:i+80]
+                quotes = tdx.get_quotes([_code_to_tdx(c) for c in batch])
+                code_map = {c: c for c in batch}
+                for tdx_code, q in quotes.items():
+                    code6 = code_map.get(tdx_code, "")
+                    if not code6:
+                        continue
+                    price = q.get("price", 0)
+                    pre_close = q.get("open", 0)  # TDX无昨收字段, 用开盘近似
+                    # 尝试从涨停池数据获取昨收
+                    zt_df = get_zt_df()
+                    if zt_df is not None:
+                        zt_row = zt_df[zt_df["代码"] == code6.zfill(6)]
+                        if not zt_row.empty:
+                            pre_close = float(zt_row.iloc[0].get("昨收", 0) or 0)
+                    if price > 0:
+                        bid_metrics[code6] = {
+                            "open": q.get("open", 0), "pre_close": pre_close,
+                            "price": price,
+                            "high": q.get("high", 0), "low": q.get("low", 0),
+                            "volume": int(q.get("vol", 0)) * 100,
+                            "amount": q.get("amount", 0),
+                            "bid1": q.get("bid1", 0), "bid1_vol": q.get("bid1_vol", 0),
+                            "ask1": q.get("ask1", 0), "ask1_vol": q.get("ask1_vol", 0),
+                        }
+                time.sleep(0.2)
+            print(f"  → mootdx 兜底行情: {len(bid_metrics)} 只")
+        else:
+            # akshare 成功，mootdx 补充盘口
+            for i in range(0, len(tdx_codes), 80):
+                batch = tdx_codes[i:i+80]
+                quotes = tdx.get_quotes([_code_to_tdx(c) for c in batch])
+                code_map = {c: c for c in batch}
+                for tdx_code, q in quotes.items():
+                    code6 = code_map.get(tdx_code, "")
+                    if code6 in bid_metrics:
+                        bid_metrics[code6].update({
+                            "bid1_vol": q.get("bid1_vol", 0),
+                            "ask1_vol": q.get("ask1_vol", 0),
+                            "bid1": q.get("bid1", 0), "ask1": q.get("ask1", 0),
+                        })
+                        if q.get("price", 0) > 0: bid_metrics[code6]["price"] = q["price"]
+                        if q.get("volume", 0) > 0:
+                            bid_metrics[code6]["volume"] = q["volume"] * 100
+                time.sleep(0.2)
+            print("  → mootdx 盘口补充完成")
 
     # 4. 市场概况
     print("[3/5] 市场概况...")
